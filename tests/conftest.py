@@ -88,11 +88,18 @@ def vector_store(chroma_dir: Path, embedding_fn: Callable) -> VectorStore:
 
 
 @pytest.fixture
-def metadata_store(db_path: Path) -> MetadataStore:
-    """返回使用临时数据库的 MetadataStore（已初始化）。
+def metadata_store(db_path: Path, monkeypatch) -> MetadataStore:
+    """返回使用临时 SQLite 数据库的 MetadataStore（已初始化）。
 
-    MetadataStore 是同步实现（sqlite3 + 线程锁），fixture 也用同步。
+    强制 SQLite 模式（忽略全局 MySQL 配置），保证测试隔离。
     """
+    import brain.config as config_module
+    from brain.config import DatabaseSettings
+
+    # 强制 SQLite：把 database.host 设为 None
+    cfg = config_module.get_config()
+    monkeypatch.setattr(cfg.database, "host", None)
+
     store = MetadataStore(db_path=db_path)
     store.initialize()
     yield store

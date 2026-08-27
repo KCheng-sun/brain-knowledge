@@ -37,6 +37,20 @@ class StorageSettings(BaseSettings):
     db_path: Path = _PROJECT_ROOT / "data" / "metadata.db"
 
 
+class DatabaseSettings(BaseSettings):
+    """关系型数据库配置（Phase 5D：支持 MySQL）。"""
+
+    model_config = SettingsConfigDict(env_prefix="BRAIN_DB_")
+
+    # None=用 SQLite（db_path），指定则用 MySQL
+    host: str | None = None
+    port: int = 3306
+    user: str = "root"
+    password: str = ""
+    database: str = "brain"
+    charset: str = "utf8mb4"
+
+
 class LLMSettings(BaseSettings):
     """LLM 配置"""
 
@@ -111,6 +125,7 @@ class AppConfig(BaseSettings):
     )
 
     storage: StorageSettings = Field(default_factory=StorageSettings)
+    database: DatabaseSettings = Field(default_factory=DatabaseSettings)
     llm: LLMSettings = Field(default_factory=LLMSettings)
     embedding: EmbeddingSettings = Field(default_factory=EmbeddingSettings)
     ingestion: IngestionSettings = Field(default_factory=IngestionSettings)

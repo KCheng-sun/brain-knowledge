@@ -246,6 +246,7 @@ ruff check brain/
   - LLM/工具的入参出参要截断（2000 字符），否则长 prompt 会撑爆 SQLite，且前端渲染卡顿
 - 经验（5B）：
   - **成本数据复用 trace_events 表**，不新建 llm_usage 表——token_usage JSON 里加 cost 字段即可，成本天然随 trace_id 关联，用 json_extract 聚合查询
+  - **预算用量应为独立计数器，不从审计日志聚合**：早期用 SUM(json_extract) 从 trace_events 聚合今日 token，“重置”变成删历史记录，破坏了调用链回放数据。改为独立 usage_counters 表（today/month/total 三行 + period_key 跨天轮转），on_llm_end 时 UPSERT 累加，重置只清零计数器不删 trace_events。回填逻辑幂等（仅计数器为空时从 trace_events 初始化）
   - SQLite 的 json_extract 可直接从 JSON 字段提取 cost：`SUM(json_extract(token_usage, '$.cost'))`，无需应用层解析
   - **预算熔断在 API 入口检查**（ask/stream/resume），超限返 429；recursion_limit 通过 stream/invoke 的 config 传入防死循环，两层防护
   - DeepSeek 实际返回的 model 名是 `deepseek-v4-flash`（不是配置的 `deepseek-chat`），价格表要兼容别名
@@ -260,6 +261,8 @@ ruff check brain/
   - LLM-as-Judge 的 prompt 要求严格 JSON 输出，但要容错——LLM 可能输出多余文本，用 find('{')..rfind('}') 提取 JSON 块
   - scheduler 加 weekly_eval 周任务抽样，成本可控（10% 抽样 + 单次 Judge 调用）
   - **测试集存数据库而非文件**：golden_cases/bad_cases 表支持页面 CRUD，YAML 仅作种子导入（首次 seed）。运行时全部走数据库，避免文件读写并发问题，页面实时增删改查
+  - **MetadataStore 双后端兼容**：通过 config.database.host 切换 SQLite/MySQL，_exec 方法自动翻译占位符（?→%s）、UPSERT（ON CONFLICT→ON DUPLICATE KEY）、json_extract（→CAST(JSON_UNQUOTE(JSON_EXTRACT)) AS DECIMAL）。测试 fixture monkeypatch host=None 强制 SQLite 隔离
+  - **SQLite→MySQL 迁移不能手写 DDL**：表结构要从 SQLite PRAGMA table_info 动态读取生成，否则列名/类型必不一致。TEXT 列做 PK/索引需指定 VARCHAR(255) 长度，MySQL 严格模式不允许 TEXT 列 DEFAULT
 
 ---
 

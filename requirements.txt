@@ -33,6 +33,8 @@ python-dotenv>=1.0.0
 
 # 异步 SQLite
 aiosqlite>=0.20.0
+# MySQL（Phase 5D）
+pymysql>=1.1.0
 
 # 文件监听
 watchdog>=4.0.0

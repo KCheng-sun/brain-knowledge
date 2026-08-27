@@ -1,10 +1,10 @@
-﻿"""SQLite 元数据存储（同步）。
+"""元数据存储（同步，支持 SQLite 和 MySQL）。
 
 管理笔记元数据、标签、关联关系、摄入日志的 CRUD 操作。
-使用 sqlite3（线程安全），供 DeepAgents 工具在任意线程中直调。
+根据 config.database.host 自动选择后端：None=SQLite，指定=MySQL。
+所有方法为同步调用，通过实例锁保证多线程安全。
 """
 
-import sqlite3
 import threading
 from datetime import date, datetime, timedelta
 from pathlib import Path
@@ -23,11 +23,7 @@ from brain.models import (
 
 
 def _synchronized(method):
-    """装饰器——用实例锁串行化数据库操作。
-
-    LangGraph 的工具节点会并行执行多个工具，同一 SQLite 连接
-    不能并发访问，必须加锁。
-    """
+    """装饰器——用实例锁串行化数据库操作。"""
 
     def wrapper(self, *args, **kwargs):
         with self._lock:
@@ -37,27 +33,49 @@ def _synchronized(method):
 
 
 class MetadataStore:
-    """SQLite 元数据管理—notes / tags / note_tags / connections / ingestion_log。
+    """元数据管理—支持 SQLite 和 MySQL，通过实例锁保证多线程安全。"""
 
-    所有方法为同步调用，通过实例锁保证多线程安全。
-    """
-
-    def __init__(self, db_path: Path):
-        self._db_path = str(db_path)
-        self._conn: sqlite3.Connection | None = None
+    def __init__(self, db_path: Path | None = None):
+        self._db_path = str(db_path) if db_path else None
+        self._conn = None
         self._lock = threading.Lock()
+        self._is_mysql = False
 
     # ---- 生命周期 ----
 
     @_synchronized
     def initialize(self) -> None:
-        self._conn = sqlite3.connect(self._db_path, check_same_thread=False)
-        self._conn.row_factory = sqlite3.Row
-        self._conn.execute("PRAGMA journal_mode=WAL")
-        self._conn.execute("PRAGMA foreign_keys=ON")
-        self._conn.execute("PRAGMA busy_timeout=5000")
+        from brain.config import get_config
+
+        cfg = get_config()
+        db_cfg = cfg.database
+
+        if db_cfg.host:
+            import pymysql
+            from pymysql.cursors import DictCursor
+
+            self._is_mysql = True
+            self._conn = pymysql.connect(
+                host=db_cfg.host, port=db_cfg.port,
+                user=db_cfg.user, password=db_cfg.password,
+                database=db_cfg.database, charset=db_cfg.charset,
+                cursorclass=DictCursor, autocommit=False,
+            )
+            logger.info(f"MetadataStore 已连接 MySQL: {db_cfg.host}:{db_cfg.port}/{db_cfg.database}")
+        else:
+            import sqlite3
+
+            if not self._db_path:
+                self._db_path = str(cfg.storage.db_path)
+            self._is_mysql = False
+            self._conn = sqlite3.connect(self._db_path, check_same_thread=False)
+            self._conn.row_factory = sqlite3.Row
+            self._conn.execute("PRAGMA journal_mode=WAL")
+            self._conn.execute("PRAGMA foreign_keys=ON")
+            self._conn.execute("PRAGMA busy_timeout=5000")
+            logger.info(f"MetadataStore 已连接 SQLite: {self._db_path}")
+
         self._create_tables()
-        logger.info(f"MetadataStore 已连接: {self._db_path}")
 
     @_synchronized
     def close(self) -> None:
@@ -65,9 +83,75 @@ class MetadataStore:
             self._conn.close()
             logger.info("MetadataStore 已关闭")
 
+    def _exec(self, sql: str, params=None):
+        """执行 SQL，返回 cursor（调用方可 .fetchone()/.fetchall()）。
+
+        自动处理 SQLite/MySQL 占位符和语法差异：
+        - ? → %s（MySQL）
+        - INSERT OR REPLACE → REPLACE INTO（MySQL）
+        - INSERT OR IGNORE → INSERT IGNORE（MySQL）
+        - ON CONFLICT(...) DO UPDATE SET → ON DUPLICATE KEY UPDATE（excluded.col → VALUES(col)，兼容直接赋值和累加两种写法）
+        - json_extract(col, '$.k') → CAST(JSON_UNQUOTE(JSON_EXTRACT(...)) AS DOUBLE)（返回 float，与 SQLite 一致）
+        """
+        assert self._conn is not None
+        if self._is_mysql:
+            import re as _re
+
+            sql = sql.replace("INSERT OR REPLACE INTO", "REPLACE INTO")
+            sql = sql.replace("INSERT OR IGNORE INTO", "INSERT IGNORE INTO")
+            m = _re.search(r"ON CONFLICT\(([^)]+)\) DO UPDATE SET\s+(.+)", sql, _re.DOTALL)
+            if m:
+                # excluded.col → VALUES(col)（兼容直接赋值和累加两种写法）
+                set_clause = _re.sub(r"excluded\.(\w+)", r"VALUES(\1)", m.group(2))
+                sql = sql[: m.start()] + "ON DUPLICATE KEY UPDATE " + set_clause
+            sql = _re.sub(
+                r"json_extract\((\w+),\s*'\$\.(\w+)'\)",
+                r"CAST(JSON_UNQUOTE(JSON_EXTRACT(\1, '$.\2')) AS DOUBLE)",
+                sql,
+            )
+            # SQLite strftime('fmt', col) → MySQL DATE_FORMAT(col, 'fmt')
+            sql = _re.sub(r"strftime\(([^,]+),\s*([^)]+)\)", r"DATE_FORMAT(\2, \1)", sql)
+            # 先转换 ? → %s 占位符
+            sql = sql.replace("?", "%s")
+            # 转义字面量 %（DATE_FORMAT 的 %H、LIKE 的 % 等），
+            # 避免 pymysql 的 % 格式化误判；%s 占位符保留
+            sql = sql.replace("%s", "\x00\x00")
+            sql = sql.replace("%", "%%")
+            sql = sql.replace("\x00\x00", "%s")
+        cur = self._conn.cursor()
+        # MySQL: 无参数时不传 args，避免 SQL 中的字面量 % 被误当格式占位符
+        if params:
+            cur.execute(sql, params)
+        else:
+            cur.execute(sql)
+        return cur
+
+    def _executescript(self, script: str) -> None:
+        """执行多语句脚本（兼容 SQLite executescript 和 MySQL 逐条执行）。"""
+        assert self._conn is not None
+        if self._is_mysql:
+            cur = self._conn.cursor()
+            for stmt in script.split(";"):
+                stmt = stmt.strip()
+                if stmt:
+                    cur.execute(stmt)
+            cur.close()
+        else:
+            self._conn.executescript(script)
+
     def _create_tables(self) -> None:
         assert self._conn is not None
-        self._conn.executescript("""
+        if self._is_mysql:
+            from brain.storage.mysql_schema import MYSQL_DDL
+
+            cur = self._conn.cursor()
+            for ddl in MYSQL_DDL:
+                cur.execute(ddl)
+            cur.close()
+            self._conn.commit()
+            self._migrate()
+            return
+        self._executescript("""
             CREATE TABLE IF NOT EXISTS notes (
                 id TEXT PRIMARY KEY,
                 title TEXT NOT NULL,
@@ -209,11 +293,22 @@ class MetadataStore:
             );
             CREATE INDEX IF NOT EXISTS idx_metrics_type_time ON metrics(metric_type, created_at);
             CREATE INDEX IF NOT EXISTS idx_metrics_trace ON metrics(trace_id);
+
+            -- 用量计数器（Phase 5B 预算账本）：独立于 trace_events，可重置不破坏审计数据
+            CREATE TABLE IF NOT EXISTS usage_counters (
+                period_type TEXT NOT NULL,   -- today / month / total
+                period_key TEXT NOT NULL,    -- 日期串如 2024-08-13（today/month），total 固定为 'all'
+                tokens INTEGER NOT NULL DEFAULT 0,
+                cost REAL NOT NULL DEFAULT 0,
+                calls INTEGER NOT NULL DEFAULT 0,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY (period_type, period_key)
+            );
         """)
         self._conn.commit()
 
         # trace_events 表单独创建（可能跨连接迁移）
-        self._conn.executescript(
+        self._executescript(
             """
             CREATE TABLE IF NOT EXISTS trace_events (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -263,7 +358,7 @@ class MetadataStore:
         self._conn.commit()
 
         # golden_cases / bad_cases 表（Phase 5D：测试集存数据库支持页面 CRUD）
-        self._conn.executescript(
+        self._executescript(
             """
             CREATE TABLE IF NOT EXISTS golden_cases (
                 id TEXT PRIMARY KEY,
@@ -296,23 +391,42 @@ class MetadataStore:
         assert self._conn is not None
 
         def has_column(table: str, column: str) -> bool:
-            cols = [r[1] for r in self._conn.execute(f"PRAGMA table_info({table})").fetchall()]
-            return column in cols
+            if self._is_mysql:
+                cur = self._exec(
+                    "SELECT COUNT(*) as cnt FROM information_schema.columns "
+                    "WHERE table_schema=DATABASE() AND table_name=%s AND column_name=%s",
+                    (table, column),
+                )
+                row = cur.fetchone()
+                return (row["cnt"] if row else 0) > 0
+            else:
+                cur = self._conn.execute(f"PRAGMA table_info({table})")
+                cols = [r[1] for r in cur.fetchall()]
+                return column in cols
 
         def has_table(table: str) -> bool:
-            r = self._conn.execute(
-                "SELECT name FROM sqlite_master WHERE type='table' AND name=?", (table,)
-            ).fetchone()
-            return r is not None
+            if self._is_mysql:
+                cur = self._exec(
+                    "SELECT COUNT(*) as cnt FROM information_schema.tables "
+                    "WHERE table_schema=DATABASE() AND table_name=%s",
+                    (table,),
+                )
+                row = cur.fetchone()
+                return (row["cnt"] if row else 0) > 0
+            else:
+                cur = self._exec(
+                    "SELECT name FROM sqlite_master WHERE type='table' AND name=?", (table,)
+                )
+                return cur.fetchone() is not None
 
         # eval_scores 补 run_id 列（Phase 5D 评估批次关联）
         if has_table("eval_scores") and not has_column("eval_scores", "run_id"):
-            self._conn.execute("ALTER TABLE eval_scores ADD COLUMN run_id INTEGER")
+            self._exec("ALTER TABLE eval_scores ADD COLUMN run_id INTEGER")
             logger.info("迁移: eval_scores 表新增 run_id 列")
 
         # eval_runs 表（旧库可能没有）
         if not has_table("eval_runs"):
-            self._conn.executescript(
+            self._executescript(
                 """
                 CREATE TABLE IF NOT EXISTS eval_runs (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -330,14 +444,79 @@ class MetadataStore:
             )
             logger.info("迁移: 新建 eval_runs 表")
 
+        # 回填 usage_counters（从 trace_events 历史数据初始化计数器）
+        self._backfill_usage_counters()
+
         self._conn.commit()
+
+    def _backfill_usage_counters(self) -> None:
+        """从 trace_events 历史数据回填 usage_counters 计数器。
+
+        幂等：仅在 usage_counters 为空时执行（避免重复累加）。
+        将历史 llm_end 事件按 today/month/total 三个周期初始化计数器。
+        """
+        from datetime import datetime
+
+        # 已有计数器数据则跳过
+        row = self._exec(
+            "SELECT COUNT(*) as cnt FROM usage_counters"
+        ).fetchone()
+        if row and row["cnt"] > 0:
+            return
+
+        # 从 trace_events 按日期聚合历史 token/cost
+        rows = self._exec(
+            """SELECT substr(created_at, 1, 10) as day,
+                      substr(created_at, 1, 7) as month,
+                      COALESCE(json_extract(token_usage, '$.total'), 0) as tokens,
+                      COALESCE(json_extract(token_usage, '$.cost'), 0) as cost
+               FROM trace_events
+               WHERE event_type='llm_end' AND token_usage IS NOT NULL"""
+        ).fetchall()
+        if not rows:
+            return
+
+        now_key = datetime.now().strftime("%Y-%m-%d")
+        now_month = datetime.now().strftime("%Y-%m")
+        today_tokens = today_cost = 0
+        month_tokens = month_cost = 0
+        total_tokens = total_cost = 0
+
+        for r in rows:
+            tokens = int(r["tokens"] or 0)
+            cost = float(r["cost"] or 0)
+            total_tokens += tokens
+            total_cost += cost
+            if r["day"] == now_key:
+                today_tokens += tokens
+                today_cost += cost
+            if r["month"] == now_month:
+                month_tokens += tokens
+                month_cost += cost
+
+        now_iso = datetime.now().isoformat()
+        for pt, pk, t, c in [
+            ("today", now_key, today_tokens, today_cost),
+            ("month", now_month, month_tokens, month_cost),
+            ("total", "all", total_tokens, total_cost),
+        ]:
+            self._exec(
+                """INSERT OR REPLACE INTO usage_counters
+                   (period_type, period_key, tokens, cost, calls, updated_at)
+                   VALUES (?, ?, ?, ?, 0, ?)""",
+                (pt, pk, t, round(c, 6), now_iso),
+            )
+        logger.info(
+            f"回填 usage_counters: today={today_tokens}t/¥{today_cost:.4f}, "
+            f"month={month_tokens}t/¥{month_cost:.4f}, total={total_tokens}t/¥{total_cost:.4f}"
+        )
 
     # ---- Notes CRUD ----
 
     @_synchronized
     def create_note(self, note: NoteMetadata) -> str:
         assert self._conn is not None
-        self._conn.execute(
+        self._exec(
             """INSERT INTO notes (id, title, source_type, source_path, file_hash,
                content_preview, content_length, chunk_count, status,
                created_at, updated_at, ingested_at)
@@ -356,7 +535,7 @@ class MetadataStore:
     @_synchronized
     def get_note(self, note_id: str) -> NoteMetadata | None:
         assert self._conn is not None
-        row = self._conn.execute("SELECT * FROM notes WHERE id = ?", (note_id,)).fetchone()
+        row = self._exec("SELECT * FROM notes WHERE id = ?", (note_id,)).fetchone()
         if row is None:
             return None
         return self._row_to_note(row)
@@ -366,7 +545,7 @@ class MetadataStore:
         self, status: NoteStatus = NoteStatus.ACTIVE, limit: int = 50, offset: int = 0,
     ) -> list[NoteMetadata]:
         assert self._conn is not None
-        rows = self._conn.execute(
+        rows = self._exec(
             "SELECT * FROM notes WHERE status = ? ORDER BY created_at DESC LIMIT ? OFFSET ?",
             (status.value, limit, offset),
         ).fetchall()
@@ -382,24 +561,24 @@ class MetadataStore:
             return
         set_clause = ", ".join(f"{k} = ?" for k in updates)
         values = list(updates.values()) + [note_id]
-        self._conn.execute(f"UPDATE notes SET {set_clause} WHERE id = ?", values)
+        self._exec(f"UPDATE notes SET {set_clause} WHERE id = ?", values)
         self._conn.commit()
 
     @_synchronized
     def delete_note(self, note_id: str, soft: bool = True) -> None:
         assert self._conn is not None
         if soft:
-            self._conn.execute("UPDATE notes SET status = ? WHERE id = ?",
+            self._exec("UPDATE notes SET status = ? WHERE id = ?",
                                (NoteStatus.DELETED.value, note_id))
         else:
-            self._conn.execute("DELETE FROM notes WHERE id = ?", (note_id,))
+            self._exec("DELETE FROM notes WHERE id = ?", (note_id,))
         self._conn.commit()
         logger.info(f"MetadataStore: 已{'软' if soft else '硬'}删除笔记 {note_id}")
 
     @_synchronized
     def note_exists(self, file_hash: str) -> str | None:
         assert self._conn is not None
-        row = self._conn.execute(
+        row = self._exec(
             "SELECT id FROM notes WHERE file_hash = ? AND status = 'active'",
             (file_hash,),
         ).fetchone()
@@ -408,7 +587,7 @@ class MetadataStore:
     @_synchronized
     def count_notes(self, status: NoteStatus = NoteStatus.ACTIVE) -> int:
         assert self._conn is not None
-        row = self._conn.execute(
+        row = self._exec(
             "SELECT COUNT(*) as cnt FROM notes WHERE status = ?", (status.value,),
         ).fetchone()
         return row["cnt"] if row else 0
@@ -418,10 +597,10 @@ class MetadataStore:
     @_synchronized
     def get_or_create_tag(self, name: str, category: TagCategory, is_ai: bool = False) -> int:
         assert self._conn is not None
-        row = self._conn.execute("SELECT id FROM tags WHERE name = ?", (name,)).fetchone()
+        row = self._exec("SELECT id FROM tags WHERE name = ?", (name,)).fetchone()
         if row:
             return row["id"]
-        cur = self._conn.execute(
+        cur = self._exec(
             "INSERT INTO tags (name, category, is_ai_generated) VALUES (?, ?, ?)",
             (name, category.value, int(is_ai)),
         )
@@ -431,7 +610,7 @@ class MetadataStore:
     @_synchronized
     def add_tag_to_note(self, note_id: str, tag_id: int, confidence: float | None = None) -> None:
         assert self._conn is not None
-        self._conn.execute(
+        self._exec(
             "INSERT OR REPLACE INTO note_tags (note_id, tag_id, confidence) VALUES (?, ?, ?)",
             (note_id, tag_id, confidence),
         )
@@ -440,7 +619,7 @@ class MetadataStore:
     @_synchronized
     def get_note_tags(self, note_id: str) -> list[Tag]:
         assert self._conn is not None
-        rows = self._conn.execute(
+        rows = self._exec(
             """SELECT t.id, t.name, t.category, t.is_ai_generated, nt.confidence
                FROM tags t
                JOIN note_tags nt ON t.id = nt.tag_id
@@ -462,7 +641,7 @@ class MetadataStore:
     @_synchronized
     def add_connection(self, conn: Connection) -> int:
         assert self._conn is not None
-        cur = self._conn.execute(
+        cur = self._exec(
             """INSERT INTO connections
                (source_note_id, target_note_id, relation_type, strength,
                 description, created_at, is_ai_generated)
@@ -476,7 +655,7 @@ class MetadataStore:
     @_synchronized
     def get_connections(self, note_id: str) -> list[Connection]:
         assert self._conn is not None
-        rows = self._conn.execute(
+        rows = self._exec(
             """SELECT * FROM connections
                WHERE source_note_id = ? OR target_note_id = ?
                ORDER BY strength DESC""",
@@ -490,7 +669,7 @@ class MetadataStore:
     def log_event(self, note_id: str, event: str, status: str,
                   message: str = "", duration_ms: int | None = None) -> None:
         assert self._conn is not None
-        self._conn.execute(
+        self._exec(
             """INSERT INTO ingestion_log (note_id, event, status, message, duration_ms, timestamp)
                VALUES (?, ?, ?, ?, ?, ?)""",
             (note_id, event, status, message, duration_ms, datetime.now().isoformat()),
@@ -504,7 +683,7 @@ class MetadataStore:
         """创建会话。返回 session_id。"""
         assert self._conn is not None
         now = datetime.now().isoformat()
-        self._conn.execute(
+        self._exec(
             "INSERT INTO sessions (id, title, created_at, updated_at) VALUES (?, ?, ?, ?)",
             (session_id, title, now, now),
         )
@@ -515,7 +694,7 @@ class MetadataStore:
     def list_sessions(self, limit: int = 50) -> list[dict]:
         """列出会话（按最近更新排序）。"""
         assert self._conn is not None
-        rows = self._conn.execute(
+        rows = self._exec(
             "SELECT id, title, created_at, updated_at FROM sessions ORDER BY updated_at DESC LIMIT ?",
             (limit,),
         ).fetchall()
@@ -533,7 +712,7 @@ class MetadataStore:
     def get_session(self, session_id: str) -> dict | None:
         """获取会话详情。"""
         assert self._conn is not None
-        row = self._conn.execute(
+        row = self._exec(
             "SELECT id, title, created_at, updated_at FROM sessions WHERE id = ?",
             (session_id,),
         ).fetchone()
@@ -550,7 +729,7 @@ class MetadataStore:
     def rename_session(self, session_id: str, title: str) -> None:
         """重命名会话并刷新 updated_at。"""
         assert self._conn is not None
-        self._conn.execute(
+        self._exec(
             "UPDATE sessions SET title = ?, updated_at = ? WHERE id = ?",
             (title, datetime.now().isoformat(), session_id),
         )
@@ -560,7 +739,7 @@ class MetadataStore:
     def touch_session(self, session_id: str) -> None:
         """刷新会话的 updated_at（有新消息时调用）。"""
         assert self._conn is not None
-        self._conn.execute(
+        self._exec(
             "UPDATE sessions SET updated_at = ? WHERE id = ?",
             (datetime.now().isoformat(), session_id),
         )
@@ -570,7 +749,7 @@ class MetadataStore:
     def delete_session(self, session_id: str) -> None:
         """删除会话（消息级联删除）。"""
         assert self._conn is not None
-        self._conn.execute("DELETE FROM sessions WHERE id = ?", (session_id,))
+        self._exec("DELETE FROM sessions WHERE id = ?", (session_id,))
         self._conn.commit()
 
     # ---- Messages（会话消息） ----
@@ -588,7 +767,7 @@ class MetadataStore:
         import json
 
         timeline_json = json.dumps(timeline or [], ensure_ascii=False)
-        cur = self._conn.execute(
+        cur = self._exec(
             """INSERT INTO messages (session_id, role, content, timeline, created_at)
                VALUES (?, ?, ?, ?, ?)""",
             (session_id, role, content, timeline_json, datetime.now().isoformat()),
@@ -602,7 +781,7 @@ class MetadataStore:
         assert self._conn is not None
         import json
 
-        rows = self._conn.execute(
+        rows = self._exec(
             "SELECT id, role, content, timeline, created_at FROM messages WHERE session_id = ? ORDER BY id",
             (session_id,),
         ).fetchall()
@@ -627,7 +806,7 @@ class MetadataStore:
     def count_messages(self, session_id: str) -> int:
         """会话消息数。"""
         assert self._conn is not None
-        row = self._conn.execute(
+        row = self._exec(
             "SELECT COUNT(*) as cnt FROM messages WHERE session_id = ?",
             (session_id,),
         ).fetchone()
@@ -645,7 +824,7 @@ class MetadataStore:
     ) -> int:
         """保存一条知识片段。返回片段 ID。"""
         assert self._conn is not None
-        cur = self._conn.execute(
+        cur = self._exec(
             """INSERT INTO knowledge_fragments (session_id, title, content, status, created_at)
                VALUES (?, ?, ?, ?, ?)""",
             (session_id, title, content, status, datetime.now().isoformat()),
@@ -658,7 +837,7 @@ class MetadataStore:
     def list_knowledge_fragments(self, limit: int = 50) -> list[dict]:
         """列出知识片段（按时间倒序）。"""
         assert self._conn is not None
-        rows = self._conn.execute(
+        rows = self._exec(
             """SELECT id, session_id, title, content, status, created_at
                FROM knowledge_fragments
                ORDER BY id DESC LIMIT ?""",
@@ -680,7 +859,7 @@ class MetadataStore:
     def find_similar_fragment(self, title: str) -> dict | None:
         """按标题查找已有知识片段（子智能体去重用）。"""
         assert self._conn is not None
-        row = self._conn.execute(
+        row = self._exec(
             "SELECT id, title, content FROM knowledge_fragments WHERE title = ? LIMIT 1",
             (title,),
         ).fetchone()
@@ -692,7 +871,7 @@ class MetadataStore:
     def delete_knowledge_fragment(self, fragment_id: int) -> bool:
         """删除知识片段。返回是否删除成功。"""
         assert self._conn is not None
-        cur = self._conn.execute(
+        cur = self._exec(
             "DELETE FROM knowledge_fragments WHERE id = ?", (fragment_id,)
         )
         self._conn.commit()
@@ -703,7 +882,7 @@ class MetadataStore:
         """按关键词模糊搜索知识片段（标题和内容）。"""
         assert self._conn is not None
         pattern = f"%{keyword}%"
-        rows = self._conn.execute(
+        rows = self._exec(
             """SELECT id, session_id, title, content, status, created_at
                FROM knowledge_fragments
                WHERE title LIKE ? OR content LIKE ?
@@ -728,7 +907,7 @@ class MetadataStore:
     def save_digest_report(self, report_type: str, report_date: str, content: str) -> int:
         """保存摘要报告（同类型同日期覆盖）。"""
         assert self._conn is not None
-        cur = self._conn.execute(
+        cur = self._exec(
             """INSERT INTO digest_reports (report_type, report_date, content, created_at)
                VALUES (?, ?, ?, ?)
                ON CONFLICT(report_type, report_date) DO UPDATE SET
@@ -743,7 +922,7 @@ class MetadataStore:
     def get_digest_report(self, report_type: str, report_date: str) -> dict | None:
         """按类型和日期获取摘要报告。"""
         assert self._conn is not None
-        row = self._conn.execute(
+        row = self._exec(
             "SELECT id, report_type, report_date, content, created_at FROM digest_reports WHERE report_type = ? AND report_date = ?",
             (report_type, report_date),
         ).fetchone()
@@ -753,7 +932,7 @@ class MetadataStore:
     def list_digest_reports(self, limit: int = 10) -> list[dict]:
         """列出最近摘要报告。"""
         assert self._conn is not None
-        rows = self._conn.execute(
+        rows = self._exec(
             "SELECT id, report_type, report_date, content, created_at FROM digest_reports ORDER BY id DESC LIMIT ?",
             (limit,),
         ).fetchall()
@@ -765,7 +944,7 @@ class MetadataStore:
     def get_review(self, note_id: str) -> dict | None:
         """获取笔记的复习状态。"""
         assert self._conn is not None
-        row = self._conn.execute(
+        row = self._exec(
             "SELECT * FROM reviews WHERE note_id = ?", (note_id,)
         ).fetchone()
         return dict(row) if row else None
@@ -783,7 +962,7 @@ class MetadataStore:
         """写入/更新复习状态（SM-2 计算后的结果）。"""
         assert self._conn is not None
         now = datetime.now().isoformat()
-        self._conn.execute(
+        self._exec(
             """INSERT INTO reviews
                (note_id, ease_factor, interval_days, due_date, review_count, last_quality, last_reviewed_at)
                VALUES (?, ?, ?, ?, ?, ?, ?)
@@ -803,7 +982,7 @@ class MetadataStore:
         """一次 SQL 取全部到期复习（含笔记标题）。"""
         assert self._conn is not None
         today = date.today().isoformat()
-        rows = self._conn.execute(
+        rows = self._exec(
             """SELECT r.*, n.title, n.ingested_at
                FROM reviews r
                JOIN notes n ON n.id = r.note_id
@@ -817,7 +996,7 @@ class MetadataStore:
     def get_review_candidates(self, limit: int = 10) -> list[dict]:
         """从未进入复习系统的笔记（首次复习候选）。"""
         assert self._conn is not None
-        rows = self._conn.execute(
+        rows = self._exec(
             """SELECT n.id, n.title, n.ingested_at, n.content_preview
                FROM notes n
                LEFT JOIN reviews r ON r.note_id = n.id
@@ -837,7 +1016,7 @@ class MetadataStore:
         """
         assert self._conn is not None
         pattern = f"%{tag_name}%"
-        rows = self._conn.execute(
+        rows = self._exec(
             """SELECT DISTINCT n.* FROM notes n
                JOIN note_tags nt ON n.id = nt.note_id
                JOIN tags t ON t.id = nt.tag_id
@@ -859,7 +1038,7 @@ class MetadataStore:
             return {}
 
         placeholders = ",".join("?" for _ in note_ids)
-        rows = self._conn.execute(
+        rows = self._exec(
             f"""SELECT nt.note_id, t.id, t.name, t.category, t.is_ai_generated, nt.confidence
                FROM note_tags nt
                JOIN tags t ON t.id = nt.tag_id
@@ -884,7 +1063,7 @@ class MetadataStore:
     def get_tag_counts(self) -> dict[str, int]:
         """一次 SQL 统计全部标签使用次数。"""
         assert self._conn is not None
-        rows = self._conn.execute(
+        rows = self._exec(
             """SELECT t.name, COUNT(*) as cnt
                FROM note_tags nt
                JOIN tags t ON t.id = nt.tag_id
@@ -896,7 +1075,7 @@ class MetadataStore:
     def get_all_connections_flat(self) -> list[dict]:
         """一次 SQL 取全部关联（含两端笔记标题）。"""
         assert self._conn is not None
-        rows = self._conn.execute(
+        rows = self._exec(
             """SELECT c.source_note_id, c.target_note_id, c.relation_type,
                       c.strength, c.description,
                       n1.title AS source_title, n2.title AS target_title
@@ -922,12 +1101,12 @@ class MetadataStore:
     def get_note_degree_map(self) -> dict[str, int]:
         """一次 SQL 统计每篇笔记的关联数（度数）。"""
         assert self._conn is not None
-        rows = self._conn.execute(
+        rows = self._exec(
             """SELECT note_id, COUNT(*) as degree FROM (
                  SELECT source_note_id AS note_id FROM connections
                  UNION ALL
                  SELECT target_note_id FROM connections
-               ) GROUP BY note_id"""
+               ) AS all_notes GROUP BY note_id"""
         ).fetchall()
         return {r["note_id"]: r["degree"] for r in rows}
 
@@ -937,7 +1116,7 @@ class MetadataStore:
     def add_rss_feed(self, url: str) -> int:
         """添加 RSS 源。返回 feed_id。"""
         assert self._conn is not None
-        cur = self._conn.execute(
+        cur = self._exec(
             "INSERT INTO rss_feeds (url, created_at) VALUES (?, ?)",
             (url, datetime.now().isoformat()),
         )
@@ -948,7 +1127,7 @@ class MetadataStore:
     def list_rss_feeds(self) -> list[dict]:
         """列出全部 RSS 源。"""
         assert self._conn is not None
-        rows = self._conn.execute(
+        rows = self._exec(
             "SELECT id, url, title, created_at, last_fetched_at, entry_count FROM rss_feeds ORDER BY id"
         ).fetchall()
         return [dict(r) for r in rows]
@@ -957,7 +1136,7 @@ class MetadataStore:
     def get_rss_feed(self, feed_id: int) -> dict | None:
         """获取单个 RSS 源。"""
         assert self._conn is not None
-        row = self._conn.execute(
+        row = self._exec(
             "SELECT id, url, title, created_at, last_fetched_at, entry_count FROM rss_feeds WHERE id = ?",
             (feed_id,),
         ).fetchone()
@@ -967,7 +1146,7 @@ class MetadataStore:
     def delete_rss_feed(self, feed_id: int) -> bool:
         """删除 RSS 源（条目级联删除）。"""
         assert self._conn is not None
-        cur = self._conn.execute("DELETE FROM rss_feeds WHERE id = ?", (feed_id,))
+        cur = self._exec("DELETE FROM rss_feeds WHERE id = ?", (feed_id,))
         self._conn.commit()
         return cur.rowcount > 0
 
@@ -981,7 +1160,7 @@ class MetadataStore:
         """拉取后更新源信息。"""
         assert self._conn is not None
         now = datetime.now().isoformat()
-        self._conn.execute(
+        self._exec(
             "UPDATE rss_feeds SET title = ?, last_fetched_at = ?, entry_count = entry_count + ? WHERE id = ?",
             (title, now, new_entries, feed_id),
         )
@@ -991,7 +1170,7 @@ class MetadataStore:
     def rss_entry_exists(self, feed_id: int, entry_id: str) -> bool:
         """检查 feed 条目是否已处理过。"""
         assert self._conn is not None
-        row = self._conn.execute(
+        row = self._exec(
             "SELECT 1 FROM rss_entries WHERE feed_id = ? AND entry_id = ?",
             (feed_id, entry_id),
         ).fetchone()
@@ -1009,7 +1188,7 @@ class MetadataStore:
     ) -> int:
         """记录一条已处理的 feed 条目。"""
         assert self._conn is not None
-        cur = self._conn.execute(
+        cur = self._exec(
             """INSERT OR IGNORE INTO rss_entries (feed_id, entry_id, title, link, note_id, published_at)
                VALUES (?, ?, ?, ?, ?, ?)""",
             (feed_id, entry_id, title, link, note_id, published),
@@ -1041,7 +1220,7 @@ class MetadataStore:
         import json
 
         meta_json = json.dumps(metadata, ensure_ascii=False) if metadata else None
-        cur = self._conn.execute(
+        cur = self._exec(
             """INSERT INTO metrics (trace_id, metric_type, metric_name, value, metadata, created_at)
                VALUES (?, ?, ?, ?, ?, ?)""",
             (trace_id, metric_type, metric_name, value, meta_json, datetime.now().isoformat()),
@@ -1068,7 +1247,7 @@ class MetadataStore:
         cutoff = (datetime.now() - timedelta(hours=hours)).isoformat()
 
         # 问答次数（只数 count 行）+ 平均延迟（只取 latency_ms 行）
-        ask_row = self._conn.execute(
+        ask_row = self._exec(
             """SELECT
                       SUM(CASE WHEN metric_name='count' THEN 1 ELSE 0 END) as cnt,
                       AVG(CASE WHEN metric_name='latency_ms' THEN value END) as avg_lat
@@ -1077,20 +1256,20 @@ class MetadataStore:
         ).fetchone()
 
         # 工具调用次数
-        tool_row = self._conn.execute(
+        tool_row = self._exec(
             "SELECT COUNT(*) as cnt FROM metrics WHERE metric_type='tool_call' AND created_at >= ?",
             (cutoff,),
         ).fetchone()
 
         # LLM token 总消耗
-        token_row = self._conn.execute(
+        token_row = self._exec(
             """SELECT COALESCE(SUM(value), 0) as total
                FROM metrics WHERE metric_type='llm_call' AND metric_name='token_count' AND created_at >= ?""",
             (cutoff,),
         ).fetchone()
 
         # 摄入次数（只数 count 行）+ 平均延迟
-        ingest_row = self._conn.execute(
+        ingest_row = self._exec(
             """SELECT
                       SUM(CASE WHEN metric_name='count' THEN 1 ELSE 0 END) as cnt,
                       AVG(CASE WHEN metric_name='latency_ms' THEN value END) as avg_lat
@@ -1099,7 +1278,7 @@ class MetadataStore:
         ).fetchone()
 
         # 按小时分布（最近 24 小时的问答数和 token）
-        hourly_rows = self._conn.execute(
+        hourly_rows = self._exec(
             """SELECT strftime('%H', created_at) as hour,
                       SUM(CASE WHEN metric_type='ask' AND metric_name='count' THEN 1 ELSE 0 END) as ask_cnt,
                       SUM(CASE WHEN metric_type='llm_call' AND metric_name='token_count' THEN value ELSE 0 END) as token_total
@@ -1128,7 +1307,7 @@ class MetadataStore:
         按 trace_id 聚合，返回每条 trace 的汇总信息。
         """
         assert self._conn is not None
-        rows = self._conn.execute(
+        rows = self._exec(
             """SELECT trace_id,
                       MIN(created_at) as started_at,
                       MAX(created_at) as ended_at,
@@ -1159,7 +1338,7 @@ class MetadataStore:
         assert self._conn is not None
         import json
 
-        rows = self._conn.execute(
+        rows = self._exec(
             """SELECT id, metric_type, metric_name, value, metadata, created_at
                FROM metrics WHERE trace_id = ?
                ORDER BY id""",
@@ -1210,22 +1389,53 @@ class MetadataStore:
         import json
 
         # seq 在同一 trace 内递增
-        seq_row = self._conn.execute(
+        seq_row = self._exec(
             "SELECT COALESCE(MAX(seq), -1) + 1 as next_seq FROM trace_events WHERE trace_id = ?",
             (trace_id,),
         ).fetchone()
         seq = seq_row["next_seq"] if seq_row else 0
 
         token_json = json.dumps(token_usage, ensure_ascii=False) if token_usage else None
-        cur = self._conn.execute(
+        now_iso = datetime.now().isoformat()
+        cur = self._exec(
             """INSERT INTO trace_events
                (trace_id, seq, event_type, name, input, output, token_usage, latency_ms, run_id, created_at)
                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (trace_id, seq, event_type, name, input_data, output, token_json, latency_ms,
-             run_id, datetime.now().isoformat()),
+             run_id, now_iso),
         )
+        # 同步累加用量计数器（仅 llm_end 有 token_usage 时）
+        if event_type == "llm_end" and token_usage and token_usage.get("total", 0) > 0:
+            self._increment_usage_counters(token_usage, now_iso)
         self._conn.commit()
         return cur.lastrowid
+
+    def _increment_usage_counters(self, token_usage: dict, now_iso: str) -> None:
+        """累加用量到 today/month/total 三个周期计数器。
+
+        计数器独立于 trace_events（不可变审计日志），重置只清零计数器不删历史。
+        跨天/跨月自动轮转：period_key 变了则老行保留、新行从 0 开始。
+        """
+        from datetime import datetime
+
+        now = datetime.fromisoformat(now_iso)
+        today_key = now.strftime("%Y-%m-%d")
+        month_key = now.strftime("%Y-%m")
+        tokens = int(token_usage.get("total", 0))
+        cost = float(token_usage.get("cost", 0.0))
+
+        for period_type, period_key in [("today", today_key), ("month", month_key), ("total", "all")]:
+            # UPSERT：存在则累加，不存在则新建（period_key 不匹配时 INSERT 新行）
+            self._exec(
+                """INSERT INTO usage_counters (period_type, period_key, tokens, cost, calls, updated_at)
+                   VALUES (?, ?, ?, ?, 1, ?)
+                   ON CONFLICT(period_type, period_key) DO UPDATE SET
+                     tokens = tokens + excluded.tokens,
+                     cost = cost + excluded.cost,
+                     calls = calls + 1,
+                     updated_at = excluded.updated_at""",
+                (period_type, period_key, tokens, cost, now_iso),
+            )
 
     @_synchronized
     def get_trace_events(self, trace_id: str) -> list[dict]:
@@ -1238,7 +1448,7 @@ class MetadataStore:
         assert self._conn is not None
         import json
 
-        rows = self._conn.execute(
+        rows = self._exec(
             """SELECT id, seq, event_type, name, input, output, token_usage, latency_ms, run_id, created_at
                FROM trace_events WHERE trace_id = ? ORDER BY seq""",
             (trace_id,),
@@ -1319,31 +1529,30 @@ class MetadataStore:
     def get_cost_summary(self) -> dict:
         """获取成本汇总（今日/本月/总累计 + 配额用量）。
 
-        成本数据从 trace_events.token_usage JSON 的 cost 字段聚合。
+        从 usage_counters 表读取（独立计数器），不再 SUM trace_events。
+        重置只清零计数器，不删除历史调用记录。
         """
         assert self._conn is not None
         from datetime import datetime
 
         now = datetime.now()
-        today_start = now.replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
-        month_start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0).isoformat()
+        today_key = now.strftime("%Y-%m-%d")
+        month_key = now.strftime("%Y-%m")
 
-        def _sum_cost(since: str) -> tuple[float, int]:
-            """返回 (成本, token) — 从 trace_events 的 token_usage.cost 聚合。"""
-            row = self._conn.execute(
-                """SELECT
-                    COALESCE(SUM(json_extract(token_usage, '$.cost')), 0) as cost,
-                    COALESCE(SUM(json_extract(token_usage, '$.total')), 0) as tokens
-                   FROM trace_events
-                   WHERE event_type='llm_end' AND token_usage IS NOT NULL
-                     AND created_at >= ?""",
-                (since,),
+        def _read(period_type: str, period_key: str) -> tuple[float, int]:
+            """返回 (成本, token) — 从 usage_counters 读取指定周期。"""
+            row = self._exec(
+                "SELECT COALESCE(tokens, 0) as tokens, COALESCE(cost, 0) as cost "
+                "FROM usage_counters WHERE period_type=? AND period_key=?",
+                (period_type, period_key),
             ).fetchone()
-            return round(row["cost"], 6), int(row["tokens"] or 0)
+            if row:
+                return round(float(row["cost"]), 6), int(row["tokens"])
+            return 0.0, 0
 
-        today_cost, today_tokens = _sum_cost(today_start)
-        month_cost, month_tokens = _sum_cost(month_start)
-        total_cost, total_tokens = _sum_cost("1970-01-01")
+        today_cost, today_tokens = _read("today", today_key)
+        month_cost, month_tokens = _read("month", month_key)
+        total_cost, total_tokens = _read("total", "all")
 
         return {
             "today": {"cost": today_cost, "tokens": today_tokens},
@@ -1352,13 +1561,34 @@ class MetadataStore:
         }
 
     @_synchronized
+    def reset_usage_counters(self, period: str = "today") -> None:
+        """重置用量计数器（不删除历史调用记录）。
+
+        Args:
+            period: 'today' | 'month' — 重置今日或本月计数器。
+                    'total' 不允许重置（累计值不可变）。
+        """
+        assert self._conn is not None
+        assert period in ("today", "month"), f"不支持重置周期: {period}"
+        from datetime import datetime
+
+        now = datetime.now()
+        period_key = now.strftime("%Y-%m-%d") if period == "today" else now.strftime("%Y-%m")
+        self._exec(
+            "DELETE FROM usage_counters WHERE period_type=? AND period_key=?",
+            (period, period_key),
+        )
+        self._conn.commit()
+        logger.info(f"用量计数器已重置: {period} (period_key={period_key})")
+
+    @_synchronized
     def get_cost_by_model(self, hours: int = 24) -> list[dict]:
         """按模型聚合成本（最近 N 小时）。"""
         assert self._conn is not None
         from datetime import datetime, timedelta
 
         cutoff = (datetime.now() - timedelta(hours=hours)).isoformat()
-        rows = self._conn.execute(
+        rows = self._exec(
             """SELECT
                     COALESCE(name, 'unknown') as model,
                     SUM(json_extract(token_usage, '$.prompt')) as prompt_t,
@@ -1391,7 +1621,7 @@ class MetadataStore:
         from datetime import datetime, timedelta
 
         cutoff = (datetime.now() - timedelta(days=days)).isoformat()
-        rows = self._conn.execute(
+        rows = self._exec(
             """SELECT
                     substr(created_at, 1, 10) as day,
                     SUM(json_extract(token_usage, '$.total')) as total_t,
@@ -1431,7 +1661,7 @@ class MetadataStore:
         import json
 
         dim_json = json.dumps(dimensions, ensure_ascii=False) if dimensions else None
-        cur = self._conn.execute(
+        cur = self._exec(
             """INSERT INTO eval_scores (trace_id, question, answer, score, dimensions, comment, run_id, judged_at)
                VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
             (trace_id, question[:500], answer[:1000], score, dim_json, comment,
@@ -1446,7 +1676,7 @@ class MetadataStore:
         assert self._conn is not None
         import json
 
-        rows = self._conn.execute(
+        rows = self._exec(
             """SELECT id, trace_id, question, answer, score, dimensions, comment, judged_at
                FROM eval_scores ORDER BY judged_at DESC LIMIT ?""",
             (limit,),
@@ -1473,7 +1703,7 @@ class MetadataStore:
     def get_eval_score_summary(self) -> dict:
         """评估打分汇总（平均分/总数/分布）。"""
         assert self._conn is not None
-        row = self._conn.execute(
+        row = self._exec(
             """SELECT
                     COUNT(*) as cnt,
                     AVG(score) as avg_score,
@@ -1510,7 +1740,7 @@ class MetadataStore:
         import json
 
         details_json = json.dumps(details, ensure_ascii=False) if details else None
-        cur = self._conn.execute(
+        cur = self._exec(
             """INSERT INTO eval_runs
                (run_type, total, passed, pass_rate, avg_score, duration_ms, details, created_at)
                VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
@@ -1533,7 +1763,7 @@ class MetadataStore:
             params.append(run_type)
         sql += " ORDER BY created_at DESC LIMIT ?"
         params.append(limit)
-        rows = self._conn.execute(sql, params).fetchall()
+        rows = self._exec(sql, params).fetchall()
         result = []
         for r in rows:
             try:
@@ -1572,7 +1802,7 @@ class MetadataStore:
             return False
         set_clause = ", ".join(f"{k}=?" for k in updates)
         params = list(updates.values()) + [run_id]
-        cur = self._conn.execute(
+        cur = self._exec(
             f"UPDATE eval_runs SET {set_clause} WHERE id=?", params
         )
         self._conn.commit()
@@ -1597,7 +1827,7 @@ class MetadataStore:
         now = datetime.now().isoformat()
         kw_json = json.dumps(expected_keywords or [], ensure_ascii=False)
         src_json = json.dumps(expected_sources or [], ensure_ascii=False)
-        self._conn.execute(
+        self._exec(
             """INSERT INTO golden_cases (id, question, expected_keywords, expected_sources, min_score, enabled, created_at, updated_at)
                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                ON CONFLICT(id) DO UPDATE SET
@@ -1622,7 +1852,7 @@ class MetadataStore:
         if enabled_only:
             sql += " WHERE enabled=1"
         sql += " ORDER BY id"
-        rows = self._conn.execute(sql).fetchall()
+        rows = self._exec(sql).fetchall()
         result = []
         for r in rows:
             try:
@@ -1667,7 +1897,7 @@ class MetadataStore:
         updates["updated_at"] = datetime.now().isoformat()
         set_clause = ", ".join(f"{k}=?" for k in updates)
         params = list(updates.values()) + [case_id]
-        cur = self._conn.execute(
+        cur = self._exec(
             f"UPDATE golden_cases SET {set_clause} WHERE id=?", params
         )
         self._conn.commit()
@@ -1677,7 +1907,7 @@ class MetadataStore:
     def delete_golden_case(self, case_id: str) -> bool:
         """删除 golden case。"""
         assert self._conn is not None
-        cur = self._conn.execute("DELETE FROM golden_cases WHERE id=?", (case_id,))
+        cur = self._exec("DELETE FROM golden_cases WHERE id=?", (case_id,))
         self._conn.commit()
         return cur.rowcount > 0
 
@@ -1697,7 +1927,7 @@ class MetadataStore:
         import json
 
         extra_json = json.dumps(extra, ensure_ascii=False) if extra else None
-        cur = self._conn.execute(
+        cur = self._exec(
             """INSERT INTO bad_cases (trace_id, question, answer, reason, extra, collected_at)
                VALUES (?, ?, ?, ?, ?, ?)""",
             (trace_id, question[:500], answer[:1000] if answer else "",
@@ -1712,7 +1942,7 @@ class MetadataStore:
         assert self._conn is not None
         import json
 
-        rows = self._conn.execute(
+        rows = self._exec(
             "SELECT * FROM bad_cases ORDER BY collected_at DESC LIMIT ?", (limit,)
         ).fetchall()
         result = []
@@ -1736,14 +1966,14 @@ class MetadataStore:
     def delete_bad_case(self, case_id: int) -> bool:
         """删除 bad case。"""
         assert self._conn is not None
-        cur = self._conn.execute("DELETE FROM bad_cases WHERE id=?", (case_id,))
+        cur = self._exec("DELETE FROM bad_cases WHERE id=?", (case_id,))
         self._conn.commit()
         return cur.rowcount > 0
 
     # ---- Helpers ----
 
     @staticmethod
-    def _row_to_note(row: sqlite3.Row) -> NoteMetadata:
+    def _row_to_note(row) -> NoteMetadata:
         return NoteMetadata(
             id=row["id"], title=row["title"],
             source_type=SourceType(row["source_type"]) if row["source_type"] else SourceType.MARKDOWN,
@@ -1758,7 +1988,7 @@ class MetadataStore:
         )
 
     @staticmethod
-    def _row_to_connection(row: sqlite3.Row) -> Connection:
+    def _row_to_connection(row) -> Connection:
         return Connection(
             id=row["id"], source_note_id=row["source_note_id"],
             target_note_id=row["target_note_id"],

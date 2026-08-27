@@ -862,6 +862,54 @@ def eval_cmd(dataset: str | None, limit: int | None, verbose: bool):
 
 
 # ============================================================
+# brain budget — 预算用量查询/重置
+# ============================================================
+
+
+@cli.command()
+@click.option("--reset", is_flag=True, help="重置今日用量（清零计数器，不删历史记录）")
+@click.option("--reset-month", is_flag=True, help="重置本月用量")
+@click.option("--set-limit", type=int, default=None, help="临时设置日 token 配额（仅本次会话生效）")
+def budget(reset: bool, reset_month: bool, set_limit: int | None):
+    """查看或重置 token/成本预算用量。
+
+    \b
+    示例:
+      brain budget              # 查看当前用量
+      brain budget --reset      # 重置今日用量（不删历史记录）
+      brain budget --reset-month  # 重置本月用量
+    """
+    from brain.config import get_config
+    from brain.storage.metadata import MetadataStore
+
+    cfg = get_config()
+    store = MetadataStore(cfg.storage.db_path)
+    store.initialize()
+
+    if reset or reset_month:
+        period = "today" if reset else "month"
+        scope = "今日" if reset else "本月"
+        # 只清零用量计数器，不删除 trace_events 历史调用记录
+        store.reset_usage_counters(period)
+        click.echo(f"✅ {scope}用量已重置（历史记录保留）")
+
+    summary = store.get_cost_summary()
+    click.echo("\n=== 预算用量 ===")
+    click.echo(f"今日：{summary['today']['tokens']} token / ¥{summary['today']['cost']}")
+    click.echo(f"本月：{summary['month']['tokens']} token / ¥{summary['month']['cost']}")
+    click.echo(f"累计：{summary['total']['tokens']} token / ¥{summary['total']['cost']}")
+
+    cost_cfg = cfg.cost
+    click.echo(f"\n配额：日 {cost_cfg.daily_token_limit} token / ¥{cost_cfg.daily_cost_limit}，"
+               f"月 {cost_cfg.monthly_token_limit} token")
+
+    if set_limit is not None:
+        cost_cfg.daily_token_limit = set_limit
+        click.echo(f"\n⚠️  日 token 配额已临时设为 {set_limit}（仅本次进程生效）")
+    store.close()
+
+
+# ============================================================
 # brain ui — 启动 Web 界面
 # ============================================================
 
