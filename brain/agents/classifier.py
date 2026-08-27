@@ -39,21 +39,6 @@ class ClassifierAgent(BaseAgent):
     name = "classifier"
     output_model = ClassificationOutput
 
-    system_prompt = """你是一个知识分类专家。你需要分析给定的文本内容，并输出结构化的分类结果。
-
-规则：
-1. **topics（主题标签）**: 识别 1-5 个核心技术/领域主题。标签要具体（如 "LangGraph 状态管理" 而不是 "技术"）。按置信度降序排列。
-2. **content_type（内容类型）**: 判断内容属于以下哪种：
-   - 教程/指南: 系统的教学性内容
-   - 观点/思考: 个人的见解、反思、想法
-   - 摘录/引用: 从其他来源摘录的内容
-   - 问题/疑问: 提出的问题或疑惑
-   - 总结/笔记: 对某主题的总结梳理
-   - 实践/代码: 包含具体代码示例的实践内容
-3. 置信度表示你对分类的确信程度（1.0 = 非常确定）。
-
-只输出 JSON，不要输出其他内容。"""
-
     def build_user_prompt(self, note_title: str, content: str) -> str:
         return f"""请分析以下笔记内容并分类：
 

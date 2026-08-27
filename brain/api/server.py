@@ -1205,6 +1205,81 @@ def run_eval_dataset(limit: int = Query(0, ge=0, le=50, description="只跑前 N
     }
 
 
+# ---- Prompts CRUD（Phase 5E FR56） ----
+
+
+@app.get("/api/prompts")
+def list_prompts():
+    """列出全部提示词（不含正文，列表展示用）。"""
+    _init()
+    return _metadata_store.list_prompts()
+
+
+@app.get("/api/prompts/{prompt_key}")
+def get_prompt_detail(prompt_key: str):
+    """获取单条提示词详情（含正文）。"""
+    from fastapi import HTTPException
+
+    _init()
+    row = _metadata_store.get_prompt(prompt_key)
+    if not row:
+        raise HTTPException(status_code=404, detail="提示词不存在")
+    return row
+
+
+class PromptUpdateRequest(BaseModel):
+    content: str = Field(..., description="提示词正文")
+    enabled: bool | None = Field(None, description="是否启用（不传则不变）")
+
+
+@app.put("/api/prompts/{prompt_key}")
+def update_prompt(prompt_key: str, req: PromptUpdateRequest):
+    """更新提示词内容（version 自增），并刷新缓存即时生效。"""
+    from fastapi import HTTPException
+
+    _init()
+    if not _metadata_store.update_prompt(prompt_key, req.content, req.enabled):
+        raise HTTPException(status_code=404, detail="提示词不存在")
+    # 刷新缓存，下次 Agent 调用即用新提示词
+    from brain.prompts import reload_prompt
+
+    reload_prompt(prompt_key)
+    return {"message": "已更新", "prompt_key": prompt_key}
+
+
+@app.get("/api/prompts/{prompt_key}/versions")
+def list_prompt_versions(prompt_key: str):
+    """列出某提示词的历史版本（按版本号降序）。"""
+    _init()
+    return _metadata_store.list_prompt_versions(prompt_key)
+
+
+@app.get("/api/prompts/{prompt_key}/versions/{version}")
+def get_prompt_version(prompt_key: str, version: int):
+    """获取某历史版本的正文。"""
+    from fastapi import HTTPException
+
+    _init()
+    row = _metadata_store.get_prompt_version(prompt_key, version)
+    if not row:
+        raise HTTPException(status_code=404, detail="历史版本不存在")
+    return row
+
+
+@app.post("/api/prompts/{prompt_key}/versions/{version}/restore")
+def restore_prompt_version(prompt_key: str, version: int):
+    """恢复某历史版本为最新（该版本内容设为当前，version 继续自增）。"""
+    from fastapi import HTTPException
+
+    _init()
+    if not _metadata_store.restore_prompt_version(prompt_key, version):
+        raise HTTPException(status_code=404, detail="历史版本不存在")
+    from brain.prompts import reload_prompt
+
+    reload_prompt(prompt_key)
+    return {"message": f"已恢复 v{version}", "prompt_key": prompt_key}
+
+
 @app.get("/api/metrics/traces/{trace_id}")
 def get_trace_detail(trace_id: str):
     """某条 trace 的完整调用链。
@@ -1343,6 +1418,17 @@ def serve_frontend():
         from fastapi.responses import FileResponse
         return FileResponse(index_path)
     return {"message": "前端未构建。运行: cd frontend && npm run build"}
+
+
+@app.get("/{full_path:path}")
+def serve_spa(full_path: str):
+    """SPA fallback：所有非 /api 路径返回 index.html（支持前端路由刷新）。"""
+    # /assets/* 已由 StaticFiles 处理，不会走到这里
+    index_path = _frontend_dist / "index.html"
+    if index_path.exists():
+        from fastapi.responses import FileResponse
+        return FileResponse(index_path)
+    return {"message": "前端未构建"}
 
 
 if __name__ == "__main__":

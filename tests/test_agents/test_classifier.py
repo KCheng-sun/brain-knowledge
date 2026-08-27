@@ -73,13 +73,17 @@ class TestClassifierPrompt:
         assert "asyncio 是 Python" in prompt
 
     def test_full_prompt_includes_schema(self):
-        """完整 prompt 包含 JSON 输出格式说明。"""
+        """user prompt 包含 JSON 输出格式说明（system_prompt 已分离为单独角色）。"""
+        from brain.prompts import get_prompt
+
         agent = ClassifierAgent()
-        full = agent._build_full_prompt("测试内容")
-        assert "你是一个知识分类专家" in full
-        assert "测试内容" in full
-        assert "topics" in full.lower()
-        assert "content_type" in full.lower()
+        # system_prompt 从数据库读取（测试环境回退到默认值）
+        sys_prompt = get_prompt("classifier")
+        user_prompt = agent._build_user_prompt_with_schema("测试内容")
+        assert "你是一个知识分类专家" in sys_prompt
+        assert "测试内容" in user_prompt
+        assert "topics" in user_prompt.lower()
+        assert "content_type" in user_prompt.lower()
 
 
 class TestJSONParsing:

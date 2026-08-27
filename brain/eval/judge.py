@@ -2,6 +2,7 @@
 
 用 DeepSeek 当裁判，对问答抽样打分（1-5 分 + 维度 + 评语）。
 成本可控：抽样 + 单次 Judge 调用。
+提示词从 prompts 表读取（Phase 5E），key="judge"。
 """
 
 from __future__ import annotations
@@ -11,25 +12,7 @@ from typing import Any
 
 from loguru import logger
 
-JUDGE_PROMPT = """你是一个严格的问题回答质量评估员。请对以下问答对打分。
-
-## 问题
-{question}
-
-## 回答
-{answer}
-
-## 知识库相关片段（供参考判断准确性）
-{context}
-
-## 评分标准
-- relevance（相关性，1-5）：回答是否切题
-- accuracy（准确性，1-5）：内容是否正确、有无编造
-- completeness（完整性，1-5）：回答是否充分
-
-## 输出格式（严格 JSON，不要其他内容）
-{{"score": <1-5 总分>, "dimensions": {{"relevance": <1-5>, "accuracy": <1-5>, "completeness": <1-5>}}, "comment": "<一句话评语>"}}
-"""
+from brain.prompts import get_prompt_template
 
 
 class LLMJudge:
@@ -73,17 +56,28 @@ class LLMJudge:
             {"score": 1-5, "dimensions": {...}, "comment": "..."}
             失败时返回 {"score": 0, "error": "..."}
         """
-        prompt = JUDGE_PROMPT.format(
+        prompt = get_prompt_template(
+            "judge",
             question=question[:500],
             answer=answer[:2000],
             context=context[:1000] or "（无参考片段）",
         )
 
         try:
-            from langchain_core.messages import HumanMessage
+            from langchain_core.messages import HumanMessage, SystemMessage
 
             llm = self._get_llm()
-            response = llm.invoke([HumanMessage(content=prompt)])
+            # 拆分 system / user：提示词用 ---USER--- 标记边界
+            if "---USER---" in prompt:
+                sys_text, user_text = prompt.split("---USER---", 1)
+                messages = [
+                    SystemMessage(content=sys_text.strip()),
+                    HumanMessage(content=user_text.strip()),
+                ]
+            else:
+                # 兼容旧格式（无分隔符）
+                messages = [HumanMessage(content=prompt)]
+            response = llm.invoke(messages)
             text = response.content if hasattr(response, "content") else str(response)
 
             # 解析 JSON（LLM 可能输出多余文本，提取第一个 JSON 块）

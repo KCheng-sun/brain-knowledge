@@ -385,130 +385,137 @@ function formatArgs(args) {
       <!-- 空状态欢迎页 -->
       <div v-if="messages.length === 0" class="welcome">
         <div class="welcome-logo">🧠</div>
-        <h2 class="welcome-title">向你的第二大脑提问</h2>
-        <p class="welcome-sub">
+        <a-typography-title :level="3">向你的第二大脑提问</a-typography-title>
+        <a-typography-paragraph type="secondary">
           深度 Agent 会自动搜索知识库、追踪笔记关联、多步推理后回答
-        </p>
+        </a-typography-paragraph>
         <div class="welcome-examples">
-          <button
+          <a-button
             v-for="ex in [
               '我最近关于 LangGraph 的思考有哪些关键结论？',
               '我的知识库中哪些笔记互相关联？',
               '总结一下我对 Agent 架构的理解',
             ]"
             :key="ex"
-            class="example-chip"
+            block
             @click="question = ex"
           >
             {{ ex }}
-          </button>
+          </a-button>
         </div>
       </div>
 
       <!-- 消息列表 -->
-      <div
-        v-for="(m, i) in messages"
-        :key="i"
-        :class="['message', m.role === 'user' ? 'user' : 'assistant']"
+      <a-list
+        v-if="messages.length"
+        :data-source="messages"
+        :split="false"
+        item-layout="vertical"
+        style="padding: 16px 4px"
       >
-        <div class="role-label">{{ m.role === "user" ? "YOU" : "BRAIN" }}</div>
+        <template #renderItem="{ item: m, index: i }">
+          <a-list-item style="border: none; padding: 0 0 16px">
+            <div :class="['msg-row', m.role === 'user' ? 'msg-right' : 'msg-left']">
+              <!-- 用户消息内容 -->
+              <div v-if="m.role === 'user'" class="user-bubble">{{ m.content }}</div>
 
-        <!-- 用户消息 -->
-        <div v-if="m.role === 'user'" class="user-bubble">{{ m.content }}</div>
+              <!-- assistant 消息：统一时间线 -->
+              <div v-else class="assistant-block">
+                <div class="assistant-bubble">
+                <a-timeline v-if="(m.timeline || []).length">
+                  <a-timeline-item
+                    v-for="(tl, k) in m.timeline || []"
+                    :key="'tl' + k"
+                    :color="tl.kind === 'tool' ? 'blue' : tl.kind === 'proposal' ? 'gold' : 'gray'"
+                  >
+                    <!-- 思考片段 -->
+                    <div
+                      v-if="tl.kind === 'thought'"
+                      class="thought-text"
+                      v-html="renderMarkdown(tl.content)"
+                    ></div>
 
-        <!-- assistant 消息：统一时间线 -->
-        <template v-else>
-          <div
-            v-for="(item, k) in m.timeline || []"
-            :key="'tl' + k"
-          >
-            <!-- 思考片段 -->
-            <div
-              v-if="item.kind === 'thought'"
-              class="thought-text"
-              v-html="renderMarkdown(item.content)"
-            ></div>
+                    <!-- 工具调用 -->
+                    <a-tag v-else-if="tl.kind === 'tool'" :color="tl.done ? 'success' : 'processing'">
+                      {{ tl.done ? '✓' : '⟳' }} {{ tl.name }}
+                      <span v-if="tl.args" style="color: rgba(0,0,0,0.45)"> {{ tl.args }}</span>
+                    </a-tag>
 
-            <!-- 工具调用 -->
-            <div
-              v-else-if="item.kind === 'tool'"
-              :class="['tool-entry', item.done ? 'done' : 'running']"
-            >
-              <span class="tool-icon">{{ item.done ? "✓" : "⟳" }}</span>
-              <span class="tool-name">{{ item.name }}</span>
-              <span v-if="item.args" class="tool-args">{{ item.args }}</span>
+                    <!-- 知识片段提案（HIL 确认卡片） -->
+                    <a-card
+                      v-else-if="tl.kind === 'proposal'"
+                      size="small"
+                      :bordered="!tl.decided"
+                      :style="{ maxWidth: 480 }"
+                    >
+                      <template #title>
+                        <a-space>
+                          <span>💡 建议保存知识片段</span>
+                          <a-tag v-if="tl.decided" :color="tl.decision === 'reject' ? 'default' : 'success'">
+                            {{ tl.decision === 'approve' ? '✅ 已保存' : tl.decision === 'edit' ? '✅ 已保存(编辑)' : '🗑 已拒绝' }}
+                          </a-tag>
+                        </a-space>
+                      </template>
+                      <a-typography-title :level="5" style="margin: 0 0 8px">{{ tl.title }}</a-typography-title>
+                      <a-typography-paragraph style="margin: 0" type="secondary">{{ tl.content }}</a-typography-paragraph>
+                      <a-space v-if="!tl.decided" style="margin-top: 12px">
+                        <a-button type="primary" size="small" @click="m._decide({ type: 'approve' })">保存</a-button>
+                        <a-button danger size="small" @click="m._decide({ type: 'reject', message: '用户选择不保存' })">拒绝</a-button>
+                      </a-space>
+                    </a-card>
+                  </a-timeline-item>
+                </a-timeline>
+
+                <!-- 最终答案 -->
+                <div
+                  v-if="m.content"
+                  class="answer-text"
+                  v-html="renderMarkdown(m.content)"
+                ></div>
+
+                <!-- 点踩按钮（Phase 5D FR54 bad case 回流） -->
+                <div v-if="m.content" style="margin-top: 4px">
+                  <a-button
+                    v-if="!m.thumbsDown"
+                    size="small"
+                    @click="thumbsDown(m)"
+                    title="这个回答不好，反馈给开发"
+                  >👎 这个回答不好</a-button>
+                  <a-tag v-else color="default">已反馈 ✓</a-tag>
+                </div>
+                </div>
+
+                <!-- 思考中 -->
+                <a-space v-if="!m.content && !(m.timeline || []).length && loading && i === messages.length - 1">
+                  <a-spin size="small" />
+                  <span>{{ statusMsg || 'Agent 正在思考' }}</span>
+                </a-space>
+              </div>
             </div>
-
-            <!-- 知识片段提案（HIL 确认卡片） -->
-            <div
-              v-else-if="item.kind === 'proposal'"
-              :class="['proposal-card', item.decided ? 'decided' : 'pending']"
-            >
-              <div class="proposal-header">
-                <span class="proposal-icon">💡</span>
-                <span class="proposal-title">建议保存知识片段</span>
-                <span v-if="item.decided" class="proposal-result">
-                  {{ item.decision === "approve" ? "✅ 已保存" : item.decision === "edit" ? "✅ 已保存(编辑)" : "🗑 已拒绝" }}
-                </span>
-              </div>
-              <div class="proposal-body">
-                <div class="proposal-frag-title">{{ item.title }}</div>
-                <div class="proposal-frag-content">{{ item.content }}</div>
-              </div>
-              <div v-if="!item.decided" class="proposal-actions">
-                <button class="p-btn approve" @click="m._decide({ type: 'approve' })">
-                  保存
-                </button>
-                <button class="p-btn reject" @click="m._decide({ type: 'reject', message: '用户选择不保存' })">
-                  拒绝
-                </button>
-              </div>
-            </div>
-          </div>
-
-          <!-- 最终答案 -->
-          <div
-            v-if="m.content"
-            class="answer-text"
-            v-html="renderMarkdown(m.content)"
-          ></div>
-
-          <!-- 点踩按钮（Phase 5D FR54 bad case 回流） -->
-          <div v-if="m.content && m.role === 'assistant'" class="message-actions">
-            <button
-              v-if="!m.thumbsDown"
-              class="feedback-btn"
-              @click="thumbsDown(m)"
-              title="这个回答不好，反馈给开发"
-            >👎</button>
-            <span v-else class="feedback-done">已反馈 ✓</span>
-          </div>
-
-          <!-- 思考中 -->
-          <div
-            v-if="!m.content && !(m.timeline || []).length && loading && i === messages.length - 1"
-            class="thinking-line"
-          >
-            <span class="thinking-dots"><span></span><span></span><span></span></span>
-            <span>{{ statusMsg || "Agent 正在思考" }}</span>
-          </div>
+          </a-list-item>
         </template>
-      </div>
+      </a-list>
     </div>
 
     <!-- 输入区 -->
     <div class="input-bar">
       <div class="input-wrap">
-        <input
-          v-model="question"
-          class="input"
-          placeholder="输入问题，Enter 发送 — Agent 将搜索知识库并深度推理"
-          @keyup.enter="send"
+        <a-textarea
+          v-model:value="question"
+          class="input-field"
+          placeholder="输入问题，Enter 发送（Shift+Enter 换行）— Agent 将搜索知识库并深度推理"
+          :auto-size="{ minRows: 2, maxRows: 6 }"
           :disabled="loading"
+          @keydown.enter.exact.prevent="send"
         />
-        <button class="send-btn" :disabled="loading || !question.trim()" @click="send">
-          {{ loading ? "⏳" : "➤" }}
-        </button>
+        <a-button
+          type="primary"
+          class="send-btn"
+          :disabled="loading || !question.trim()"
+          @click="send"
+        >
+          {{ loading ? "⏳" : "发送" }}
+        </a-button>
       </div>
     </div>
   </div>
@@ -519,29 +526,19 @@ function formatArgs(args) {
   display: flex;
   flex-direction: column;
   height: 100%;
+  width: 100%;
   max-width: 900px;
   margin: 0 auto;
   padding: 0 24px;
+  box-sizing: border-box;
 }
 
 /* ============ 聊天区域 ============ */
 .chat-box {
   flex: 1;
   overflow-y: auto;
-  padding: 24px 4px 16px;
+  padding: 8px 4px 16px;
   scroll-behavior: smooth;
-}
-
-/* 滚动条 */
-.chat-box::-webkit-scrollbar {
-  width: 6px;
-}
-.chat-box::-webkit-scrollbar-thumb {
-  background: var(--border);
-  border-radius: 3px;
-}
-.chat-box::-webkit-scrollbar-thumb:hover {
-  background: var(--primary-dim);
 }
 
 /* ============ 欢迎页 ============ */
@@ -556,23 +553,6 @@ function formatArgs(args) {
 .welcome-logo {
   font-size: 52px;
   margin-bottom: 16px;
-  filter: drop-shadow(0 4px 16px rgba(0, 132, 255, 0.25));
-}
-
-.welcome-title {
-  font-size: 24px;
-  font-weight: 600;
-  margin-bottom: 8px;
-  background: linear-gradient(90deg, var(--text-main), var(--primary));
-  -webkit-background-clip: text;
-  background-clip: text;
-  color: transparent;
-}
-
-.welcome-sub {
-  font-size: 14px;
-  color: var(--text-dim);
-  margin-bottom: 28px;
 }
 
 .welcome-examples {
@@ -583,301 +563,88 @@ function formatArgs(args) {
   max-width: 480px;
 }
 
-.example-chip {
-  padding: 12px 16px;
-  background: var(--bg-card);
-  border: 1px solid var(--border);
-  border-radius: 10px;
-  color: var(--text-dim);
-  font-size: 14px;
-  cursor: pointer;
-  transition: all 0.15s;
-  text-align: left;
-}
-
-.example-chip:hover {
-  border-color: var(--border-glow);
-  color: var(--primary);
-  box-shadow: 0 2px 12px rgba(0, 132, 255, 0.12);
-}
-
-/* ============ 消息 ============ */
-.message {
-  margin-bottom: 20px;
-  max-width: 92%;
-}
-
-.message.user {
-  margin-left: auto;
-  max-width: 70%;
-}
-
-.role-label {
-  font-family: var(--font-mono);
-  font-size: 11px;
-  letter-spacing: 1.5px;
-  color: var(--text-faint);
-  margin-bottom: 6px;
-}
-
-.user-bubble {
-  padding: 10px 16px;
-  background: linear-gradient(135deg, rgba(0, 132, 255, 0.1), rgba(0, 184, 212, 0.08));
-  border: 1px solid var(--border-glow);
-  border-radius: 12px;
-  font-size: 15px;
-  line-height: 1.6;
-  color: var(--text-main);
-}
-
-/* 思考片段 */
+/* 思考片段：markdown 渲染区 */
 .thought-text {
-  padding: 8px 12px;
-  margin-bottom: 6px;
-  background: var(--bg-panel);
-  border-left: 2px solid var(--border);
-  border-radius: 4px;
   font-size: 13px;
-  color: var(--text-faint);
   line-height: 1.5;
+  color: rgba(0, 0, 0, 0.45);
 }
 
-/* 工具调用条目 */
-.tool-entry {
-  display: inline-flex;
-  align-items: center;
-  gap: 8px;
-  padding: 5px 12px;
-  margin-bottom: 4px;
-  background: var(--bg-card);
-  border: 1px solid var(--border);
-  border-radius: 6px;
-  font-family: var(--font-mono);
-  font-size: 12.5px;
-  color: var(--text-dim);
-  max-width: 100%;
-}
-
-.tool-entry.running {
-  border-color: var(--border-glow);
-  color: var(--primary);
-  animation: glowPulse 1.2s infinite;
-}
-
-.tool-entry.done {
-  border-color: rgba(16, 185, 129, 0.4);
-  color: var(--success);
-}
-
-@keyframes glowPulse {
-  0%, 100% { box-shadow: 0 0 4px rgba(0, 132, 255, 0.12); }
-  50% { box-shadow: 0 0 12px rgba(0, 132, 255, 0.3); }
-}
-
-.tool-icon {
-  font-weight: 700;
-  font-size: 12px;
-}
-
-.tool-name {
-  font-weight: 600;
-}
-
-.tool-args {
-  color: var(--text-faint);
-  font-size: 11px;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-  max-width: 320px;
-}
-
-/* 知识片段提案卡片 */
-.proposal-card {
-  margin: 10px 0;
-  padding: 14px 16px;
-  background: #fffbf0;
-  border: 1px solid #f5d78e;
-  border-radius: 12px;
-  max-width: 480px;
-}
-
-.proposal-card.decided {
-  opacity: 0.75;
-  border-color: var(--border);
-  background: var(--bg-card);
-}
-
-.proposal-header {
+/* 消息行：左右对齐 */
+.msg-row {
   display: flex;
-  align-items: center;
-  gap: 8px;
-  margin-bottom: 10px;
+  width: 100%;
+}
+.msg-right {
+  justify-content: flex-end;
+}
+.msg-left {
+  justify-content: flex-start;
 }
 
-.proposal-icon {
-  font-size: 16px;
-}
-
-.proposal-title {
-  font-size: 14px;
-  font-weight: 600;
-  color: #8a6d1a;
-}
-
-.proposal-card.decided .proposal-title {
-  color: var(--text-dim);
-}
-
-.proposal-result {
-  margin-left: auto;
-  font-size: 13px;
-  font-weight: 600;
-}
-
-.proposal-body {
-  padding: 10px 12px;
-  background: #fffdf5;
-  border: 1px solid #f0e3bd;
+/* 用户消息气泡 */
+.user-bubble {
+  padding: 8px 14px;
+  background: rgba(0, 0, 0, 0.04);
   border-radius: 8px;
-  margin-bottom: 12px;
+  width: 80%;
 }
 
-.proposal-frag-title {
-  font-size: 14px;
-  font-weight: 700;
-  color: var(--text-main);
-  margin-bottom: 4px;
+/* assistant 区块 */
+.assistant-block {
+  width: 100%;
 }
 
-.proposal-frag-content {
-  font-size: 13px;
-  color: var(--text-dim);
-  line-height: 1.6;
-  white-space: pre-wrap;
-}
-
-.proposal-actions {
-  display: flex;
-  gap: 8px;
-}
-
-.p-btn {
-  padding: 7px 20px;
-  border: none;
+/* 整体气泡：包含工具链 + 答案 + 反馈 */
+.assistant-bubble {
+  padding: 8px 14px;
+  background: rgba(0, 0, 0, 0.04);
   border-radius: 8px;
-  font-size: 14px;
-  font-weight: 600;
-  cursor: pointer;
-  transition: all 0.15s;
 }
 
-.p-btn.approve {
-  background: var(--primary);
-  color: #fff;
-}
-
-.p-btn.approve:hover {
-  box-shadow: 0 2px 10px rgba(0, 132, 255, 0.4);
-}
-
-.p-btn.reject {
-  background: transparent;
-  color: var(--text-dim);
-  border: 1px solid var(--border);
-}
-
-.p-btn.reject:hover {
-  color: var(--danger);
-  border-color: var(--danger);
-}
-
-/* 最终答案 */
+/* 最终答案：markdown 渲染区 */
 .answer-text {
-  margin-top: 8px;
-  padding: 14px 18px;
-  background: var(--bg-card);
-  border: 1px solid var(--border);
-  border-radius: 12px;
   font-size: 15px;
   line-height: 1.75;
-  color: var(--text-main);
 }
 
-/* 点踩反馈按钮 */
-.message-actions {
-  margin-top: 6px;
-  display: flex;
-  align-items: center;
-  gap: 8px;
+/* markdown 首末元素不贴边 */
+.answer-text :deep(p:first-child) {
+  margin-top: 0;
 }
-.feedback-btn {
-  background: none;
-  border: 1px solid var(--border);
-  border-radius: 6px;
-  padding: 2px 8px;
-  font-size: 14px;
-  cursor: pointer;
-  opacity: 0.5;
-  transition: opacity 0.15s;
+.answer-text :deep(p:last-child) {
+  margin-bottom: 0;
 }
-.feedback-btn:hover {
-  opacity: 1;
-  border-color: var(--danger);
+
+/* 时间线紧凑：与答案紧贴 */
+:deep(.ant-timeline) {
+  margin: 4px 0 2px;
 }
-.feedback-done {
-  font-size: 12px;
-  color: var(--text-faint);
+:deep(.ant-timeline-item) {
+  padding-bottom: 0 !important;
+}
+:deep(.ant-timeline-item-content) {
+  margin-inline-start: 18px;
+  margin-top: 0;
+  padding-bottom: 2px;
+}
+:deep(.ant-timeline-item-last > .ant-timeline-item-content) {
+  padding-bottom: 0;
+  margin-bottom: 0;
+  min-height: auto;
 }
 
 .answer-text :deep(strong) {
-  color: var(--primary);
+  color: var(--ant-color-primary);
 }
 
 /* 可点击的笔记引用标签 */
 .answer-text :deep(.ref-link),
 .thought-text :deep(.ref-link) {
-  color: var(--primary);
+  color: var(--ant-color-primary);
   cursor: pointer;
   text-decoration: underline dotted;
   text-underline-offset: 3px;
-  transition: all 0.12s;
-}
-.answer-text :deep(.ref-link:hover),
-.thought-text :deep(.ref-link:hover) {
-  background: rgba(0, 132, 255, 0.1);
-  border-radius: 3px;
-}
-
-/* 思考中 */
-.thinking-line {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  padding: 10px 14px;
-  color: var(--text-dim);
-  font-size: 14px;
-}
-
-.thinking-dots {
-  display: inline-flex;
-  gap: 4px;
-}
-
-.thinking-dots span {
-  width: 5px;
-  height: 5px;
-  border-radius: 50%;
-  background: var(--primary);
-  animation: dotBounce 1.2s infinite;
-}
-
-.thinking-dots span:nth-child(2) { animation-delay: 0.15s; }
-.thinking-dots span:nth-child(3) { animation-delay: 0.3s; }
-
-@keyframes dotBounce {
-  0%, 60%, 100% { transform: translateY(0); opacity: 0.4; }
-  30% { transform: translateY(-4px); opacity: 1; }
 }
 
 /* ============ 输入栏 ============ */
@@ -886,55 +653,18 @@ function formatArgs(args) {
 }
 
 .input-wrap {
-  display: flex;
-  gap: 10px;
-  padding: 8px;
-  background: var(--bg-panel);
-  border: 1px solid var(--border);
-  border-radius: 14px;
-  transition: border-color 0.2s;
+  position: relative;
 }
 
-.input-wrap:focus-within {
-  border-color: var(--border-glow);
-  box-shadow: 0 2px 16px rgba(0, 132, 255, 0.1);
-}
-
-.input {
-  flex: 1;
-  padding: 10px 14px;
-  background: transparent;
-  border: none;
-  outline: none;
-  color: var(--text-main);
-  font-size: 15px;
-  font-family: inherit;
-}
-
-.input::placeholder {
-  color: var(--text-faint);
+/* textarea 右下留出按钮空间，避免文字被遮挡 */
+.input-field :deep(textarea) {
+  padding-bottom: 40px;
+  resize: none;
 }
 
 .send-btn {
-  width: 42px;
-  height: 42px;
-  border: none;
-  border-radius: 10px;
-  background: linear-gradient(135deg, var(--primary), var(--accent));
-  color: #ffffff;
-  font-size: 16px;
-  cursor: pointer;
-  transition: all 0.15s;
-  flex-shrink: 0;
-}
-
-.send-btn:hover:not(:disabled) {
-  box-shadow: 0 2px 14px rgba(0, 132, 255, 0.4);
-  transform: scale(1.03);
-}
-
-.send-btn:disabled {
-  opacity: 0.4;
-  cursor: not-allowed;
+  position: absolute;
+  right: 8px;
+  bottom: 8px;
 }
 </style>

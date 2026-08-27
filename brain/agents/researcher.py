@@ -5,6 +5,7 @@ from loguru import logger
 
 from brain.agents.middleware import LoggingMiddleware
 from brain.llm import get_chat_model
+from brain.prompts import get_prompt
 from brain.storage.metadata import MetadataStore
 from brain.storage.vector_store import VectorStore
 
@@ -70,16 +71,7 @@ class ResearcherAgent:
         title_writer = SubAgent(
             name="title-writer",
             description="为当前对话生成简短标题（10 字以内）并写入数据库。当需要为对话命名时调用。",
-            system_prompt="""你是对话标题生成专家。
-
-任务流程：
-1. 根据用户的问题或对话主题，构思一个简短精炼的标题
-2. 调用 update_session_title 工具将标题写入数据库
-3. 工具调用成功后，简短确认即可
-
-标题规则：
-- 不超过 10 个字
-- 抓住对话的核心主题，不要用"关于...的问题"这种句式""",
+            system_prompt=get_prompt("title_writer"),
             tools=[update_session_title],
         )
 
@@ -122,20 +114,7 @@ class ResearcherAgent:
                 "从最近几轮对话中提取值得长期保存的知识片段（结论、事实、经验），"
                 "检查去重后提议给用户确认。当对话中产生了有价值的知识时调用。"
             ),
-            system_prompt="""你是知识沉淀专家。从最近几轮对话中提取值得长期保存的知识片段。
-
-任务流程：
-1. 通读最近的对话，识别有价值的结论、事实、经验、方法
-2. 对每个候选片段，先用 check_existing_fragments 检查是否已存在（去重）
-3. 用 search_notes 搜索知识库，确认片段内容不与已有笔记重复
-4. 对通过去重检查的片段，调用 propose_knowledge 提议保存（用户会确认）
-
-提取规则：
-- 只提取"结论性"内容：定义、最佳实践、踩坑经验、方法总结
-- 不要提取闲聊、过程性讨论、用户还没确认的观点
-- 一次最多提取 2 个片段
-- 片段内容要自包含：脱离对话上下文也能看懂
-- 如果对话没有值得沉淀的内容，直接报告"无值得保存的片段"即可""",
+            system_prompt=get_prompt("knowledge_extractor"),
             tools=[check_existing_fragments, propose_knowledge],
         )
 
@@ -146,25 +125,7 @@ class ResearcherAgent:
             # HIL：propose_knowledge 调用时暂停，等待用户批准/编辑/拒绝
             interrupt_on={"propose_knowledge": True},
             checkpointer=checkpointer,
-            system_prompt="""你是用户的个人知识管家，拥有用户完整知识库的访问权限。
-
-你的任务是回答用户的问题。遵循以下工作流程：
-
-1. **生成标题**: 使用 task 工具委派 title-writer 子智能体为本次对话生成标题（子智能体会自己写入数据库）
-2. **理解问题**: 仔细分析用户想知道什么
-3. **搜索知识库**: 使用 search_notes 查找相关笔记；如果用户询问"之前总结/沉淀过什么"，用 search_fragments 检索已保存的知识片段
-4. **深入追踪**: 如果搜索结果提示有相关概念或关联，使用 get_connections 追踪关联链
-5. **查看详情**: 对关键笔记使用 get_note_detail 获取完整内容和标签
-6. **迭代搜索**: 如果初步结果不够，调整关键词继续搜索
-7. **综合回答**: 汇总所有发现，给出有引用来源的完整答案
-8. **知识沉淀（必须执行）**: 回答完用户问题后如果这轮对话产生了有价值的知识，使用 task 工具委派 knowledge-extractor 子智能体，把本次对话的结论发送给它提取知识片段。
-
-规则：
-- 至少执行 2 次搜索（用不同角度/关键词）
-- 如果发现笔记之间有有趣的关联，一定要提及
-- 引用时用 [笔记标题] 标注来源
-- 如果知识库中没有足够信息，诚实说明
-- 用中文回答""",
+            system_prompt=get_prompt("researcher"),
             middleware=[LoggingMiddleware(agent_name="researcher")],
         )
 

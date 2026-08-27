@@ -1,9 +1,10 @@
 <script setup>
-import { ref, onMounted, inject } from "vue";
+import { ref, h, onMounted, inject } from "vue";
+import { message, Modal } from "ant-design-vue";
 import { listFragments } from "../api/index.js";
+import { ReloadOutlined, DeleteOutlined, MessageOutlined } from "@ant-design/icons-vue";
 import axios from "axios";
 
-// 跨页跳转：跳问答页展开讲讲该片段
 const jumpToAsk = inject("jumpToAsk", null);
 
 const fragments = ref([]);
@@ -21,147 +22,85 @@ async function refresh() {
 }
 
 async function removeFragment(id) {
-  if (!confirm("确定删除这条知识片段？")) return;
   try {
     await axios.delete(`/api/fragments/${id}`);
+    message.success("已删除");
     await refresh();
   } catch (e) {
-    console.error(e);
+    message.error("删除失败");
   }
 }
 
 onMounted(refresh);
+
+function onDelete(id) {
+  Modal.confirm({
+    title: "删除知识片段",
+    content: "确定删除这条知识片段？",
+    okText: "删除",
+    okType: "danger",
+    cancelText: "取消",
+    onOk: () => removeFragment(id),
+  });
+}
 </script>
 
 <template>
-  <div>
-    <div class="header-row">
-      <p class="hint">对话中经你确认保存的结论沉淀在这里，问答时 Agent 可以引用它们</p>
-      <button class="btn-refresh" :disabled="loading" @click="refresh">
-        {{ loading ? "刷新中..." : "🔄 刷新" }}
-      </button>
+  <a-space direction="vertical" :size="16" style="width: 100%">
+    <div style="display: flex; justify-content: space-between; align-items: center">
+      <a-typography-text type="secondary">
+        对话中经你确认保存的结论沉淀在这里，问答时 Agent 可以引用它们
+      </a-typography-text>
+      <a-button :icon="h(ReloadOutlined)" :loading="loading" @click="refresh">
+        刷新
+      </a-button>
     </div>
 
-    <div v-if="!loading && fragments.length === 0" class="empty">
-      <div class="empty-icon">💡</div>
-      <p>还没有保存的知识片段</p>
-      <p class="empty-sub">在问答中，当 Agent 提议保存知识时点击「保存」即可沉淀到这里</p>
-    </div>
+    <a-empty
+      v-if="!loading && fragments.length === 0"
+      description="还没有保存的知识片段"
+    >
+      <template #description>
+        <p>还没有保存的知识片段</p>
+        <p style="color: #8c8c8c; font-size: 13px">
+          在问答中，当 Agent 提议保存知识时点击「保存」即可沉淀到这里
+        </p>
+      </template>
+    </a-empty>
 
-    <div v-for="f in fragments" :key="f.id" class="fragment-card">
-      <div class="fragment-head">
-        <span class="fragment-title">{{ f.title }}</span>
-        <span class="fragment-date">{{ f.created_at.slice(0, 10) }}</span>
-        <button class="delete-btn" title="删除片段" @click="removeFragment(f.id)">✕</button>
-      </div>
-      <div class="fragment-content">{{ f.content }}</div>
-      <button
+    <a-card
+      v-for="f in fragments"
+      :key="f.id"
+      size="small"
+      hoverable
+    >
+      <template #title>
+        <span style="font-weight: 600">{{ f.title }}</span>
+      </template>
+      <template #extra>
+        <a-space>
+          <span style="font-size: 12px; color: #8c8c8c">
+            {{ f.created_at?.slice(0, 10) }}
+          </span>
+          <a-button
+            type="text"
+            size="small"
+            danger
+            :icon="h(DeleteOutlined)"
+            @click="onDelete(f.id)"
+          />
+        </a-space>
+      </template>
+      <p style="white-space: pre-wrap; margin: 0 0 12px">{{ f.content }}</p>
+      <a-button
         v-if="jumpToAsk"
-        class="expand-btn"
+        type="link"
+        size="small"
+        :icon="h(MessageOutlined)"
         @click="jumpToAsk(`关于我沉淀的知识片段「${f.title}」，请展开详细讲讲`)"
       >
-        💬 展开讲讲
-      </button>
-    </div>
-  </div>
+        展开讲讲
+      </a-button>
+    </a-card>
+  </a-space>
 </template>
-
-<style scoped>
-.header-row {
-  display: flex;
-  align-items: flex-start;
-  justify-content: space-between;
-  gap: 16px;
-  margin-bottom: 20px;
-}
-.hint {
-  color: var(--text-dim);
-  font-size: 14px;
-  flex: 1;
-}
-.btn-refresh {
-  padding: 8px 16px;
-  background: var(--primary);
-  color: #fff;
-  border: none;
-  border-radius: 8px;
-  font-size: 14px;
-  cursor: pointer;
-  flex-shrink: 0;
-}
-.btn-refresh:hover {
-  opacity: 0.85;
-}
-.empty {
-  text-align: center;
-  padding: 60px 0;
-  color: var(--text-dim);
-}
-.empty-icon {
-  font-size: 40px;
-  margin-bottom: 12px;
-}
-.empty-sub {
-  font-size: 13px;
-  color: var(--text-faint);
-  margin-top: 6px;
-}
-.fragment-card {
-  padding: 16px;
-  margin-bottom: 12px;
-  background: var(--bg-card);
-  border: 1px solid var(--border);
-  border-radius: 10px;
-}
-.fragment-head {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  margin-bottom: 8px;
-}
-.fragment-title {
-  font-weight: 600;
-  font-size: 15px;
-  color: var(--text-main);
-  flex: 1;
-}
-.fragment-date {
-  font-size: 12px;
-  color: var(--text-faint);
-  font-family: var(--font-mono);
-}
-.delete-btn {
-  border: none;
-  background: transparent;
-  color: var(--text-faint);
-  cursor: pointer;
-  font-size: 13px;
-  padding: 4px 6px;
-  border-radius: 4px;
-  transition: all 0.12s;
-}
-.delete-btn:hover {
-  color: var(--danger);
-  background: rgba(239, 68, 68, 0.1);
-}
-.fragment-content {
-  font-size: 14px;
-  color: var(--text-dim);
-  line-height: 1.6;
-  white-space: pre-wrap;
-  margin-bottom: 10px;
-}
-.expand-btn {
-  padding: 6px 16px;
-  background: transparent;
-  border: 1px solid var(--border-glow);
-  color: var(--primary);
-  border-radius: 8px;
-  font-size: 13px;
-  cursor: pointer;
-  transition: all 0.12s;
-}
-.expand-btn:hover {
-  background: rgba(0, 132, 255, 0.08);
-}
-</style>

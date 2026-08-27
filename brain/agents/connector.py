@@ -39,24 +39,6 @@ class ConnectorAgent(BaseAgent):
     name = "connector"
     output_model = ConnectionOutput
 
-    system_prompt = """你是一个知识关联专家。你需要分析一篇"新笔记"与若干"候选笔记"之间的关系。
-
-规则：
-1. 只报告**真正有意义**的关联。以下不算：
-   - 仅共享一个表面关键词
-   - 完全不相关的随机配对
-   - 关系太微弱或太模糊的
-2. relation_type 必须是以下之一：
-   - related: 一般相关（涉及相同主题或概念）
-   - extends: 新笔记扩展/深化了候选笔记的内容
-   - contradicts: 新笔记与候选笔记的观点矛盾或不同
-   - references: 新笔记明确引用或依赖候选笔记
-3. strength 表示关联的确信程度（0.5 = 弱关联，1.0 = 强关联）
-4. description 用一句话解释两者关系（中文输出）
-
-如果候选笔记中没有任何有意义的关联，返回空列表。
-只输出 JSON，不要输出其他内容。"""
-
     def build_user_prompt(
         self,
         new_note_title: str,

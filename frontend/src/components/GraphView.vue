@@ -1,9 +1,9 @@
 <script setup>
-import { ref, onMounted, onBeforeUnmount, inject } from "vue";
+import { ref, h, onMounted, onBeforeUnmount, inject } from "vue";
+import { ReloadOutlined, CloseOutlined, MessageOutlined } from "@ant-design/icons-vue";
 import * as echarts from "echarts";
 import axios from "axios";
 
-// 跨页跳转：注入 App 提供的函数
 const jumpToAsk = inject("jumpToAsk", null);
 
 const chartEl = ref(null);
@@ -12,12 +12,11 @@ const loading = ref(true);
 const selectedNode = ref(null);
 const empty = ref(false);
 
-// 关联类型 → 边颜色
 const RELATION_COLORS = {
   related: "#94a3b8",
-  extends: "#0084ff",
-  contradicts: "#ef4444",
-  references: "#10b981",
+  extends: "var(--ant-color-primary)",
+  contradicts: "#f56565",
+  references: "#36b37e",
 };
 
 const RELATION_LABELS = {
@@ -51,17 +50,15 @@ function renderGraph(data) {
   }
 
   const maxDegree = Math.max(1, ...data.nodes.map((n) => n.degree));
-  // 无关联的孤立节点不显示（图谱聚焦关联网络）
   const connectedIds = new Set();
   data.edges.forEach((e) => {
     connectedIds.add(e.source);
     connectedIds.add(e.target);
   });
 
-  // 分类调色板——与图例一一对应
   const CATEGORY_COLORS = [
-    "#0084ff", "#00b8d4", "#10b981", "#f59e0b",
-    "#8b5cf6", "#ef4444", "#ec4899", "#64748b",
+    "var(--ant-color-primary)", "var(--ant-color-primary)", "#36b37e", "#ff9f43",
+    "#f56565", "#ec4899", "#06b6d4", "#64748b",
   ];
 
   const nodes = data.nodes
@@ -69,11 +66,10 @@ function renderGraph(data) {
     .map((n) => ({
       id: n.id,
       name: n.title,
-      symbolSize: 14 + (n.degree / maxDegree) * 22, // 大小 = 关联数
+      symbolSize: 14 + (n.degree / maxDegree) * 22,
       category: n.tags[0] || "未分类",
       value: n.degree,
-      label: { show: true, fontSize: 11, color: "#1a2c45" },
-      // 详情数据挂载在节点上
+      label: { show: true, fontSize: 11, color: "#1a1a2e" },
       _detail: n,
     }));
 
@@ -89,7 +85,6 @@ function renderGraph(data) {
     _detail: e,
   }));
 
-  // 图例——每个分类显式指定颜色，保证图例与节点颜色一致
   const categories = [...new Set(nodes.map((n) => n.category))].map((c, i) => ({
     name: c,
     itemStyle: { color: CATEGORY_COLORS[i % CATEGORY_COLORS.length] },
@@ -120,20 +115,9 @@ function renderGraph(data) {
         roam: true,
         draggable: true,
         categories,
-        force: {
-          repulsion: 260,
-          edgeLength: [80, 200],
-          gravity: 0.08,
-        },
-        emphasis: {
-          focus: "adjacency",
-          lineStyle: { width: 3 },
-        },
-        label: {
-          show: true,
-          position: "right",
-          formatter: (p) => p.name,
-        },
+        force: { repulsion: 260, edgeLength: [80, 200], gravity: 0.08 },
+        emphasis: { focus: "adjacency", lineStyle: { width: 3 } },
+        label: { show: true, position: "right", formatter: (p) => p.name },
       },
     ],
   });
@@ -159,166 +143,73 @@ onBeforeUnmount(() => {
 </script>
 
 <template>
-  <div class="graph-page">
-    <div class="header-row">
-      <p class="hint">
-        节点大小 = 关联数量；边颜色 = 关联类型；点击节点查看详情，滚轮缩放，拖拽平移
-      </p>
-      <button class="btn-refresh" :disabled="loading" @click="refresh">
-        {{ loading ? "加载中..." : "🔄 刷新" }}
-      </button>
+  <div>
+    <div style="display: flex; justify-content: space-between; align-items: flex-start; margin-bottom: 10px">
+      <a-typography-text type="secondary">
+        节点大小 = 关联数量；边颜色 = 关联类型；点击节点查看详情
+      </a-typography-text>
+      <a-button :icon="h(ReloadOutlined)" :loading="loading" @click="refresh">刷新</a-button>
     </div>
 
-    <!-- 图例 -->
-    <div class="legend-row">
+    <a-space style="margin-bottom: 14px">
       <span v-for="(color, type) in RELATION_COLORS" :key="type" class="legend-item">
         <span class="legend-line" :style="{ background: color }"></span>
         {{ RELATION_LABELS[type] }}
       </span>
-    </div>
+    </a-space>
 
-    <div v-if="empty && !loading" class="empty">
-      <div class="empty-icon">🕸️</div>
-      <p>还没有关联数据</p>
-      <p class="empty-sub">摄入多篇同主题笔记后，AI 会自动发现它们之间的关联</p>
-    </div>
+    <a-empty v-if="empty && !loading">
+      <template #description>
+        <p>还没有关联数据</p>
+        <p style="color: var(--ant-color-text-secondary); font-size: 13px">摄入多篇同主题笔记后，AI 会自动发现关联</p>
+      </template>
+    </a-empty>
 
     <div v-show="!empty" ref="chartEl" class="chart-box"></div>
 
     <!-- 选中节点详情 -->
-    <div v-if="selectedNode" class="node-panel">
-      <div class="node-panel-head">
-        <span class="node-title">{{ selectedNode._detail.title }}</span>
-        <button class="close-btn" @click="selectedNode = null">✕</button>
-      </div>
-      <div class="node-meta">
+    <a-card
+      v-if="selectedNode"
+      size="small"
+      class="node-panel"
+      :body-style="{ padding: '16px' }"
+    >
+      <template #title>
+        <span style="font-weight: 600">{{ selectedNode._detail.title }}</span>
+      </template>
+      <template #extra>
+        <a-button type="text" size="small" :icon="h(CloseOutlined)" @click="selectedNode = null" />
+      </template>
+      <a-space direction="vertical" :size="6">
         <div>🏷️ 标签: {{ selectedNode._detail.tags.join(", ") || "无" }}</div>
         <div>🔗 关联数: {{ selectedNode._detail.degree }}</div>
         <div>📅 {{ selectedNode._detail.date }}</div>
-      </div>
-      <button
+      </a-space>
+      <a-button
         v-if="jumpToAsk"
-        class="ask-btn"
+        type="primary"
+        block
+        size="small"
+        :icon="h(MessageOutlined)"
+        style="margin-top: 12px"
         @click="jumpToAsk(`关于笔记「${selectedNode._detail.title}」，帮我总结要点并找出相关内容`)"
       >
-        💬 就此笔记提问
-      </button>
-    </div>
+        就此笔记提问
+      </a-button>
+    </a-card>
   </div>
 </template>
 
 <style scoped>
-.header-row {
-  display: flex;
-  align-items: flex-start;
-  justify-content: space-between;
-  gap: 16px;
-  margin-bottom: 10px;
-}
-.hint {
-  color: var(--text-dim);
-  font-size: 14px;
-  flex: 1;
-}
-.btn-refresh {
-  padding: 8px 16px;
-  background: var(--primary);
-  color: #fff;
-  border: none;
-  border-radius: 8px;
-  font-size: 14px;
-  cursor: pointer;
-  flex-shrink: 0;
-}
-.legend-row {
-  display: flex;
-  gap: 16px;
-  margin-bottom: 14px;
-}
-.legend-item {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  font-size: 13px;
-  color: var(--text-dim);
-}
-.legend-line {
-  width: 18px;
-  height: 3px;
-  border-radius: 2px;
-}
 .chart-box {
   height: calc(100vh - 260px);
   min-height: 480px;
-  border: 1px solid var(--border);
-  border-radius: 12px;
-  background: var(--bg-card);
-}
-.empty {
-  text-align: center;
-  padding: 80px 0;
-  color: var(--text-dim);
-}
-.empty-icon {
-  font-size: 44px;
-  margin-bottom: 12px;
-}
-.empty-sub {
-  font-size: 13px;
-  color: var(--text-faint);
-  margin-top: 6px;
 }
 .node-panel {
   position: fixed;
   right: 24px;
   bottom: 24px;
   width: 300px;
-  padding: 16px;
-  background: var(--bg-panel);
-  border: 1px solid var(--border-glow);
-  border-radius: 12px;
-  box-shadow: 0 4px 20px rgba(0, 0, 0, 0.12);
   z-index: 20;
-}
-.node-panel-head {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  margin-bottom: 10px;
-}
-.node-title {
-  font-weight: 600;
-  font-size: 14px;
-  flex: 1;
-  margin-right: 8px;
-}
-.close-btn {
-  border: none;
-  background: transparent;
-  cursor: pointer;
-  color: var(--text-faint);
-  font-size: 14px;
-}
-.node-meta {
-  font-size: 13px;
-  color: var(--text-dim);
-  display: flex;
-  flex-direction: column;
-  gap: 6px;
-  margin-bottom: 12px;
-}
-.ask-btn {
-  width: 100%;
-  padding: 8px 14px;
-  background: var(--primary);
-  color: #fff;
-  border: none;
-  border-radius: 8px;
-  font-size: 13px;
-  cursor: pointer;
-  transition: opacity 0.15s;
-}
-.ask-btn:hover {
-  opacity: 0.85;
 }
 </style>

@@ -1,8 +1,8 @@
 <script setup>
 import { ref, watch } from "vue";
 import { searchNotes } from "../api/index.js";
+import { SearchOutlined } from "@ant-design/icons-vue";
 
-// 跨页跳转种子: { query, ts } —— 问答引用点击跳来时自动搜索
 const props = defineProps({
   seed: { type: Object, default: null },
 });
@@ -28,7 +28,6 @@ async function search() {
   }
 }
 
-// 外部跳转：预填查询并立即搜索
 watch(
   () => props.seed,
   (newSeed) => {
@@ -43,141 +42,80 @@ watch(
 
 <template>
   <div>
-    <h3 style="margin-bottom: 16px">语义搜索</h3>
-    <div class="search-row">
-      <input
-        v-model="query"
-        class="input search-input"
-        placeholder="输入关键词..."
-        @keyup.enter="search"
+    <a-space direction="vertical" :size="16" style="width: 100%">
+      <a-input-group compact>
+        <a-input
+          v-model:value="query"
+          placeholder="输入关键词..."
+          style="width: calc(100% - 360px)"
+          size="large"
+          @press-enter="search"
+        />
+        <a-input
+          v-model:value="tag"
+          placeholder="标签（可选）"
+          style="width: 150px"
+          size="large"
+          @press-enter="search"
+        />
+        <a-select
+          v-model:value="topK"
+          style="width: 90px"
+          size="large"
+        >
+          <a-select-option :value="3">3 条</a-select-option>
+          <a-select-option :value="5">5 条</a-select-option>
+          <a-select-option :value="10">10 条</a-select-option>
+          <a-select-option :value="20">20 条</a-select-option>
+        </a-select>
+        <a-button
+          type="primary"
+          size="large"
+          :loading="loading"
+          @click="search"
+        >
+          <template #icon><SearchOutlined /></template>
+          搜索
+        </a-button>
+      </a-input-group>
+
+      <a-alert
+        v-if="total > 0"
+        :message="`共 ${total} 条结果`"
+        type="info"
+        show-icon
       />
-      <input
-        v-model="tag"
-        class="input tag-input"
-        placeholder="标签（可选）"
-        @keyup.enter="search"
+
+      <a-list
+        v-if="results.length"
+        :data-source="results"
+        :split="true"
+      >
+        <template #renderItem="{ item }">
+          <a-list-item>
+            <a-list-item-meta>
+              <template #title>
+                <a-space>
+                  <a-tag color="blue">{{ item.score }}</a-tag>
+                  <span style="font-weight: 600">{{ item.title }}</span>
+                </a-space>
+              </template>
+              <template #description>
+                <div v-if="item.tags.length" style="margin-bottom: 4px">
+                  <a-tag v-for="t in item.tags" :key="t" color="default">{{ t }}</a-tag>
+                </div>
+                <div>{{ item.content_preview }}...</div>
+                <code style="font-size: 12px; color: #8c8c8c">{{ item.note_id }}</code>
+              </template>
+            </a-list-item-meta>
+          </a-list-item>
+        </template>
+      </a-list>
+
+      <a-empty
+        v-if="!loading && results.length === 0 && query"
+        description="没有找到相关笔记"
       />
-      <select v-model.number="topK" class="select">
-        <option :value="3">3 条</option>
-        <option :value="5">5 条</option>
-        <option :value="10">10 条</option>
-        <option :value="20">20 条</option>
-      </select>
-      <button class="btn" :disabled="loading" @click="search">
-        {{ loading ? "..." : "🔍 搜索" }}
-      </button>
-    </div>
-
-    <div v-if="total > 0" class="result-count">共 {{ total }} 条结果</div>
-
-    <div v-for="r in results" :key="r.note_id" class="result-item">
-      <div class="result-header">
-        <span class="score">[{{ r.score }}]</span>
-        <span class="title">{{ r.title }}</span>
-      </div>
-      <div class="tags" v-if="r.tags.length">
-        🏷️ {{ r.tags.join(" · ") }}
-      </div>
-      <div class="preview">{{ r.content_preview }}...</div>
-      <code class="note-id">{{ r.note_id }}</code>
-    </div>
-
-    <div v-if="!loading && results.length === 0 && query" class="empty">
-      没有找到相关笔记
-    </div>
+    </a-space>
   </div>
 </template>
-
-<style scoped>
-.search-row {
-  display: flex;
-  gap: 8px;
-  margin-bottom: 20px;
-}
-.input {
-  padding: 10px 14px;
-  border: 1px solid var(--border);
-  border-radius: 8px;
-  font-size: 15px;
-  outline: none;
-  background: var(--bg-card);
-  color: var(--text-main);
-}
-.input:focus {
-  border-color: var(--primary);
-}
-.search-input {
-  flex: 3;
-}
-.tag-input {
-  flex: 1;
-}
-.select {
-  padding: 10px;
-  border: 1px solid var(--border);
-  border-radius: 8px;
-  font-size: 14px;
-  outline: none;
-  background: var(--bg-card);
-  color: var(--text-main);
-}
-.btn {
-  padding: 10px 20px;
-  background: var(--primary);
-  color: #fff;
-  border: none;
-  border-radius: 8px;
-  font-size: 15px;
-  cursor: pointer;
-}
-.btn:hover {
-  opacity: 0.85;
-}
-.result-count {
-  font-size: 13px;
-  color: var(--text-dim);
-  margin-bottom: 16px;
-}
-.result-item {
-  padding: 16px;
-  margin-bottom: 12px;
-  background: var(--bg-card);
-  border: 1px solid var(--border);
-  border-radius: 10px;
-}
-.result-header {
-  margin-bottom: 6px;
-}
-.score {
-  font-weight: 700;
-  color: var(--primary);
-  font-size: 13px;
-  font-family: var(--font-mono);
-}
-.title {
-  font-weight: 600;
-  font-size: 16px;
-}
-.tags {
-  font-size: 13px;
-  color: var(--text-dim);
-  margin-bottom: 6px;
-}
-.preview {
-  font-size: 14px;
-  color: var(--text-main);
-  line-height: 1.5;
-}
-.note-id {
-  display: block;
-  margin-top: 8px;
-  font-size: 12px;
-  color: var(--text-faint);
-  font-family: var(--font-mono);
-}
-.empty {
-  text-align: center;
-  color: var(--text-dim);
-  padding: 40px;
-}
-</style>

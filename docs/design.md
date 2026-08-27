@@ -1201,3 +1201,62 @@ CREATE TABLE IF NOT EXISTS eval_runs (
 - Judge 抽样：`/api/eval/judge` 跑完后写入 eval_runs（run_type='judge'）
 - `eval_scores` 表加 `run_id` 字段关联 Judge 批次
 - API：`GET /api/eval/runs` 查历史，前端总览页显示趋势
+
+---
+
+### §14 Phase 5E — 提示词外部化
+
+#### FR56 提示词外部化（存数据库）
+
+**设计思路：** 提示词是需在线迭代的运营资产——页面编辑、即时生效、版本可追溯。
+YAML 文件需重启且无法页面管理，改用 `prompts` 表存储，参照 golden_cases 表的
+「配置存库 + 页面 CRUD」先例。
+
+**prompts 表设计：**
+```sql
+CREATE TABLE IF NOT EXISTS prompts (
+    prompt_key TEXT PRIMARY KEY,   -- 'classifier'|'connector'|'researcher'|'title_writer'|'knowledge_extractor'|'judge'
+    name TEXT NOT NULL,            -- 中文名
+    description TEXT,              -- 用途说明
+    content TEXT NOT NULL,         -- 提示词正文（可能含 {占位符}）
+    is_template INTEGER DEFAULT 0, -- 是否含 {占位符}（judge 用 .format 渲染）
+    enabled INTEGER DEFAULT 1,
+    version INTEGER DEFAULT 1,     -- 修改时递增
+    updated_at TEXT NOT NULL
+);
+```
+
+**6 个提示词清单：**
+| key | 来源 | 调用方式 |
+|-----|------|----------|
+| classifier | agents/classifier.py | BaseAgent.system_prompt 类属性 |
+| connector | agents/connector.py | BaseAgent.system_prompt 类属性 |
+| researcher | agents/researcher.py 主 Agent | create_deep_agent(system_prompt=) |
+| title_writer | researcher.py 子智能体 | SubAgent(system_prompt=) |
+| knowledge_extractor | researcher.py 子智能体 | SubAgent(system_prompt=) |
+| judge | eval/judge.py | 字符串 .format(question=,answer=,context=) |
+
+**读取层（新增 brain/prompts.py）：**
+- `get_prompt(key) -> str`：从库读 + 进程内字典缓存，避免每次 Agent 调用都查库
+- `get_prompt_template(key, **kwargs) -> str`：读取 + `.format()` 渲染（judge 用）
+- `reload_prompts()`：清缓存（编辑保存后调用，即时生效）
+- 缓存 key 为 prompt_key，upsert 时从缓存字典 pop 掉
+
+**Agent 层改造：**
+- `base.py`：`system_prompt` 从类属性改为 `@property`，getter 调 `get_prompt(self.name)`；
+  `run()` 改用 `[SystemMessage(system_prompt), HumanMessage(user_prompt+schema)]` 分离角色（原拼字符串全部当 user）
+- `classifier.py` / `connector.py`：删 `system_prompt` 类属性，靠基类 property 读
+- `researcher.py`：`_build_agent()` 里 3 处 `system_prompt=` 改读 `get_prompt(key)`（DeepAgents 内部已正确构造 SystemMessage）
+- `eval/judge.py`：`JUDGE_PROMPT` 改调 `get_prompt_template("judge", ...)`；提示词用 `---USER---` 标记 system/user 边界，运行时拆分为两条消息
+
+**初始化与种子：**
+- `MetadataStore.initialize()` 后调 `seed_prompts()`
+- 幂等：仅 prompts 表为空时写入 6 条默认值（迁移现有硬编码内容）
+- 提示词初始值 = 当前代码里的 6 段文本
+
+#### FR56a 提示词管理页面
+
+- 后台新增「提示词管理」页，复用 golden_cases 的 CRUD 模式
+- 列表展示 key/名称/版本/启用状态；点击进入编辑
+- 编辑器：大文本框 + 保存按钮；保存后调 `reload_prompts()` 即时生效
+- API：GET /api/prompts、GET /api/prompts/{key}、PUT /api/prompts/{key}

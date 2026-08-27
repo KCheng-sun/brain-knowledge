@@ -263,6 +263,15 @@ ruff check brain/
   - **测试集存数据库而非文件**：golden_cases/bad_cases 表支持页面 CRUD，YAML 仅作种子导入（首次 seed）。运行时全部走数据库，避免文件读写并发问题，页面实时增删改查
   - **MetadataStore 双后端兼容**：通过 config.database.host 切换 SQLite/MySQL，_exec 方法自动翻译占位符（?→%s）、UPSERT（ON CONFLICT→ON DUPLICATE KEY）、json_extract（→CAST(JSON_UNQUOTE(JSON_EXTRACT)) AS DECIMAL）。测试 fixture monkeypatch host=None 强制 SQLite 隔离
   - **SQLite→MySQL 迁移不能手写 DDL**：表结构要从 SQLite PRAGMA table_info 动态读取生成，否则列名/类型必不一致。TEXT 列做 PK/索引需指定 VARCHAR(255) 长度，MySQL 严格模式不允许 TEXT 列 DEFAULT
+- 经验（5E）：
+  - **提示词存数据库而非 YAML**：提示词是需在线迭代的运营资产（页面编辑、即时生效、版本可追溯），YAML 需重启且无法页面管理。参照 golden_cases 表的「配置存库 + 页面 CRUD」先例，新增 prompts 表（prompt_key PK / content / is_template / version / enabled）
+  - **提示词读取层带进程内缓存**：Agent 运行时高频读取 system_prompt，每次查库有开销。brain/prompts.py 用字典缓存，upsert 时 reload_prompt(key) 清单条缓存实现即时生效。get_prompt 找不到时回退到 prompt_defaults.py 的默认值并告警，不崩
+  - **BaseAgent.system_prompt 从类属性改 property**：子类只需定义 name（=prompt_key），property getter 调 get_prompt(self.name)。classifier/connector 删掉 system_prompt 类属性，researcher 的 3 处 system_prompt= 改读 get_prompt()
+  - **含占位符的提示词用 is_template 标记**：judge 的提示词有 {question}/{answer}/{context}，is_template=1，走 get_prompt_template(key, **kw) 用 str.format 渲染；其余 5 个是纯文本直接读。注意 str.format 遇到 JSON 示例里的 {{}} 需双写转义
+  - **system/user 角色必须分离**：原 BaseAgent 把 system_prompt 和 user_prompt 拼成单字符串用 llm.invoke(str) 调用，全部被当 HumanMessage，system 角色没发挥高优先级作用。改为 [SystemMessage(content=system_prompt), HumanMessage(content=user_prompt+schema)] 两条消息。judge 的提示词用 ---USER--- 标记 system/user 边界，运行时 split 拆分（角色说明+评分标准+输出格式=system，问题/回答/上下文=user）
+  - **MySQL 长连接必须用 autocommit=True**：autocommit=False 时第一次 SELECT 隐式开启事务，REPEATABLE READ 隔离级别下后续读都卡在事务开始时的快照，看不到其他连接的提交（表现为 server 进程读不到外部脚本清理的数据）。改为 autocommit=True，每条语句自动提交，读操作始终看最新数据。原有 37 处 self._conn.commit() 对 autocommit=True 无害（空操作）。_synchronized 锁已保证单线程串行，UPSERT 累加无并发竞态
+  - **threading.Lock 不可重入会死锁**：update_prompt 持锁后调 get_prompt（也要同一把锁），Lock 不可重入导致死锁。改为 threading.RLock（可重入锁），允许同一线程多次获取。凡是「同步方法内部调用另一个同步方法」的场景都必须用 RLock
+  - **前端需引入 Vue Router 实现页面独立 URL**：早期所有页面共用 `/` 地址靠 activeView 状态切换，刷新丢失、地址不变。引入 vue-router 后每个页面有独立路由（/ask/:sessionId?、/search、/admin/prompts 等）。Ask 组件需访问会话列表/seed，由 App.vue 直接渲染（路由 component 用空占位 { render: () => null }）；其余页面走 <router-view>。后端加 catch-all 路由 /{full_path:path} 做 SPA fallback，非 /api 路径都返回 index.html，深层路由刷新不 404
 
 ---
 

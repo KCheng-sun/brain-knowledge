@@ -1,16 +1,28 @@
 <script setup>
-import { ref, onMounted } from "vue";
+import { ref, h, watch, onMounted } from "vue";
 import { getStatus, getDigest, getReview } from "../api/index.js";
+import {
+  ReloadOutlined,
+  FileTextOutlined,
+  BlockOutlined,
+  TagOutlined,
+  ApartmentOutlined,
+} from "@ant-design/icons-vue";
 import axios from "axios";
 
 const status = ref(null);
 const digest = ref(null);
 const review = ref(null);
 const scheduler = ref([]);
-const reports = ref([]); // 定时任务生成的摘要报告
+const reports = ref([]);
 const loading = ref(true);
 
-const RELATION_ICONS = { related: "🔗", extends: "➡️", contradicts: "⚡", references: "📖" };
+const RELATION_ICONS = {
+  related: "🔗",
+  extends: "➡️",
+  contradicts: "⚡",
+  references: "📖",
+};
 
 async function refresh() {
   loading.value = true;
@@ -36,326 +48,162 @@ async function refresh() {
 
 function formatTime(iso) {
   const d = new Date(iso);
-  return `${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")} ${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}`;
+  return `${String(d.getMonth() + 1).padStart(2, "0")}-${String(
+    d.getDate()
+  ).padStart(2, "0")} ${String(d.getHours()).padStart(2, "0")}:${String(
+    d.getMinutes()
+  ).padStart(2, "0")}`;
+}
+
+function renderMarkdown(text) {
+  return text
+    .replace(/\*\*(.+?)\*\*/g, "<strong>$1</strong>")
+    .replace(/\n/g, "<br>");
 }
 
 onMounted(refresh);
+
+const statCards = ref([]);
+watch(status, (s) => {
+  if (!s) return;
+  statCards.value = [
+    { title: "笔记总数", value: s.note_count, icon: FileTextOutlined },
+    { title: "分块总数", value: s.chunk_count, icon: BlockOutlined },
+    { title: "AI 标签", value: s.tag_count, icon: TagOutlined },
+    { title: "AI 关联", value: s.connection_count, icon: ApartmentOutlined },
+  ];
+});
 </script>
 
 <template>
-  <div>
-    <div class="header-row">
-      <h3>知识库概览</h3>
-      <button class="btn-refresh" :disabled="loading" @click="refresh">
-        {{ loading ? "刷新中..." : "🔄 刷新" }}
-      </button>
+  <a-spin :spinning="loading">
+    <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 20px">
+      <h3 style="margin: 0">知识库概览</h3>
+      <a-button :icon="h(ReloadOutlined)" @click="refresh">刷新</a-button>
     </div>
 
-    <div v-if="status" class="stats-grid">
-      <div class="stat-card">
-        <div class="stat-num">{{ status.note_count }}</div>
-        <div class="stat-label">笔记总数</div>
-      </div>
-      <div class="stat-card">
-        <div class="stat-num">{{ status.chunk_count }}</div>
-        <div class="stat-label">分块总数</div>
-      </div>
-      <div class="stat-card">
-        <div class="stat-num">{{ status.tag_count }}</div>
-        <div class="stat-label">AI 标签</div>
-      </div>
-      <div class="stat-card">
-        <div class="stat-num">{{ status.connection_count }}</div>
-        <div class="stat-label">AI 关联</div>
-      </div>
-    </div>
+    <a-space direction="vertical" :size="24" style="width: 100%">
+      <!-- 统计卡片 -->
+      <a-row :gutter="16">
+        <a-col :span="6" v-for="card in statCards" :key="card.title">
+          <a-card>
+            <a-statistic :title="card.title" :value="card.value">
+              <template #prefix>
+                <component :is="card.icon" style="font-size: 20px" />
+              </template>
+            </a-statistic>
+          </a-card>
+        </a-col>
+      </a-row>
 
-    <!-- 热门标签 -->
-    <div v-if="status?.top_tags?.length" class="section">
-      <h4>🏷️ 热门标签</h4>
-      <div class="tag-list">
-        <span v-for="t in status.top_tags" :key="t.name" class="tag-chip">
-          {{ t.name }} <small>{{ t.count }}</small>
-        </span>
-      </div>
-    </div>
+      <!-- 热门标签 -->
+      <a-card v-if="status?.top_tags?.length" size="small" title="🏷️ 热门标签">
+        <a-space wrap>
+          <a-tag v-for="t in status.top_tags" :key="t.name" color="blue">
+            {{ t.name }} <small>{{ t.count }}</small>
+          </a-tag>
+        </a-space>
+      </a-card>
 
-    <!-- 最近笔记 -->
-    <div v-if="status?.recent_notes?.length" class="section">
-      <h4>📝 最近摄入</h4>
-      <div v-for="n in status.recent_notes" :key="n.note_id" class="note-row">
-        <span class="note-date">[{{ n.date }}]</span>
-        <span class="note-title">{{ n.title }}</span>
-        <span v-if="n.tags.length" class="note-tags">
-          🏷️ {{ n.tags.slice(0, 3).join(" · ") }}
-        </span>
-      </div>
-    </div>
+      <!-- 最近笔记 -->
+      <a-card v-if="status?.recent_notes?.length" size="small" title="📝 最近摄入">
+        <a-list :data-source="status.recent_notes" size="small">
+          <template #renderItem="{ item }">
+            <a-list-item>
+              <a-list-item-meta>
+                <template #title>
+                  <span style="font-weight: 500">{{ item.title }}</span>
+                </template>
+                <template #description>
+                  <span style="color: #8c8c8c">[{{ item.date }}]</span>
+                  <a-tag v-for="t in item.tags.slice(0, 3)" :key="t" size="small">{{ t }}</a-tag>
+                </template>
+              </a-list-item-meta>
+            </a-list-item>
+          </template>
+        </a-list>
+      </a-card>
 
-    <!-- 关联 -->
-    <div v-if="status?.connections?.length" class="section">
-      <h4>🔗 关联一览</h4>
-      <div v-for="c in status.connections" :key="c.source_title + c.target_title" class="conn-row">
-        {{ RELATION_ICONS[c.relation_type] || "🔗" }}
-        [{{ c.relation_type }}]
-        <strong>{{ c.source_title }}</strong> → <strong>{{ c.target_title }}</strong>
-        <div v-if="c.description" class="conn-desc">{{ c.description }}</div>
-      </div>
-    </div>
+      <!-- 关联 -->
+      <a-card v-if="status?.connections?.length" size="small" title="🔗 关联一览">
+        <a-list :data-source="status.connections" size="small">
+          <template #renderItem="{ item }">
+            <a-list-item>
+              <a-space>
+                <span>{{ RELATION_ICONS[item.relation_type] || "🔗" }}</span>
+                <a-tag>{{ item.relation_type }}</a-tag>
+                <strong>{{ item.source_title }}</strong>
+                <span>→</span>
+                <strong>{{ item.target_title }}</strong>
+              </a-space>
+              <div v-if="item.description" style="color: #8c8c8c; font-size: 13px">
+                {{ item.description }}
+              </div>
+            </a-list-item>
+          </template>
+        </a-list>
+      </a-card>
 
-    <!-- 每日摘要 -->
-    <div v-if="digest?.content" class="section digest">
-      <h4>📅 知识摘要</h4>
-      <div class="digest-content" v-html="digest.content
-        .replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>')
-        .replace(/\n/g, '<br>')"></div>
-    </div>
+      <!-- 每日摘要 -->
+      <a-card v-if="digest?.content" size="small" title="📅 知识摘要">
+        <div v-html="renderMarkdown(digest.content)" style="line-height: 1.7"></div>
+      </a-card>
 
-    <!-- 复习提醒 -->
-    <div v-if="review?.items?.length" class="section">
-      <h4>📖 需要复习 ({{ review.total }})</h4>
-      <div v-for="r in review.items" :key="r.note_id" class="review-row">
-        <span :class="['dot', r.is_new ? 'blue' : r.review_count < 2 ? 'yellow' : 'green']"></span>
-        <span class="review-title">{{ r.title }}</span>
-        <span class="review-schedule">
-          {{ r.is_new ? "新卡片" : `第${r.review_count}次 · 间隔${r.interval_days}天` }}
-        </span>
-      </div>
-    </div>
+      <!-- 复习提醒 -->
+      <a-card v-if="review?.items?.length" size="small" :title="`📖 需要复习 (${review.total})`">
+        <a-list :data-source="review.items" size="small">
+          <template #renderItem="{ item }">
+            <a-list-item>
+              <a-space>
+                <a-badge
+                  :color="item.is_new ? 'blue' : item.review_count < 2 ? 'orange' : 'green'"
+                />
+                <span>{{ item.title }}</span>
+                <a-typography-text type="secondary" style="font-size: 12px">
+                  {{ item.is_new ? "新卡片" : `第${item.review_count}次 · 间隔${item.interval_days}天` }}
+                </a-typography-text>
+              </a-space>
+            </a-list-item>
+          </template>
+        </a-list>
+      </a-card>
 
-    <!-- 定时摘要报告（调度器生成的持久化报告） -->
-    <div v-if="reports.length" class="section">
-      <h4>🗂️ 自动摘要报告</h4>
-      <div v-for="rp in reports" :key="rp.id" class="report-card">
-        <div class="report-head">
-          <span :class="['report-badge', rp.report_type]">
-            {{ rp.report_type === "daily" ? "📅 每日" : "📊 每周" }}
-          </span>
-          <span class="report-date">{{ rp.report_date }}</span>
-        </div>
-        <div
-          class="report-content"
-          v-html="rp.content
-            .replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>')
-            .replace(/\n/g, '<br>')"
-        ></div>
-      </div>
-    </div>
+      <!-- 自动摘要报告 -->
+      <a-card v-if="reports.length" size="small" title="🗂️ 自动摘要报告">
+        <a-collapse>
+          <a-collapse-panel
+            v-for="rp in reports"
+            :key="rp.id"
+            :header="`${rp.report_type === 'daily' ? '📅 每日' : '📊 每周'} · ${rp.report_date}`"
+          >
+            <div v-html="renderMarkdown(rp.content)" style="line-height: 1.7"></div>
+          </a-collapse-panel>
+        </a-collapse>
+      </a-card>
 
-    <!-- 定时任务状态 -->
-    <div v-if="scheduler.length" class="section">
-      <h4>⏰ 定时任务</h4>
-      <div v-for="t in scheduler" :key="t.name" class="task-row">
-        <div class="task-info">
-          <span class="task-name">{{ t.description }}</span>
-          <span class="task-result">{{ t.last_result || "尚未运行" }}</span>
-        </div>
-        <div class="task-meta">
-          <span>上次: {{ t.last_run_at ? formatTime(t.last_run_at) : "—" }}</span>
-          <span>下次: {{ t.next_run_at ? formatTime(t.next_run_at) : "—" }}</span>
-        </div>
-      </div>
-    </div>
-  </div>
+      <!-- 定时任务 -->
+      <a-card v-if="scheduler.length" size="small" title="⏰ 定时任务">
+        <a-list :data-source="scheduler" size="small">
+          <template #renderItem="{ item }">
+            <a-list-item>
+              <a-list-item-meta>
+                <template #title>{{ item.description }}</template>
+                <template #description>
+                  <a-typography-text type="secondary" style="font-size: 12px">
+                    {{ item.last_result || "尚未运行" }}
+                  </a-typography-text>
+                </template>
+              </a-list-item-meta>
+              <template #extra>
+                <div style="text-align: right; font-size: 12px; color: #8c8c8c">
+                  <div>上次: {{ item.last_run_at ? formatTime(item.last_run_at) : "—" }}</div>
+                  <div>下次: {{ item.next_run_at ? formatTime(item.next_run_at) : "—" }}</div>
+                </div>
+              </template>
+            </a-list-item>
+          </template>
+        </a-list>
+      </a-card>
+    </a-space>
+  </a-spin>
 </template>
-
-<style scoped>
-.header-row {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  margin-bottom: 20px;
-}
-.btn-refresh {
-  padding: 8px 16px;
-  background: var(--primary);
-  color: #fff;
-  border: none;
-  border-radius: 8px;
-  font-size: 14px;
-  cursor: pointer;
-}
-.btn-refresh:hover {
-  opacity: 0.85;
-}
-.stats-grid {
-  display: grid;
-  grid-template-columns: repeat(4, 1fr);
-  gap: 12px;
-  margin-bottom: 28px;
-}
-.stat-card {
-  text-align: center;
-  padding: 20px;
-  background: var(--bg-card);
-  border: 1px solid var(--border);
-  border-radius: 12px;
-}
-.stat-num {
-  font-size: 28px;
-  font-weight: 700;
-  color: var(--primary);
-  font-family: var(--font-mono);
-}
-.stat-label {
-  font-size: 13px;
-  color: var(--text-dim);
-  margin-top: 4px;
-}
-.section {
-  margin-bottom: 24px;
-}
-.section h4 {
-  margin-bottom: 12px;
-  font-size: 16px;
-  color: var(--text-main);
-}
-.tag-list {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 8px;
-}
-.tag-chip {
-  padding: 6px 14px;
-  background: rgba(0, 132, 255, 0.08);
-  border: 1px solid var(--border-glow);
-  color: var(--primary);
-  border-radius: 20px;
-  font-size: 14px;
-}
-.tag-chip small {
-  color: var(--text-dim);
-}
-.note-row,
-.review-row {
-  padding: 8px 0;
-  font-size: 14px;
-  border-bottom: 1px solid var(--border);
-}
-.note-date {
-  color: var(--text-dim);
-  margin-right: 8px;
-}
-.note-tags {
-  font-size: 13px;
-  color: var(--text-dim);
-  margin-left: 8px;
-}
-.conn-row {
-  padding: 8px 0;
-  font-size: 14px;
-  border-bottom: 1px solid var(--border);
-}
-.conn-desc {
-  font-size: 13px;
-  color: var(--text-dim);
-  font-style: italic;
-  margin-top: 4px;
-}
-.digest {
-  padding: 20px;
-  background: var(--bg-card);
-  border-radius: 12px;
-  border: 1px solid var(--border-glow);
-}
-.digest-content {
-  font-size: 14px;
-  line-height: 1.7;
-}
-.dot {
-  width: 8px;
-  height: 8px;
-  border-radius: 50%;
-  flex-shrink: 0;
-  display: inline-block;
-}
-.dot.red { background: var(--danger); }
-.dot.yellow { background: #f39c12; }
-.dot.green { background: var(--success); }
-.dot.blue { background: var(--primary); }
-.review-title {
-  flex: 1;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-.review-schedule {
-  flex-shrink: 0;
-  font-size: 12px;
-  color: var(--text-faint);
-  font-family: var(--font-mono);
-}
-.freshness {
-  margin-left: auto;
-  font-size: 12px;
-  color: var(--text-dim);
-}
-.report-card {
-  padding: 14px 16px;
-  margin-bottom: 10px;
-  background: var(--bg-card);
-  border: 1px solid var(--border);
-  border-radius: 10px;
-}
-.report-head {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  margin-bottom: 8px;
-}
-.report-badge {
-  font-size: 12px;
-  font-weight: 600;
-  padding: 3px 10px;
-  border-radius: 12px;
-}
-.report-badge.daily {
-  background: rgba(0, 132, 255, 0.1);
-  color: var(--primary);
-}
-.report-badge.weekly {
-  background: rgba(0, 184, 212, 0.1);
-  color: var(--accent);
-}
-.report-date {
-  font-size: 12px;
-  color: var(--text-faint);
-  font-family: var(--font-mono);
-}
-.report-content {
-  font-size: 13px;
-  color: var(--text-dim);
-  line-height: 1.7;
-}
-.task-row {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  padding: 10px 0;
-  border-bottom: 1px solid var(--border);
-}
-.task-info {
-  display: flex;
-  flex-direction: column;
-  gap: 3px;
-  flex: 1;
-}
-.task-name {
-  font-size: 14px;
-  font-weight: 500;
-}
-.task-result {
-  font-size: 12px;
-  color: var(--text-dim);
-}
-.task-meta {
-  display: flex;
-  flex-direction: column;
-  gap: 3px;
-  font-size: 12px;
-  color: var(--text-faint);
-  font-family: var(--font-mono);
-  text-align: right;
-  flex-shrink: 0;
-}
-</style>

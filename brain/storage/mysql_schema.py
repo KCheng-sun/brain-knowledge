@@ -122,6 +122,26 @@ MYSQL_DDL = [
   `updated_at` text COLLATE utf8mb4_unicode_ci NOT NULL,
   PRIMARY KEY (`period_type`,`period_key`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci""",
+    """CREATE TABLE IF NOT EXISTS `prompts` (
+  `prompt_key` varchar(50) COLLATE utf8mb4_unicode_ci NOT NULL,
+  `name` text COLLATE utf8mb4_unicode_ci NOT NULL,
+  `description` text COLLATE utf8mb4_unicode_ci,
+  `content` text COLLATE utf8mb4_unicode_ci NOT NULL,
+  `is_template` int DEFAULT '0',
+  `enabled` int DEFAULT '1',
+  `version` int DEFAULT '1',
+  `updated_at` text COLLATE utf8mb4_unicode_ci NOT NULL,
+  PRIMARY KEY (`prompt_key`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci""",
+    """CREATE TABLE IF NOT EXISTS `prompt_versions` (
+  `id` int NOT NULL AUTO_INCREMENT,
+  `prompt_key` varchar(50) COLLATE utf8mb4_unicode_ci NOT NULL,
+  `version` int NOT NULL,
+  `content` text COLLATE utf8mb4_unicode_ci NOT NULL,
+  `saved_at` text COLLATE utf8mb4_unicode_ci NOT NULL,
+  PRIMARY KEY (`id`),
+  KEY `idx_prompt_versions_key` (`prompt_key`,`version`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci""",
     """CREATE TABLE IF NOT EXISTS `note_tags` (
   `note_id` varchar(255) COLLATE utf8mb4_unicode_ci NOT NULL,
   `tag_id` int NOT NULL,

@@ -194,3 +194,40 @@ export async function getEvalRuns(limit = 20, runType = null) {
   });
   return data;
 }
+
+// ---- Prompts（Phase 5E） ----
+
+export async function listPrompts() {
+  const { data } = await client.get("/prompts");
+  return data;
+}
+
+export async function getPrompt(promptKey) {
+  const { data } = await client.get(`/prompts/${promptKey}`);
+  return data;
+}
+
+export async function updatePrompt(promptKey, content, enabled = null) {
+  const { data } = await client.put(`/prompts/${promptKey}`, {
+    content,
+    enabled,
+  });
+  return data;
+}
+
+export async function listPromptVersions(promptKey) {
+  const { data } = await client.get(`/prompts/${promptKey}/versions`);
+  return data;
+}
+
+export async function getPromptVersion(promptKey, version) {
+  const { data } = await client.get(`/prompts/${promptKey}/versions/${version}`);
+  return data;
+}
+
+export async function restorePromptVersion(promptKey, version) {
+  const { data } = await client.post(
+    `/prompts/${promptKey}/versions/${version}/restore`
+  );
+  return data;
+}

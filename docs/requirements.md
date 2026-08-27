@@ -212,10 +212,22 @@
 
 #### Phase 5E — 提示词外部化
 
-| FR# | 功能 | 描述 | 优先级 |
-|-----|------|------|--------|
-| FR56 | 提示词外部化 | researcher/classifier/connector 的 system_prompt 抽到 prompts/*.yaml | P1 |
-| FR57 | 配置集中化 | 模型路由、Agent 参数、工具注册集中到 config | P2 |
+> **调整（2024-08-13）：提示词存数据库而非 YAML 文件。**
+> 理由：提示词是需在线迭代的运营资产（页面编辑、即时生效、版本可追溯），
+> YAML 文件需重启且无法页面管理。参照 golden_cases 表的「配置存库 + 页面 CRUD」先例。
+
+| FR# | 功能 | 描述 | 优先级 | 状态 |
+|-----|------|------|--------|------|
+| FR56 | 提示词外部化 | 6 个 system_prompt（classifier/connector/researcher/title-writer/knowledge-extractor/judge）存 `prompts` 表；运行时从库读 + 内存缓存；`brain/prompts.py` 统一读取入口 | P1 | 🔵 |
+| FR57 | 配置集中化 | 模型路由、Agent 参数、工具注册集中到 config | P2 | ⏸ |
+| FR56a | 提示词管理页面 | 后台新增「提示词管理」页：列表/编辑/保存/版本号；编辑后刷新缓存即时生效 | P1 | 🔵 |
+
+**Phase 5E 实现要点：**
+- `prompts` 表：`prompt_key`(PK) / `name` / `description` / `content` / `is_template`(含 `{占位符}`) / `enabled` / `version` / `updated_at`
+- 初始化时 `seed_prompts()` 幂等写入 6 条默认值（迁移现有硬编码内容）
+- `get_prompt(key)` 带进程内字典缓存，`upsert_prompt` 时清缓存
+- judge 提示词含 `{question}/{answer}/{context}` 占位符，用 `is_template=1` 标记，走 `get_prompt_template(key, **kw)` 渲染
+- 其余 5 个提示词为纯文本（`is_template=0`），直接读取使用
 
 #### Phase 5F — RAG 质量增强
 

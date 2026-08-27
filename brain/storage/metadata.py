@@ -38,7 +38,7 @@ class MetadataStore:
     def __init__(self, db_path: Path | None = None):
         self._db_path = str(db_path) if db_path else None
         self._conn = None
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()  # 可重入锁：允许同一线程多次获取（update_prompt 调 get_prompt）
         self._is_mysql = False
 
     # ---- 生命周期 ----
@@ -59,7 +59,7 @@ class MetadataStore:
                 host=db_cfg.host, port=db_cfg.port,
                 user=db_cfg.user, password=db_cfg.password,
                 database=db_cfg.database, charset=db_cfg.charset,
-                cursorclass=DictCursor, autocommit=False,
+                cursorclass=DictCursor, autocommit=True,
             )
             logger.info(f"MetadataStore 已连接 MySQL: {db_cfg.host}:{db_cfg.port}/{db_cfg.database}")
         else:
@@ -379,6 +379,28 @@ class MetadataStore:
                 extra TEXT,
                 collected_at TEXT NOT NULL
             );
+
+            -- 提示词外部化（Phase 5E FR56）：配置存库 + 页面 CRUD
+            CREATE TABLE IF NOT EXISTS prompts (
+                prompt_key TEXT PRIMARY KEY,
+                name TEXT NOT NULL,
+                description TEXT,
+                content TEXT NOT NULL,
+                is_template INTEGER DEFAULT 0,
+                enabled INTEGER DEFAULT 1,
+                version INTEGER DEFAULT 1,
+                updated_at TEXT NOT NULL
+            );
+
+            -- 提示词历史版本（每次更新前归档旧内容）
+            CREATE TABLE IF NOT EXISTS prompt_versions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                prompt_key TEXT NOT NULL,
+                version INTEGER NOT NULL,
+                content TEXT NOT NULL,
+                saved_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_prompt_versions_key ON prompt_versions(prompt_key, version);
             """
         )
         self._conn.commit()
@@ -447,6 +469,9 @@ class MetadataStore:
         # 回填 usage_counters（从 trace_events 历史数据初始化计数器）
         self._backfill_usage_counters()
 
+        # 播种提示词（Phase 5E：首次初始化写入 6 条默认值）
+        self._seed_prompts()
+
         self._conn.commit()
 
     def _backfill_usage_counters(self) -> None:
@@ -510,6 +535,29 @@ class MetadataStore:
             f"回填 usage_counters: today={today_tokens}t/¥{today_cost:.4f}, "
             f"month={month_tokens}t/¥{month_cost:.4f}, total={total_tokens}t/¥{total_cost:.4f}"
         )
+
+    def _seed_prompts(self) -> None:
+        """首次初始化时写入 6 条默认提示词（幂等：仅空表时写）。
+
+        之后用户可在页面编辑，运行时从库读取（brain.prompts.get_prompt）。
+        """
+        from datetime import datetime
+
+        from brain.storage.prompt_defaults import DEFAULT_PROMPTS
+
+        row = self._exec("SELECT COUNT(*) as cnt FROM prompts").fetchone()
+        if row and row["cnt"] > 0:
+            return
+
+        now_iso = datetime.now().isoformat()
+        for key, name, desc, content, is_template in DEFAULT_PROMPTS:
+            self._exec(
+                """INSERT OR IGNORE INTO prompts
+                   (prompt_key, name, description, content, is_template, enabled, version, updated_at)
+                   VALUES (?, ?, ?, ?, ?, 1, 1, ?)""",
+                (key, name, desc, content, is_template, now_iso),
+            )
+        logger.info(f"播种提示词: {len(DEFAULT_PROMPTS)} 条默认值")
 
     # ---- Notes CRUD ----
 
@@ -1997,3 +2045,117 @@ class MetadataStore:
             is_ai_generated=bool(row["is_ai_generated"]),
             created_at=row["created_at"] or "",
         )
+
+    # ---- Prompts（提示词外部化，Phase 5E FR56） ----
+
+    @_synchronized
+    def get_prompt(self, prompt_key: str) -> dict | None:
+        """获取单条提示词（含全部字段）。不存在返回 None。"""
+        assert self._conn is not None
+        row = self._exec(
+            "SELECT prompt_key, name, description, content, is_template, enabled, version, updated_at "
+            "FROM prompts WHERE prompt_key=?",
+            (prompt_key,),
+        ).fetchone()
+        if not row:
+            return None
+        return {
+            "prompt_key": row["prompt_key"],
+            "name": row["name"],
+            "description": row["description"],
+            "content": row["content"],
+            "is_template": bool(row["is_template"]),
+            "enabled": bool(row["enabled"]),
+            "version": row["version"],
+            "updated_at": row["updated_at"],
+        }
+
+    @_synchronized
+    def list_prompts(self) -> list[dict]:
+        """列出全部提示词（不含 content 正文，列表展示用）。"""
+        assert self._conn is not None
+        rows = self._exec(
+            "SELECT prompt_key, name, description, is_template, enabled, version, updated_at "
+            "FROM prompts ORDER BY prompt_key"
+        ).fetchall()
+        return [
+            {
+                "prompt_key": r["prompt_key"],
+                "name": r["name"],
+                "description": r["description"],
+                "is_template": bool(r["is_template"]),
+                "enabled": bool(r["enabled"]),
+                "version": r["version"],
+                "updated_at": r["updated_at"],
+            }
+            for r in rows
+        ]
+
+    @_synchronized
+    def update_prompt(self, prompt_key: str, content: str, enabled: bool | None = None) -> bool:
+        """更新提示词内容（version 自增），并归档旧版本到 prompt_versions。返回是否成功。"""
+        assert self._conn is not None
+        from datetime import datetime
+
+        # 先读取旧内容，归档到历史表
+        old = self.get_prompt(prompt_key)
+        if old:
+            self._exec(
+                "INSERT INTO prompt_versions (prompt_key, version, content, saved_at) "
+                "VALUES (?, ?, ?, ?)",
+                (prompt_key, old["version"], old["content"], datetime.now().isoformat()),
+            )
+
+        # 动态拼接 SET 子句：content/version/updated_at 必更新，enabled 可选
+        sets = ["content = ?", "version = version + 1", "updated_at = ?"]
+        params: list = [content, datetime.now().isoformat()]
+        if enabled is not None:
+            sets.append("enabled = ?")
+            params.append(1 if enabled else 0)
+        params.append(prompt_key)
+        cur = self._exec(
+            f"UPDATE prompts SET {', '.join(sets)} WHERE prompt_key=?",
+            tuple(params),
+        )
+        self._conn.commit()
+        return cur.rowcount > 0
+
+    @_synchronized
+    def list_prompt_versions(self, prompt_key: str) -> list[dict]:
+        """列出某提示词的历史版本（按版本号降序，不含正文）。"""
+        assert self._conn is not None
+        rows = self._exec(
+            "SELECT version, saved_at FROM prompt_versions "
+            "WHERE prompt_key=? ORDER BY version DESC",
+            (prompt_key,),
+        ).fetchall()
+        return [
+            {"version": r["version"], "saved_at": r["saved_at"]}
+            for r in rows
+        ]
+
+    @_synchronized
+    def get_prompt_version(self, prompt_key: str, version: int) -> dict | None:
+        """获取某提示词指定历史版本的正文。不存在返回 None。"""
+        assert self._conn is not None
+        row = self._exec(
+            "SELECT version, content, saved_at FROM prompt_versions "
+            "WHERE prompt_key=? AND version=?",
+            (prompt_key, version),
+        ).fetchone()
+        if not row:
+            return None
+        return {
+            "version": row["version"],
+            "content": row["content"],
+            "saved_at": row["saved_at"],
+        }
+
+    @_synchronized
+    def restore_prompt_version(self, prompt_key: str, version: int) -> bool:
+        """恢复某历史版本（把该版本内容设为最新，version 继续自增）。"""
+        assert self._conn is not None
+        hist = self.get_prompt_version(prompt_key, version)
+        if not hist:
+            return False
+        return self.update_prompt(prompt_key, hist["content"])

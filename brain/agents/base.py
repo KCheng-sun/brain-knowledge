@@ -24,19 +24,25 @@ class BaseAgent:
     """Agent 基类。
 
     子类只需定义：
-      - name: Agent 名称（用于日志）
-      - system_prompt: 系统提示词
+      - name: Agent 名称（用于日志 + 提示词库的 prompt_key）
       - build_user_prompt(...): 构建用户提示词
       - output_model: 期望的 Pydantic 输出模型
 
+    system_prompt 从 prompts 表读取（Phase 5E），key = self.name。
     然后调用 self.run(input_data) 即可获得验证后的结构化输出。
     """
 
     name: str = "base"
-    system_prompt: str = "你是一个 AI 助手。"
     output_model: type[T] = BaseModel  # 子类必须覆写
     max_retries: int = 3
     retry_delay: float = 1.0  # 秒
+
+    @property
+    def system_prompt(self) -> str:
+        """从 prompts 表读取系统提示词（key=self.name）。"""
+        from brain.prompts import get_prompt
+
+        return get_prompt(self.name)
 
     @property
     def _output_example(self) -> str:
@@ -52,13 +58,19 @@ class BaseAgent:
 
         自动处理：JSON 提取、Pydantic 验证、失败重试。
         """
+        from langchain_core.messages import HumanMessage, SystemMessage
+
         user_prompt = self.build_user_prompt(**kwargs)
         llm = get_chat_model()
 
         last_error = None
         for attempt in range(1, self.max_retries + 1):
             try:
-                response = llm.invoke(self._build_full_prompt(user_prompt))
+                messages = [
+                    SystemMessage(content=self.system_prompt),
+                    HumanMessage(content=self._build_user_prompt_with_schema(user_prompt)),
+                ]
+                response = llm.invoke(messages)
                 parsed = self._parse_json(response.content)
                 result = self.output_model(**parsed)
                 logger.info(f"[{self.name}] ✓ 执行成功 (attempt {attempt})")
@@ -76,13 +88,11 @@ class BaseAgent:
 
         raise RuntimeError(f"[{self.name}] 执行失败: {last_error}")
 
-    def _build_full_prompt(self, user_prompt: str) -> str:
-        """合并 system prompt 和 user prompt，并附加 JSON 格式和示例。"""
+    def _build_user_prompt_with_schema(self, user_prompt: str) -> str:
+        """在 user 消息中附加 JSON 格式约束和示例（system 角色已分离）。"""
         schema_desc = self._describe_model(self.output_model)
         example = self._output_example
-        return f"""{self.system_prompt}
-
-{user_prompt}
+        return f"""{user_prompt}
 
 ---
 重要：你必须严格按照以下 JSON Schema 输出，不要输出任何其他内容。

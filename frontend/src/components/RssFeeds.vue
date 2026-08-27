@@ -1,11 +1,12 @@
 <script setup>
-import { ref, onMounted } from "vue";
+import { ref, h, onMounted } from "vue";
+import { message as antMessage, Modal } from "ant-design-vue";
+import { ReloadOutlined, PlusOutlined, DeleteOutlined, ThunderboltOutlined } from "@ant-design/icons-vue";
 import axios from "axios";
 
 const feeds = ref([]);
 const newUrl = ref("");
 const loading = ref(false);
-const message = ref("");
 
 async function refresh() {
   try {
@@ -20,14 +21,13 @@ async function addFeed() {
   const url = newUrl.value.trim();
   if (!url) return;
   loading.value = true;
-  message.value = "";
   try {
     const { data } = await axios.post("/api/rss", { url });
-    message.value = `✅ 已添加并拉取，新增摄入 ${data.new_entries} 条`;
+    antMessage.success(`已添加，新增摄入 ${data.new_entries} 条`);
     newUrl.value = "";
     await refresh();
   } catch (e) {
-    message.value = `❌ 添加失败: ${e.response?.data?.detail || e.message}`;
+    antMessage.error(`添加失败: ${e.response?.data?.detail || e.message}`);
   } finally {
     loading.value = false;
   }
@@ -35,193 +35,88 @@ async function addFeed() {
 
 async function fetchAll() {
   loading.value = true;
-  message.value = "";
   try {
     const { data } = await axios.post("/api/rss/fetch");
-    message.value = `📡 检查 ${data.feeds_checked} 个源，新增摄入 ${data.new_entries} 条`;
+    antMessage.success(`检查 ${data.feeds_checked} 个源，新增 ${data.new_entries} 条`);
     await refresh();
   } catch (e) {
-    message.value = `❌ 拉取失败: ${e.message}`;
+    antMessage.error("拉取失败");
   } finally {
     loading.value = false;
   }
 }
 
-async function removeFeed(id) {
-  if (!confirm("确定删除这个订阅源？")) return;
-  try {
-    await axios.delete(`/api/rss/${id}`);
-    await refresh();
-  } catch (e) {
-    console.error(e);
-  }
+function onRemove(id) {
+  Modal.confirm({
+    title: "删除订阅源",
+    content: "确定删除这个订阅源？",
+    okText: "删除",
+    okType: "danger",
+    cancelText: "取消",
+    onOk: async () => {
+      await axios.delete(`/api/rss/${id}`);
+      antMessage.success("已删除");
+      await refresh();
+    },
+  });
 }
 
 onMounted(refresh);
+
+const columns = [
+  { title: "订阅源", key: "title", ellipsis: true },
+  { title: "文章数", key: "entry_count", width: 100 },
+  { title: "上次拉取", key: "last_fetched", width: 130 },
+  { title: "操作", key: "action", width: 80 },
+];
 </script>
 
 <template>
-  <div>
-    <div class="header-row">
-      <p class="hint">订阅 RSS 源，新文章自动摄入知识库（打标签、建关联）</p>
-      <button class="btn" :disabled="loading" @click="fetchAll">
-        {{ loading ? "拉取中..." : "📡 立即拉取" }}
-      </button>
+  <a-space direction="vertical" :size="16" style="width: 100%">
+    <div style="display: flex; justify-content: space-between; align-items: center">
+      <a-typography-text type="secondary">
+        订阅 RSS 源，新文章自动摄入知识库（打标签、建关联）
+      </a-typography-text>
+      <a-button type="primary" :icon="h(ThunderboltOutlined)" :loading="loading" @click="fetchAll">
+        立即拉取
+      </a-button>
     </div>
 
-    <!-- 添加订阅源 -->
-    <div class="add-row">
-      <input
-        v-model="newUrl"
-        class="input"
-        placeholder="输入 RSS/Atom 订阅源 URL，如 https://blog.example.com/feed.xml"
-        @keyup.enter="addFeed"
-      />
-      <button class="btn" :disabled="loading || !newUrl.trim()" @click="addFeed">
-        添加
-      </button>
-    </div>
+    <a-input-search
+      v-model:value="newUrl"
+      placeholder="输入 RSS/Atom 订阅源 URL"
+      enter-button="添加"
+      size="large"
+      :loading="loading"
+      @search="addFeed"
+    >
+      <template #enterButton>
+        <a-button type="primary" :icon="h(PlusOutlined)">添加</a-button>
+      </template>
+    </a-input-search>
 
-    <div v-if="message" class="message">{{ message }}</div>
+    <a-table
+      :columns="columns"
+      :data-source="feeds.map((f) => ({ ...f, key: f.id }))"
+      :pagination="false"
+      :loading="loading"
+    >
+      <template #bodyCell="{ column, record }">
+        <template v-if="column.key === 'title'">
+          <div style="font-weight: 600">{{ record.title || record.url }}</div>
+          <div style="font-size: 12px; color: #8c8c8c; font-family: monospace">
+            {{ record.url }}
+          </div>
+        </template>
+        <template v-else-if="column.key === 'last_fetched'">
+          {{ record.last_fetched_at ? record.last_fetched_at.slice(0, 10) : "从未" }}
+        </template>
+        <template v-else-if="column.key === 'action'">
+          <a-button type="text" danger size="small" :icon="h(DeleteOutlined)" @click="onRemove(record.id)" />
+        </template>
+      </template>
+    </a-table>
 
-    <!-- 订阅源列表 -->
-    <div v-if="!feeds.length && !loading" class="empty">
-      <div class="empty-icon">📡</div>
-      <p>还没有订阅源</p>
-    </div>
-
-    <div v-for="f in feeds" :key="f.id" class="feed-card">
-      <div class="feed-head">
-        <span class="feed-title">{{ f.title || f.url }}</span>
-        <button class="delete-btn" title="删除" @click="removeFeed(f.id)">✕</button>
-      </div>
-      <div class="feed-meta">
-        <span class="feed-url">{{ f.url }}</span>
-        <span class="feed-stats">累计 {{ f.entry_count }} 条</span>
-        <span class="feed-stats">
-          上次拉取: {{ f.last_fetched_at ? f.last_fetched_at.slice(0, 10) : "从未" }}
-        </span>
-      </div>
-    </div>
-  </div>
+    <a-empty v-if="!feeds.length && !loading" description="还没有订阅源" />
+  </a-space>
 </template>
-
-<style scoped>
-.header-row {
-  display: flex;
-  align-items: flex-start;
-  justify-content: space-between;
-  gap: 16px;
-  margin-bottom: 16px;
-}
-.hint {
-  color: var(--text-dim);
-  font-size: 14px;
-  flex: 1;
-}
-.add-row {
-  display: flex;
-  gap: 8px;
-  margin-bottom: 16px;
-}
-.input {
-  flex: 1;
-  padding: 10px 14px;
-  border: 1px solid var(--border);
-  border-radius: 8px;
-  font-size: 14px;
-  outline: none;
-  background: var(--bg-card);
-  color: var(--text-main);
-}
-.input:focus {
-  border-color: var(--primary);
-}
-.btn {
-  padding: 10px 20px;
-  background: var(--primary);
-  color: #fff;
-  border: none;
-  border-radius: 8px;
-  font-size: 14px;
-  cursor: pointer;
-  flex-shrink: 0;
-}
-.btn:hover:not(:disabled) {
-  opacity: 0.85;
-}
-.btn:disabled {
-  opacity: 0.5;
-  cursor: not-allowed;
-}
-.message {
-  padding: 10px 14px;
-  margin-bottom: 16px;
-  background: rgba(16, 185, 129, 0.08);
-  border: 1px solid rgba(16, 185, 129, 0.25);
-  border-radius: 8px;
-  font-size: 14px;
-  color: var(--success);
-}
-.empty {
-  text-align: center;
-  padding: 50px 0;
-  color: var(--text-dim);
-}
-.empty-icon {
-  font-size: 36px;
-  margin-bottom: 10px;
-}
-.feed-card {
-  padding: 14px 16px;
-  margin-bottom: 10px;
-  background: var(--bg-card);
-  border: 1px solid var(--border);
-  border-radius: 10px;
-}
-.feed-head {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  margin-bottom: 6px;
-}
-.feed-title {
-  font-weight: 600;
-  font-size: 15px;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-  flex: 1;
-  margin-right: 10px;
-}
-.delete-btn {
-  border: none;
-  background: transparent;
-  color: var(--text-faint);
-  cursor: pointer;
-  font-size: 13px;
-  padding: 4px 6px;
-  border-radius: 4px;
-  flex-shrink: 0;
-}
-.delete-btn:hover {
-  color: var(--danger);
-  background: rgba(239, 68, 68, 0.1);
-}
-.feed-meta {
-  display: flex;
-  gap: 14px;
-  font-size: 12px;
-  color: var(--text-faint);
-}
-.feed-url {
-  flex: 1;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-  font-family: var(--font-mono);
-}
-.feed-stats {
-  flex-shrink: 0;
-}
-</style>
