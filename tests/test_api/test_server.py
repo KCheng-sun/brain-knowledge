@@ -235,6 +235,112 @@ class TestStatusAPI:
         assert data["chunk_count"] >= 1
 
 
+class TestTagsAPI:
+    """Phase 4B FR35：标签浏览 API。"""
+
+    def test_list_tags_empty(self, client):
+        resp = client.get("/api/tags")
+        assert resp.status_code == 200
+        assert resp.json() == []
+
+    def test_list_tags_after_ingest(self, client):
+        # 摄入笔记后（mock classifier 会生成标签）查询
+        client.post("/api/notes", json={"text": "Python 异步编程", "title": "Py"})
+        resp = client.get("/api/tags")
+        assert resp.status_code == 200
+        data = resp.json()
+        # mock classifier 返回空 topics，可能无标签；只要接口正常返回列表即可
+        assert isinstance(data, list)
+
+
+class TestNoteEditAPI:
+    """Phase 4B FR36：笔记编辑 API。"""
+
+    def test_edit_nonexistent_note_returns_404(self, client):
+        resp = client.patch("/api/notes/nonexistent", json={"title": "新标题"})
+        assert resp.status_code == 404
+
+    def test_edit_note_title(self, client):
+        # 先添加笔记
+        add_resp = client.post("/api/notes", json={"text": "测试内容", "title": "旧标题"})
+        note_id = add_resp.json()["note_id"]
+
+        # 修改标题
+        resp = client.patch(f"/api/notes/{note_id}", json={"title": "新标题"})
+        assert resp.status_code == 200
+        assert "title" in resp.json()["changed"]
+
+    def test_edit_note_add_tags(self, client):
+        add_resp = client.post("/api/notes", json={"text": "测试内容", "title": "T"})
+        note_id = add_resp.json()["note_id"]
+
+        resp = client.patch(
+            f"/api/notes/{note_id}",
+            json={"add_tags": ["python", "ai"]},
+        )
+        assert resp.status_code == 200
+        assert "+2tags" in resp.json()["changed"]
+
+    def test_edit_note_remove_tag(self, client):
+        add_resp = client.post("/api/notes", json={"text": "测试内容", "title": "T"})
+        note_id = add_resp.json()["note_id"]
+        # 先加标签
+        client.patch(f"/api/notes/{note_id}", json={"add_tags": ["python"]})
+        # 再移除
+        resp = client.patch(f"/api/notes/{note_id}", json={"remove_tags": ["python"]})
+        assert resp.status_code == 200
+
+
+class TestConnectionDeleteAPI:
+    """Phase 4B FR36：关联删除 API。"""
+
+    def test_delete_nonexistent_connection_returns_404(self, client):
+        resp = client.delete("/api/connections/99999")
+        assert resp.status_code == 404
+
+
+class TestBookmarkImportAPI:
+    """Phase 4B FR34：书签导入 API。"""
+
+    def test_import_chrome_bookmarks(self, client, tmp_path):
+        import json
+
+        data = {"roots": {"bar": {"children": [
+            {"type": "url", "name": "Google", "url": "https://google.com"},
+        ]}}}
+        bookmark_file = tmp_path / "bookmarks.json"
+        bookmark_file.write_text(json.dumps(data), encoding="utf-8")
+
+        with open(bookmark_file, "rb") as f:
+            resp = client.post(
+                "/api/bookmarks/import",
+                files={"file": ("bookmarks.json", f, "application/json")},
+            )
+
+        assert resp.status_code == 200
+        result = resp.json()
+        assert result["total"] == 1
+        assert result["success"] == 1
+
+    def test_import_firefox_bookmarks(self, client, tmp_path):
+        import json
+
+        data = {"children": [
+            {"typeCode": 2, "title": "MDN", "uri": "https://developer.mozilla.org"},
+        ]}
+        bookmark_file = tmp_path / "bookmarks.json"
+        bookmark_file.write_text(json.dumps(data), encoding="utf-8")
+
+        with open(bookmark_file, "rb") as f:
+            resp = client.post(
+                "/api/bookmarks/import",
+                files={"file": ("bookmarks.json", f, "application/json")},
+            )
+
+        assert resp.status_code == 200
+        assert resp.json()["success"] == 1
+
+
 class TestHILInterrupt:
     """HIL 中断的多 proposals 场景测试。
 

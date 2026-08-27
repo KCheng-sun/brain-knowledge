@@ -1,7 +1,10 @@
 <script setup>
-import { ref, watch } from "vue";
+import { ref, watch, onMounted } from "vue";
+import { useRoute } from "vue-router";
 import { searchNotes } from "../api/index.js";
 import { SearchOutlined } from "@ant-design/icons-vue";
+
+const route = useRoute();
 
 const props = defineProps({
   seed: { type: Object, default: null },
@@ -13,6 +16,13 @@ const topK = ref(5);
 const results = ref([]);
 const total = ref(0);
 const loading = ref(false);
+
+// 从路由 query 读取标签（Tags 页跳转过来时自动填充）
+onMounted(() => {
+  if (route.query.tag) {
+    tag.value = route.query.tag;
+  }
+});
 
 async function search() {
   if (!query.value.trim()) return;

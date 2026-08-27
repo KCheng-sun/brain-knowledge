@@ -34,6 +34,7 @@ class IngestionState(TypedDict):
     # 输入
     source_path: str
     raw_text: str
+    source_type: str  # 可选：显式指定来源类型（如 bookmark），空则按 source_path 推断
 
     # 中间产物
     parsed_doc: ParsedDocument | None
@@ -78,6 +79,7 @@ class IngestionPipeline:
         state: IngestionState = {
             "source_path": str(file_path),
             "raw_text": raw_text,
+            "source_type": "",
             "parsed_doc": None,
             "chunks": [],
             "tags": [],
@@ -97,6 +99,7 @@ class IngestionPipeline:
             raw_text = file_path.read_text(encoding="utf-8")
             state: IngestionState = {
                 "source_path": str(file_path), "raw_text": raw_text,
+                "source_type": "",
                 "parsed_doc": None, "chunks": [], "tags": [], "connections": [],
                 "note_id": "", "errors": [], "status": "running",
             }
@@ -109,6 +112,7 @@ class IngestionPipeline:
         state: IngestionState = {
             "source_path": "",
             "raw_text": f"# {title}\n\n{text}" if title else text,
+            "source_type": "",
             "parsed_doc": None,
             "chunks": [],
             "tags": [],
@@ -120,11 +124,17 @@ class IngestionPipeline:
         final_state = await self._graph.ainvoke(state)
         return final_state["note_id"]
 
-    def ingest_text_sync(self, text: str, title: str | None = None) -> str:
-        """摄入文本（同步版本）。"""
+    def ingest_text_sync(self, text: str, title: str | None = None, source_type: SourceType | None = None) -> str:
+        """摄入文本（同步版本）。
+
+        Args:
+            source_type: 显式指定来源类型（如书签导入传 BOOKMARK），
+                         None 则默认按 CLI 类型处理
+        """
         state: IngestionState = {
             "source_path": "",
             "raw_text": f"# {title}\n\n{text}" if title else text,
+            "source_type": source_type.value if source_type else "",
             "parsed_doc": None, "chunks": [], "tags": [], "connections": [],
             "note_id": "", "errors": [], "status": "running",
         }
@@ -370,7 +380,12 @@ class IngestionPipeline:
                     state["status"] = "completed"
                     return state
 
-            source_type = SourceType.MARKDOWN if state["source_path"] else SourceType.CLI
+            # source_type 优先用显式传入（如书签），否则按 source_path 推断（文件=MARKDOWN，空=CLI）
+            explicit_type = state.get("source_type", "")
+            if explicit_type:
+                source_type = SourceType(explicit_type)
+            else:
+                source_type = SourceType.MARKDOWN if state["source_path"] else SourceType.CLI
 
             note_id = state["note_id"]  # 由 _parse_node 生成，所有节点共用
 

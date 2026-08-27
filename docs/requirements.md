@@ -132,14 +132,17 @@
 | FR32 | API lifespan 迁移 | FastAPI `@app.on_event` 废弃装饰器改 `lifespan` 上下文管理器 | P0 ✅ |
 | FR33 | 测试提速 | `bulk_client` fixture 改 module 级复用，500 条笔记只摄入一次（92s→16s） | P1 ✅ |
 
-#### Phase 4B — P1 功能闭环
+#### Phase 4B — P1 功能闭环（当前进行中）
 
-| FR# | 功能 | 描述 | 优先级 |
-|-----|------|------|--------|
-| FR34 | 书签导入 | 解析 Chrome/Firefox 书签 JSON 导出，作为 `bookmark` 类型笔记摄入；CLI `brain bookmarks <path>` + API `/api/bookmarks/import` | P1 |
-| FR35 | 标签浏览 | CLI `brain tags` 列出标签计数排行；API `/api/tags`；前端标签云浏览页 | P1 |
-| FR36 | 笔记编辑 | 暴露已有 `update_note`：CLI `brain edit <id>`；API `PATCH /api/notes/{id}`；新增编辑标签/删除关联 | P2 |
-| FR37 | 多跳推理增强 | ResearcherAgent 显式子问题分解环节（现多次搜索但非显式分解→综合） | P2 |
+> 补齐需求文档标 P1 但未实现的功能：书签导入、标签浏览、笔记编辑。
+> 全部基于现有架构扩展，不引入新框架。
+
+| FR# | 功能 | 描述 | 优先级 | 状态 |
+|-----|------|------|--------|------|
+| FR34 | 书签导入 | 解析 Chrome/Firefox 书签 JSON 导出，作为 `bookmark` 类型笔记摄入；CLI `brain bookmarks <path>` + API `/api/bookmarks/import` | P1 | ✅ |
+| FR35 | 标签浏览 | CLI `brain tags` 列出标签计数排行；API `/api/tags`；前端标签云浏览页 | P1 | ✅ |
+| FR36 | 笔记编辑 | 暴露已有 `update_note`：CLI `brain edit <id>`；API `PATCH /api/notes/{id}`；新增编辑标签/删除关联 | P2 | ✅ |
+| FR37 | 多跳推理增强 | ResearcherAgent 显式子问题分解环节（现多次搜索但非显式分解→综合） | P2 | ⏸ |
 
 #### Phase 4C — 实用性增强
 
@@ -218,9 +221,9 @@
 
 | FR# | 功能 | 描述 | 优先级 | 状态 |
 |-----|------|------|--------|------|
-| FR56 | 提示词外部化 | 6 个 system_prompt（classifier/connector/researcher/title-writer/knowledge-extractor/judge）存 `prompts` 表；运行时从库读 + 内存缓存；`brain/prompts.py` 统一读取入口 | P1 | 🔵 |
+| FR56 | 提示词外部化 | 6 个 system_prompt（classifier/connector/researcher/title-writer/knowledge-extractor/judge）存 `prompts` 表；运行时从库读 + 内存缓存；`brain/prompts.py` 统一读取入口 | P1 | ✅ |
 | FR57 | 配置集中化 | 模型路由、Agent 参数、工具注册集中到 config | P2 | ⏸ |
-| FR56a | 提示词管理页面 | 后台新增「提示词管理」页：列表/编辑/保存/版本号；编辑后刷新缓存即时生效 | P1 | 🔵 |
+| FR56a | 提示词管理页面 | 后台新增「提示词管理」页：列表/编辑/保存/版本号；编辑后刷新缓存即时生效 | P1 | ✅ |
 
 **Phase 5E 实现要点：**
 - `prompts` 表：`prompt_key`(PK) / `name` / `description` / `content` / `is_template`(含 `{占位符}`) / `enabled` / `version` / `updated_at`

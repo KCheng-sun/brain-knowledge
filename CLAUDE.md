@@ -284,6 +284,12 @@ ruff check brain/
   - **PowerShell Set-Content 默认 GBK 编码会破坏中文**：用 `Get-Content -Raw | Set-Content` 批量替换文本时，默认编码把 UTF-8 中文写成 GBK，导致 SyntaxError。必须用 Python 重写文件（`open(path,'w',encoding='utf-8')`）或 PowerShell 指定 `-Encoding utf8`。教训：涉及中文的文件批量替换优先用 Python 而非 PowerShell
   - **提示词种子要支持增量补充**：_seed_prompts 原本仅空表时写入全部默认值，旧库升级时新增的 query_rewriter 不会被补充。改为「空表写全部 + 非空表补充缺失 key」，让 5F 新增的提示词能自动出现在已初始化的库里
   - **检索链路双调用方统一**：researcher.search_notes 工具和 server /api/search 原本各自调 VectorStore.search，5F 抽出 HybridSearcher 统一入口，两者都注入。CLI 的 _get_search_components 返回三元组，所有解包处同步更新
+- 经验（4B）：
+  - **书签去重的 file_hash 必须与流水线一致**：BookmarkSource 预检查去重用的 file_hash，必须和 ingest_text_sync 内部计算方式完全一致。pipeline 会把 content 包装成 `# {title}\n\n{content}` 再算 hash，所以预检查的 hash 也要基于包装后的文本，否则预检查漏判、重复摄入
+  - **ingest_text_sync 的标题包装陷阱**：传 `content=url, title=title` 时，pipeline 内部拼成 `# {title}\n\n{url}` 作为 raw_text。书签源不能自己拼 `# {title}\n\n{url}` 再传（会变成双标题），只传纯 URL 让 pipeline 包装，保证 file_hash 一致
+  - **source_type 通过 state 透传**：IngestionState 加 source_type 字段，_index_node 优先用显式传入的（如 BOOKMARK），否则按 source_path 推断（文件=MARKDOWN，空=CLI）。TypedDict 运行时不强制，旧构造点用 state.get(key, '') 兑底也不会 KeyError
+  - **标签云字号按计数权重**：前端 Tags.vue 用 `fontSize = 12 + (count/maxCount)*20` 让高频标签字号大，点击跳转 /search?tag=xxx。Search.vue 加 onMounted 读 route.query.tag 自动填充标签过滤
+  - **笔记内容编辑不做**：内容存在 ChromaDB 分块，原地改内容需重建向量（删旧 chunk + 重新分块嵌入），复杂度高。4B 只做标题/标签/关联编辑，内容编辑走重新摄入流程
 
 ---
 

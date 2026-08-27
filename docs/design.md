@@ -788,12 +788,12 @@ brain review
 - [x] FR32 API lifespan 迁移：`@app.on_event("startup")` → `lifespan` 上下文管理器
 - [x] FR33 测试提速：`bulk_client` fixture 改 module 级复用，500 条笔记只摄入一次
 
-### 13.2 Phase 4B — P1 功能闭环
+### 13.2 Phase 4B — P1 功能闭环 ✅（已完成）
 
-- [ ] FR34 书签导入：`brain/ingestion/sources/bookmark.py`（解析 Chrome/Firefox JSON），遵循 `SourceProtocol`；CLI `brain bookmarks <path>`；API `POST /api/bookmarks/import`
-- [ ] FR35 标签浏览：`MetadataStore.list_all_tags()` 新方法；CLI `brain tags`；API `GET /api/tags`；前端标签云
-- [ ] FR36 笔记编辑：`MetadataStore.update_note_tags`/`delete_connection`；CLI `brain edit <id>`；API `PATCH /api/notes/{id}`、`DELETE /api/connections/{id}`
-- [ ] FR37 多跳推理增强：ResearcherAgent 系统提示词增加显式子问题分解环节
+- [x] FR34 书签导入：`brain/ingestion/sources/bookmark.py`（解析 Chrome/Firefox JSON），遵循 `SourceProtocol`；CLI `brain bookmarks <path>`；API `POST /api/bookmarks/import`
+- [x] FR35 标签浏览：`MetadataStore.list_all_tags()` 新方法；CLI `brain tags`；API `GET /api/tags`；前端标签云页 `Tags.vue`
+- [x] FR36 笔记编辑：`MetadataStore.remove_tag_from_note`/`delete_connection`；CLI `brain edit <id>`；API `PATCH /api/notes/{id}`、`DELETE /api/connections/{id}`
+- [ ] FR37 多跳推理增强：ResearcherAgent 系统提示词增加显式子问题分解环节（暂缓）
 
 ### 13.3 Phase 4C — 实用性增强
 
@@ -804,83 +804,89 @@ brain review
 
 ### 13.4 Phase 4 核心设计
 
-**书签源设计（对齐 RSS 源结构）：**
+#### FR34 书签导入
+
+**设计思路：** 对齐 RSS 源结构——`BookmarkSource` 持有 `pipeline` + `metadata_store`，
+解析 JSON 后逐个走完整摄入流水线。不复用 `DocumentParser`（书签无 Markdown 正文，
+内容为标题+URL 拼接）。
+
+**Chrome/Firefox JSON 格式差异：**
+```python
+# Chrome: 根节点 "roots" 下按文件夹嵌套，children 递归
+{"roots": {"bookmark_bar": {"children": [{"type":"url","name":"...","url":"..."}, {"type":"folder","children":[...]}]}}}
+
+# Firefox: 平铺数组，带 typeCode (1=folder, 2=bookmark)
+{"children": [{"typeCode": 2, "title":"...", "uri":"..."}, {"typeCode": 1, "children":[...]}]}
+```
+
+`BookmarkSource.parse(path)` 递归遍历两种格式，统一提取 `(title, url)` 对。
+
+**摄入流程：**
 ```
 brain bookmarks ./bookmarks.json
     │
     ▼
-1. BookmarkSource.parse(path) → list[ParsedDocument]
-   - Chrome 导出格式：嵌套 children 数组
-   - Firefox 导出格式：平铺条目数组
-   - 每个书签 → title + url（内容为 "# {title}\n{url}"）
+1. BookmarkSource.import_file(path) → 统计 {success, failed, skipped}
+    │
+    ▼ 逐个书签
+2. 构造笔记文本: "# {title}\n\n{url}"
+3. file_hash = sha256(url)  ——基于 URL 去重（同一书签重复导入跳过）
+4. pipeline.ingest_text_sync(text, title=title)  ——走完整流水线
+5. 摄入后补写 source_type=BOOKMARK（覆盖默认的 CLI 类型）
     │
     ▼
-2. 逐个走 IngestionPipeline.ingest_document()
-   - source_type = BOOKMARK
-   - file_hash 基于 url 计算（去重）
-    │
-    ▼
-3. 批量摄入，返回成功/失败统计
+3. 返回成功/失败统计
 ```
 
-**标签浏览设计：**
-```
-brain tags
-    │
-    ▼
-1. MetadataStore.get_tag_counts() → {tag_name: count}
-   （已有方法，一次 SQL 完成）
-    │
-    ▼
-2. 按计数降序输出标签云
-    │
-    ▼
-3. CLI: 显示 [count] tagname 表格
-   API: 返回 [{name, category, count}]
-   前端: 点击标签 → 跳转 search?tag=xxx
-```
+**改动点：**
+- `brain/ingestion/sources/bookmark.py`：新增 `BookmarkSource` 类
+- `brain/ingestion/sources/__init__.py`：导出 `BookmarkSource`
+- `brain/ingestion/pipeline.py`：`ingest_text_sync` 增加 `source_type` 参数（默认 CLI，书签传 BOOKMARK）
+- `brain/cli/main.py`：新增 `brain bookmarks <path>` 命令
+- `brain/api/server.py`：新增 `POST /api/bookmarks/import`（上传文件）
 
-**笔记编辑设计：**
+#### FR35 标签浏览
+
+**设计思路：** 复用已有 `get_tag_counts()`（一次 SQL 完成），新增 `list_all_tags()`
+补充 category 字段。前端标签云点击跳转 `/search?tag=xxx`（搜索页已有标签过滤）。
+
+**改动点：**
+- `brain/storage/metadata.py`：新增 `list_all_tags()` 返回 `[{name, category, count}]`
+- `brain/cli/main.py`：新增 `brain tags` 命令（表格输出 [count] tagname）
+- `brain/api/server.py`：新增 `GET /api/tags` 返回 `[{name, category, count}]`
+- `frontend/src/components/Tags.vue`：标签云页（字号=计数权重，点击跳转搜索）
+- `frontend/src/router/index.js`：新增 `/tags` 路由 + 导航项
+
+#### FR36 笔记编辑
+
+**设计思路：** 暴露已有 `update_note`，新增标签增删和关联删除。**内容编辑走重新摄入**
+（内容存在 ChromaDB 分块，原地改内容需重建向量，复杂度高，本期不做）。
+
+**新增存储方法：**
+- `MetadataStore.remove_tag_from_note(note_id, tag_name)`：按标签名删除关联（需先查 tag_id）
+- `MetadataStore.delete_connection(conn_id)`：按关联 ID 删除
+
+**改动点：**
+- `brain/storage/metadata.py`：新增 `remove_tag_from_note`、`delete_connection`
+- `brain/cli/main.py`：新增 `brain edit <id> [--title] [--add-tag] [--remove-tag] [--delete-connection]`
+- `brain/api/server.py`：新增 `PATCH /api/notes/{id}`（改标题/增删标签）、`DELETE /api/connections/{id}`
+
+**CLI 编辑流程：**
 ```
 brain edit <note_id> --title "新标题" --add-tag python --remove-tag java
     │
     ▼
-1. MetadataStore.update_note(id, title=...)  — 已存在
-2. MetadataStore.update_note_tags(id, add=[...], remove=[...])  — 新增
-3. MetadataStore.delete_connection(conn_id)  — 新增
-4. 笔记内容不变（内容编辑走重新摄入流程）
+1. update_note(id, title=...)  ——已存在
+2. add_tag_to_note(id, get_or_create_tag(name))  ——已有
+3. remove_tag_from_note(id, name)  ——新增
+4. delete_connection(conn_id)  ——新增
+5. 笔记内容不变（内容编辑走重新摄入流程）
 ```
 
-**数据导出格式：**
-```
-brain export --output ./backup.zip
-    │
-    ▼
-输出 ZIP 包结构：
-  backup/
-  ├── notes/
-  │   ├── {note_id}.md          # 原始 Markdown
-  │   └── ...
-  ├── metadata.json             # [{id, title, tags, connections, ...}]
-  └── manifest.json             # 导出版本、时间、笔记数
-```
+#### FR37 多跳推理增强（暂缓）
 
-**Embedding 迁移流程：**
-```
-brain reindex --model BAAI/bge-m3
-    │
-    ▼
-1. 遍历 SQLite 全部 active 笔记
-    │
-    ▼
-2. 逐个用新 embedding_fn 重新分块嵌入
-    │
-    ▼
-3. 删除旧 ChromaDB collection，重建
-    │
-    ▼
-4. 进度条显示，支持 --dry-run 预览
-```
+ResearcherAgent 显式子问题分解环节。当前多次搜索但非显式分解→综合，
+本阶段暂不实现（依赖 prompt 调优 + 评估集验证，留待后续迭代）。
 
 ---
 

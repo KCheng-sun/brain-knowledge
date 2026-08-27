@@ -870,6 +870,29 @@ class MetadataStore:
             ) for row in rows
         ]
 
+    @_synchronized
+    def remove_tag_from_note(self, note_id: str, tag_name: str) -> bool:
+        """按标签名从笔记移除标签关联（Phase 4B FR36）。
+
+        需先查 tag_id 再删 note_tags 关联（不删 tags 表本身，保留标签定义）。
+        返回是否删除成功。
+        """
+        assert self._conn is not None
+        # 先查 tag_id（标签名唯一）
+        row = self._exec("SELECT id FROM tags WHERE name = ?", (tag_name,)).fetchone()
+        if row is None:
+            return False
+        tag_id = row["id"]
+        cur = self._exec(
+            "DELETE FROM note_tags WHERE note_id = ? AND tag_id = ?",
+            (note_id, tag_id),
+        )
+        self._conn.commit()
+        deleted = cur.rowcount > 0
+        if deleted:
+            logger.info(f"MetadataStore: 已从笔记 {note_id} 移除标签 {tag_name}")
+        return deleted
+
     # ---- Connections ----
 
     @_synchronized
@@ -896,6 +919,17 @@ class MetadataStore:
             (note_id, note_id),
         ).fetchall()
         return [self._row_to_connection(r) for r in rows]
+
+    @_synchronized
+    def delete_connection(self, conn_id: int) -> bool:
+        """按关联 ID 删除（Phase 4B FR36）。返回是否删除成功。"""
+        assert self._conn is not None
+        cur = self._exec("DELETE FROM connections WHERE id = ?", (conn_id,))
+        self._conn.commit()
+        deleted = cur.rowcount > 0
+        if deleted:
+            logger.info(f"MetadataStore: 已删除关联 {conn_id}")
+        return deleted
 
     # ---- Ingestion Log ----
 
@@ -1304,6 +1338,31 @@ class MetadataStore:
                GROUP BY t.name"""
         ).fetchall()
         return {r["name"]: r["cnt"] for r in rows}
+
+    @_synchronized
+    def list_all_tags(self) -> list[dict]:
+        """列出全部标签及使用次数（Phase 4B FR35）。
+
+        一次 SQL JOIN 聚合，返回 [{name, category, count}]，按 count 降序。
+        包含未被任何笔记使用的标签（count=0），便于管理。
+        """
+        assert self._conn is not None
+        rows = self._exec(
+            """SELECT t.name, t.category,
+                      COUNT(nt.note_id) as count
+               FROM tags t
+               LEFT JOIN note_tags nt ON nt.tag_id = t.id
+               GROUP BY t.id, t.name, t.category
+               ORDER BY count DESC, t.name"""
+        ).fetchall()
+        return [
+            {
+                "name": r["name"],
+                "category": r["category"] or "topic",
+                "count": r["count"],
+            }
+            for r in rows
+        ]
 
     @_synchronized
     def get_all_connections_flat(self) -> list[dict]:

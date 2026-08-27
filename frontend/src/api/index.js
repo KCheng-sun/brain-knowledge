@@ -34,6 +34,31 @@ export async function getConnections() {
   return data;
 }
 
+// Phase 4B：标签浏览 / 笔记编辑 / 书签导入
+export async function getTags() {
+  const { data } = await client.get("/tags");
+  return data;
+}
+
+export async function editNote(noteId, { title, addTags, removeTags }) {
+  const { data } = await client.patch(`/notes/${noteId}`, {
+    title,
+    add_tags: addTags || [],
+    remove_tags: removeTags || [],
+  });
+  return data;
+}
+
+export async function deleteConnection(connId) {
+  const { data } = await client.delete(`/connections/${connId}`);
+  return data;
+}
+
+export async function importBookmarks(formData) {
+  const { data } = await client.post("/bookmarks/import", formData);
+  return data;
+}
+
 export async function getDigest(weekly = false) {
   const { data } = await client.get("/digest", { params: { weekly } });
   return data;

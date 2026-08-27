@@ -3,6 +3,7 @@ import { createRouter, createWebHistory } from "vue-router";
 import Search from "../components/Search.vue";
 import AddNote from "../components/AddNote.vue";
 import ImportFiles from "../components/ImportFiles.vue";
+import Tags from "../components/Tags.vue";
 import Fragments from "../components/Fragments.vue";
 import GraphView from "../components/GraphView.vue";
 import Review from "../components/Review.vue";
@@ -18,6 +19,7 @@ const routes = [
   { path: "/search", name: "search", component: Search },
   { path: "/add", name: "add", component: AddNote },
   { path: "/import", name: "import", component: ImportFiles },
+  { path: "/tags", name: "tags", component: Tags },
   { path: "/fragments", name: "fragments", component: Fragments },
   { path: "/graph", name: "graph", component: GraphView },
   { path: "/review", name: "review", component: Review },
@@ -40,6 +42,7 @@ export const frontTools = [
   { key: "add", label: "快速记录", icon: "✍️", path: "/add" },
   { key: "import", label: "导入文件", icon: "📥", path: "/import" },
   { key: "search", label: "语义搜索", icon: "🔍", path: "/search" },
+  { key: "tags", label: "标签浏览", icon: "🏷️", path: "/tags" },
   { key: "fragments", label: "知识片段", icon: "💡", path: "/fragments" },
   { key: "graph", label: "知识图谱", icon: "🕸️", path: "/graph" },
   { key: "review", label: "间隔复习", icon: "🎴", path: "/review" },

@@ -129,6 +129,21 @@ class NoteResponse(BaseModel):
     message: str
 
 
+class NoteEditRequest(BaseModel):
+    """笔记编辑请求（Phase 4B FR36）。"""
+    title: str | None = Field(None, description="新标题")
+    add_tags: list[str] = Field(default_factory=list, description="要添加的标签名")
+    remove_tags: list[str] = Field(default_factory=list, description="要移除的标签名")
+
+
+class BookmarkImportResponse(BaseModel):
+    """书签导入响应（Phase 4B FR34）。"""
+    total: int
+    success: int
+    skipped: int
+    failed: int
+
+
 class SearchResultItem(BaseModel):
     rank: int
     score: float
@@ -1369,6 +1384,83 @@ def get_connections():
         )
         for c in flat_conns
     ]
+
+
+# ---- Phase 4B：标签浏览 / 笔记编辑 / 书签导入 / 关联删除 ----
+
+@app.get("/api/tags")
+def list_tags():
+    """列出全部标签及使用计数（FR35）。"""
+    _init()
+    return _metadata_store.list_all_tags()
+
+
+@app.patch("/api/notes/{note_id}")
+def edit_note(note_id: str, req: NoteEditRequest):
+    """编辑笔记标题和标签（FR36）。内容编辑请重新摄入。"""
+    from fastapi import HTTPException
+
+    from brain.models import TagCategory
+
+    _init()
+    note = _metadata_store.get_note(note_id)
+    if note is None:
+        raise HTTPException(status_code=404, detail="笔记不存在")
+
+    changed = []
+    if req.title is not None:
+        _metadata_store.update_note(note_id, title=req.title.strip())
+        changed.append("title")
+
+    for tag_name in req.add_tags:
+        tag_id = _metadata_store.get_or_create_tag(
+            name=tag_name.strip(), category=TagCategory.TOPIC, is_ai=False
+        )
+        _metadata_store.add_tag_to_note(note_id=note_id, tag_id=tag_id, confidence=1.0)
+    if req.add_tags:
+        changed.append(f"+{len(req.add_tags)}tags")
+
+    for tag_name in req.remove_tags:
+        _metadata_store.remove_tag_from_note(note_id, tag_name.strip())
+    if req.remove_tags:
+        changed.append(f"-{len(req.remove_tags)}tags")
+
+    return {"note_id": note_id, "changed": changed or "none"}
+
+
+@app.delete("/api/connections/{conn_id}")
+def delete_connection(conn_id: int):
+    """删除指定 ID 的关联（FR36）。"""
+    from fastapi import HTTPException
+
+    _init()
+    if not _metadata_store.delete_connection(conn_id):
+        raise HTTPException(status_code=404, detail="关联不存在")
+    return {"message": "已删除", "conn_id": conn_id}
+
+
+@app.post("/api/bookmarks/import", response_model=BookmarkImportResponse)
+def import_bookmarks(file: UploadFile = File(...)):
+    """导入浏览器书签 JSON 文件（FR34）。支持 Chrome/Firefox 格式。"""
+    import tempfile
+    from pathlib import Path
+
+    from brain.ingestion.sources import BookmarkSource
+
+    _init()
+    # 保存上传文件到临时路径
+    suffix = Path(file.filename or "bookmarks.json").suffix or ".json"
+    with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+        tmp.write(file.file.read())
+        tmp_path = Path(tmp.name)
+
+    try:
+        source = BookmarkSource(_pipeline, _metadata_store)
+        summary = source.import_file(tmp_path)
+        return BookmarkImportResponse(**summary)
+    finally:
+        if tmp_path.exists():
+            tmp_path.unlink()
 
 
 @app.get("/api/digest", response_model=DigestResponse)

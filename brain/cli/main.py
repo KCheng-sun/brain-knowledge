@@ -943,6 +943,135 @@ def ui(port: int, host: str):
 
 
 # ============================================================
+# brain bookmarks — 导入浏览器书签（Phase 4B FR34）
+# ============================================================
+
+
+@cli.command()
+@click.argument("path", type=click.Path(exists=True))
+def bookmarks(path: str):
+    """导入浏览器书签 JSON 导出文件。
+
+    支持 Chrome / Firefox 导出格式，每个书签作为 bookmark 类型笔记摄入。
+    基于 URL 去重，重复导入会跳过。
+
+    \b
+    示例:
+      brain bookmarks ./bookmarks.json
+    """
+    from brain.ingestion.sources import BookmarkSource
+
+    pipeline = _get_pipeline()
+    metadata_store = pipeline.metadata_store
+    source = BookmarkSource(pipeline, metadata_store)
+
+    click.echo("🔖 正在导入书签...")
+    summary = source.import_file(Path(path))
+
+    click.echo("\n✅ 导入完成:")
+    click.echo(f"  总数: {summary['total']}")
+    click.echo(f"  成功: {summary['success']}")
+    click.echo(f"  跳过(已存在): {summary['skipped']}")
+    click.echo(f"  失败: {summary['failed']}")
+
+
+# ============================================================
+# brain tags — 标签浏览（Phase 4B FR35）
+# ============================================================
+
+
+@cli.command()
+def tags():
+    """列出全部标签及使用计数（按计数降序）。"""
+    _, metadata_store, _ = _get_search_components()
+
+    all_tags = metadata_store.list_all_tags()
+    if not all_tags:
+        click.echo("  暂无标签。")
+        return
+
+    click.echo(f"🏷️  共 {len(all_tags)} 个标签:\n")
+    # 表格输出：[count] category  tagname
+    for tag in all_tags:
+        count = tag["count"]
+        category = tag["category"]
+        name = tag["name"]
+        click.echo(f"  [{count:>3}] ({category:<10}) {name}")
+
+
+# ============================================================
+# brain edit — 编辑笔记元数据（Phase 4B FR36）
+# ============================================================
+
+
+@cli.command()
+@click.argument("note_id", required=True)
+@click.option("--title", "-t", default=None, help="修改笔记标题")
+@click.option("--add-tag", "add_tag", multiple=True, help="添加标签（可多次指定）")
+@click.option("--remove-tag", "remove_tag", multiple=True, help="移除标签（可多次指定）")
+@click.option("--delete-connection", "delete_conn", type=int, default=None,
+              help="删除指定 ID 的关联")
+def edit(note_id: str, title: str | None, add_tag: tuple, remove_tag: tuple, delete_conn: int | None):
+    """编辑笔记的标题/标签/关联（内容编辑请重新摄入）。
+
+    \b
+    示例:
+      brain edit abc123 -t "新标题"
+      brain edit abc123 --add-tag python --add-tag ai
+      brain edit abc123 --remove-tag java
+      brain edit abc123 --delete-connection 42
+    """
+    from brain.models import TagCategory
+
+    _, metadata_store, _ = _get_search_components()
+
+    note = metadata_store.get_note(note_id)
+    if note is None:
+        click.echo(f"❌ 笔记不存在: {note_id}")
+        return
+
+    changed = False
+
+    # 1. 修改标题
+    if title is not None:
+        metadata_store.update_note(note_id, title=title.strip())
+        click.echo(f"✅ 标题已更新: {title.strip()}")
+        changed = True
+
+    # 2. 添加标签
+    for tag_name in add_tag:
+        tag_id = metadata_store.get_or_create_tag(
+            name=tag_name.strip(), category=TagCategory.TOPIC, is_ai=False
+        )
+        metadata_store.add_tag_to_note(note_id=note_id, tag_id=tag_id, confidence=1.0)
+        click.echo(f"✅ 已添加标签: {tag_name.strip()}")
+        changed = True
+
+    # 3. 移除标签
+    for tag_name in remove_tag:
+        ok = metadata_store.remove_tag_from_note(note_id, tag_name.strip())
+        if ok:
+            click.echo(f"✅ 已移除标签: {tag_name.strip()}")
+        else:
+            click.echo(f"⚠️  标签不存在或未关联: {tag_name.strip()}")
+        changed = True
+
+    # 4. 删除关联
+    if delete_conn is not None:
+        ok = metadata_store.delete_connection(delete_conn)
+        if ok:
+            click.echo(f"✅ 已删除关联: {delete_conn}")
+        else:
+            click.echo(f"⚠️  关联不存在: {delete_conn}")
+        changed = True
+
+    if not changed:
+        click.echo("未指定任何修改。使用 --title/--add-tag/--remove-tag/--delete-connection")
+    else:
+        click.echo(f"\n📝 笔记 {note_id} 编辑完成")
+
+
+# ============================================================
 # 入口
 # ============================================================
 
