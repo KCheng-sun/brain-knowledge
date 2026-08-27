@@ -40,6 +40,8 @@ def client(tmp_path, monkeypatch):
         chroma_dir=tmp_path / "chroma",
         db_path=tmp_path / "metadata.db",
     )
+    # 强制 SQLite 隔离：忽略 .env 里的 BRAIN_DB_HOST，避免测试连真实 MySQL 污染数据
+    cfg.database.host = None
     monkeypatch.setattr(config_module, "_config", cfg)
 
     # 2. mock embedding 函数
@@ -66,6 +68,7 @@ def client(tmp_path, monkeypatch):
     server_module._pipeline = None
     server_module._vector_store = None
     server_module._metadata_store = None
+    server_module._hybrid_searcher = None  # Phase 5F：重置混合检索器
     server_module._checkpointer = None
     server_module._watcher = None
 

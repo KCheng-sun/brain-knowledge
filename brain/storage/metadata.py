@@ -405,6 +405,19 @@ class MetadataStore:
         )
         self._conn.commit()
 
+        # BM25 全文索引（Phase 5F FR58）：索引笔记标题+预览，补充向量检索的关键词命中能力
+        # SQLite 用 FTS5 表（独立存一份索引数据，由 _sync_fts_note 维护同步）
+        self._executescript(
+            """
+            CREATE VIRTUAL TABLE IF NOT EXISTS notes_fts USING fts5(
+                note_id UNINDEXED,
+                title,
+                content_preview
+            );
+            """
+        )
+        self._conn.commit()
+
         # 数据库迁移：补充旧表缺失的列/表（CREATE TABLE IF NOT EXISTS 不会改已有表）
         self._migrate()
 
@@ -472,7 +485,150 @@ class MetadataStore:
         # 播种提示词（Phase 5E：首次初始化写入 6 条默认值）
         self._seed_prompts()
 
+        # BM25 全文索引初始化（Phase 5F FR58）
+        self._init_bm25_index()
+
         self._conn.commit()
+
+    def _init_bm25_index(self) -> None:
+        """初始化 BM25 全文索引（Phase 5F FR58）。
+
+        - MySQL: 幂等添加 FULLTEXT 索引（检查 information_schema）
+        - SQLite: 回填 FTS5 表（旧库升级时 notes 已有数据但 FTS 为空）
+        """
+        if self._is_mysql:
+            # 检查是否已有名为 ft_notes_text 的 FULLTEXT 索引
+            cur = self._exec(
+                "SELECT COUNT(*) as cnt FROM information_schema.statistics "
+                "WHERE table_schema=DATABASE() AND table_name=%s "
+                "AND index_type='FULLTEXT'",
+                ("notes",),
+            )
+            row = cur.fetchone()
+            if row and row["cnt"] == 0:
+                try:
+                    self._exec(
+                        "ALTER TABLE notes ADD FULLTEXT INDEX ft_notes_text (title, content_preview)"
+                    )
+                    logger.info("迁移: notes 表新增 FULLTEXT 索引 ft_notes_text")
+                except Exception as e:
+                    logger.warning(f"添加 FULLTEXT 索引失败（可能已存在）: {e}")
+        else:
+            # SQLite FTS5 contentless 表：回填旧数据（notes 已有但 FTS 未同步）
+            row = self._exec("SELECT COUNT(*) as cnt FROM notes_fts").fetchone()
+            if row and row["cnt"] == 0:
+                self._exec(
+                    "INSERT INTO notes_fts(note_id, title, content_preview) "
+                    "SELECT id, title, content_preview FROM notes WHERE status = 'active'"
+                )
+                synced = self._exec("SELECT COUNT(*) as cnt FROM notes_fts").fetchone()
+                logger.info(f"迁移: notes_fts 回填 {synced['cnt'] if synced else 0} 条笔记")
+
+    def _sync_fts_note(
+        self, note_id: str, title: str, content_preview: str,
+        insert: bool = True, delete_only: bool = False,
+    ) -> None:
+        """同步单条笔记到 BM25 索引（Phase 5F）。
+
+        - insert=True: 先删后插（幂等 upsert）
+        - insert=False: 仅更新（先删后插，用于 update_note）
+        - delete_only=True: 仅删除（硬删除时）
+
+        MySQL: notes 表本身有 FULLTEXT 索引，无需同步外部表，此方法为空操作。
+        """
+        if self._is_mysql:
+            return  # FULLTEXT 索引直接挂在 notes 表，写入即同步
+        # SQLite FTS5 contentless 表
+        self._exec("DELETE FROM notes_fts WHERE note_id = ?", (note_id,))
+        if not delete_only and insert:
+            self._exec(
+                "INSERT INTO notes_fts(note_id, title, content_preview) VALUES (?, ?, ?)",
+                (note_id, title or "", content_preview or ""),
+            )
+
+    @_synchronized
+    def bm25_search(self, query: str, top_k: int = 20) -> list[dict]:
+        """BM25 关键词检索（Phase 5F FR58）。
+
+        索引笔记标题 + content_preview，返回 note_id + bm25_score + title + preview。
+        双后端兼容：SQLite 走 FTS5，MySQL 走 MATCH...AGAINST。
+
+        中文兼容：FTS5 unicode61 分词器对 CJK 按字切分，短语查询可能不命中，
+        故 FTS 结果为空时用 LIKE 兜底（保证中文召回，牺牲排序精度）。
+
+        Args:
+            query: 搜索查询（自然语言或关键词）
+            top_k: 返回结果数
+
+        Returns:
+            [{note_id, score, title, content_preview}, ...]，按 bm25 分降序
+        """
+        assert self._conn is not None
+        if not query.strip():
+            return []
+        try:
+            rows = self._fts_query(query, top_k)
+            # FTS 未命中时用 LIKE 兜底（中文短语场景）
+            if not rows:
+                rows = self._like_query(query, top_k)
+            return [
+                {
+                    "note_id": r["id"],
+                    "score": round(float(r["score"]), 4) if r["score"] is not None else 0.0,
+                    "title": r["title"] or "",
+                    "content_preview": r["content_preview"] or "",
+                }
+                for r in rows
+            ]
+        except Exception as e:
+            logger.warning(f"BM25 检索失败（降级为空结果）: {e}")
+            return []
+
+    def _fts_query(self, query: str, top_k: int) -> list:
+        """FTS5 / FULLTEXT 查询（带 BM25 排序分）。"""
+        if self._is_mysql:
+            return self._exec(
+                """SELECT id, title, content_preview,
+                          MATCH(title, content_preview) AGAINST(%s IN NATURAL LANGUAGE MODE) as score
+                   FROM notes
+                   WHERE status = 'active'
+                     AND MATCH(title, content_preview) AGAINST(%s IN NATURAL LANGUAGE MODE)
+                   ORDER BY score DESC
+                   LIMIT %s""",
+                (query, query, top_k),
+            ).fetchall()
+        # SQLite FTS5：bm25() 返回负值（越小越相关），取负转为“越大越相关”
+        return self._exec(
+            """SELECT n.id, n.title, n.content_preview,
+                      -bm25(notes_fts) as score
+               FROM notes_fts f
+               JOIN notes n ON n.id = f.note_id
+               WHERE notes_fts MATCH ? AND n.status = 'active'
+               ORDER BY score DESC
+               LIMIT ?""",
+            (query, top_k),
+        ).fetchall()
+
+    def _like_query(self, query: str, top_k: int) -> list:
+        """LIKE 模糊查询兜底（中文短语场景，无 BM25 排序分）。"""
+        pattern = f"%{query}%"
+        if self._is_mysql:
+            return self._exec(
+                """SELECT id, title, content_preview, 1.0 as score
+                   FROM notes
+                   WHERE status = 'active'
+                     AND (title LIKE %s OR content_preview LIKE %s)
+                   LIMIT %s""",
+                (pattern, pattern, top_k),
+            ).fetchall()
+        return self._exec(
+            """SELECT id, title, content_preview, 1.0 as score
+               FROM notes
+               WHERE status = 'active'
+                 AND (title LIKE ? OR content_preview LIKE ?)
+               LIMIT ?""",
+            (pattern, pattern, top_k),
+        ).fetchall()
 
     def _backfill_usage_counters(self) -> None:
         """从 trace_events 历史数据回填 usage_counters 计数器。
@@ -537,27 +693,46 @@ class MetadataStore:
         )
 
     def _seed_prompts(self) -> None:
-        """首次初始化时写入 6 条默认提示词（幂等：仅空表时写）。
+        """写入默认提示词（幂等）。
 
-        之后用户可在页面编辑，运行时从库读取（brain.prompts.get_prompt）。
+        - 空表：写入全部默认值
+        - 已有数据：补充缺失的 key（如旧库升级时新增的 query_rewriter）
         """
         from datetime import datetime
 
         from brain.storage.prompt_defaults import DEFAULT_PROMPTS
 
-        row = self._exec("SELECT COUNT(*) as cnt FROM prompts").fetchone()
-        if row and row["cnt"] > 0:
-            return
-
         now_iso = datetime.now().isoformat()
-        for key, name, desc, content, is_template in DEFAULT_PROMPTS:
-            self._exec(
-                """INSERT OR IGNORE INTO prompts
-                   (prompt_key, name, description, content, is_template, enabled, version, updated_at)
-                   VALUES (?, ?, ?, ?, ?, 1, 1, ?)""",
-                (key, name, desc, content, is_template, now_iso),
-            )
-        logger.info(f"播种提示词: {len(DEFAULT_PROMPTS)} 条默认值")
+        row = self._exec("SELECT COUNT(*) as cnt FROM prompts").fetchone()
+        is_empty = not (row and row["cnt"] > 0)
+
+        if is_empty:
+            for key, name, desc, content, is_template in DEFAULT_PROMPTS:
+                self._exec(
+                    """INSERT OR IGNORE INTO prompts
+                       (prompt_key, name, description, content, is_template, enabled, version, updated_at)
+                       VALUES (?, ?, ?, ?, ?, 1, 1, ?)""",
+                    (key, name, desc, content, is_template, now_iso),
+                )
+            logger.info(f"播种提示词: {len(DEFAULT_PROMPTS)} 条默认值")
+        else:
+            # 旧库升级：补充 5E 之后新增的提示词（如 5F 的 query_rewriter）
+            added = 0
+            for key, name, desc, content, is_template in DEFAULT_PROMPTS:
+                existing = self._exec(
+                    "SELECT prompt_key FROM prompts WHERE prompt_key = ?", (key,)
+                ).fetchone()
+                if existing is None:
+                    self._exec(
+                        """INSERT OR IGNORE INTO prompts
+                           (prompt_key, name, description, content, is_template, enabled, version, updated_at)
+                           VALUES (?, ?, ?, ?, ?, 1, 1, ?)""",
+                        (key, name, desc, content, is_template, now_iso),
+                    )
+                    added += 1
+                    logger.info(f"补充提示词: {key}")
+            if added:
+                logger.info(f"提示词升级：补充 {added} 条新增默认值")
 
     # ---- Notes CRUD ----
 
@@ -576,6 +751,8 @@ class MetadataStore:
                 note.updated_at, note.ingested_at,
             ),
         )
+        # 同步 BM25 索引（Phase 5F）
+        self._sync_fts_note(note.id, note.title, note.content_preview, insert=True)
         self._conn.commit()
         logger.debug(f"MetadataStore: 已创建笔记 {note.id} — {note.title}")
         return note.id
@@ -610,6 +787,13 @@ class MetadataStore:
         set_clause = ", ".join(f"{k} = ?" for k in updates)
         values = list(updates.values()) + [note_id]
         self._exec(f"UPDATE notes SET {set_clause} WHERE id = ?", values)
+        # 同步 BM25 索引（标题/预览变更时重建该行 FTS）
+        if "title" in updates or "content_preview" in updates:
+            row = self._exec(
+                "SELECT title, content_preview FROM notes WHERE id = ?", (note_id,)
+            ).fetchone()
+            if row:
+                self._sync_fts_note(note_id, row["title"], row["content_preview"], insert=False)
         self._conn.commit()
 
     @_synchronized
@@ -620,6 +804,8 @@ class MetadataStore:
                                (NoteStatus.DELETED.value, note_id))
         else:
             self._exec("DELETE FROM notes WHERE id = ?", (note_id,))
+            # 硬删除时同步移除 BM25 索引（软删除保留，BM25 检索时按 status 过滤）
+            self._sync_fts_note(note_id, "", "", insert=False, delete_only=True)
         self._conn.commit()
         logger.info(f"MetadataStore: 已{'软' if soft else '硬'}删除笔记 {note_id}")
 

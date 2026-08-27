@@ -1,4 +1,4 @@
-﻿"""Brain CLI — 个人知识管家的命令行入口。
+"""Brain CLI — 个人知识管家的命令行入口。
 
 用法:
     brain add "今天读到的好观点..."
@@ -47,7 +47,7 @@ def _get_pipeline() -> IngestionPipeline:
 
 
 def _get_search_components():
-    """懒加载搜索组件。"""
+    """懒加载搜索组件（含 Phase 5F 混合检索器）。"""
     cfg = get_config()
     embedding_fn = get_embedding_fn()
     vector_store = VectorStore(persist_dir=cfg.storage.chroma_dir, embedding_fn=embedding_fn)
@@ -58,7 +58,11 @@ def _get_search_components():
         metadata_store.initialize()
         _get_search_components._md_initialized = True
 
-    return vector_store, metadata_store
+    # Phase 5F：组装混合检索器（BM25+向量+RRF+Rerank+查询改写）
+    from brain.retrieval import build_hybrid_searcher
+    hybrid_searcher = build_hybrid_searcher(vector_store, metadata_store)
+
+    return vector_store, metadata_store, hybrid_searcher
 
 
 def _run_async(coro):
@@ -145,9 +149,9 @@ def add(text: str, title: str | None):
     """
     pipeline = _get_pipeline()
 
-    click.echo("📝 正在摄入...")
+    click.echo("?? 正在摄入...")
     note_id = _run_async(pipeline.ingest_text(text, title=title))
-    click.echo(f"✅ 已摄入: {note_id}")
+    click.echo(f"? 已摄入: {note_id}")
 
 
 # ============================================================
@@ -170,25 +174,25 @@ def ingest(path: str):
 
     if target.is_file():
         if target.suffix != ".md":
-            click.echo(f"⚠️  跳过非 Markdown 文件: {target.name}")
+            click.echo(f"??  跳过非 Markdown 文件: {target.name}")
             return
-        click.echo(f"📄 摄入: {target.name}")
+        click.echo(f"?? 摄入: {target.name}")
         note_id = _run_async(pipeline.ingest_file(target))
-        click.echo(f"✅ 完成: {note_id}")
+        click.echo(f"? 完成: {note_id}")
 
     elif target.is_dir():
         md_files = list(target.rglob("*.md"))
         # 排除隐藏目录
         md_files = [f for f in md_files if not any(p.startswith(".") for p in f.parts)]
-        click.echo(f"📂 发现 {len(md_files)} 个 Markdown 文件")
+        click.echo(f"?? 发现 {len(md_files)} 个 Markdown 文件")
 
         for i, f in enumerate(md_files, 1):
             click.echo(f"  [{i}/{len(md_files)}] 摄入: {f.name}")
             try:
                 note_id = _run_async(pipeline.ingest_file(f))
-                click.echo(f"    ✅ {note_id}")
+                click.echo(f"    ? {note_id}")
             except Exception as e:
-                click.echo(f"    ❌ 失败: {e}")
+                click.echo(f"    ? 失败: {e}")
 
 
 # ============================================================
@@ -209,21 +213,21 @@ def search(query: str, top_k: int, tag: str | None):
       brain search -k 10 "Agent 架构设计"
       brain search --tag "Python" "异步编程"
     """
-    vector_store, metadata_store = _get_search_components()
+    vector_store, metadata_store, hybrid_searcher = _get_search_components()
 
     # 标签过滤: 一次 SQL JOIN 查匹配标签的笔记（避免 N+1）
     tag_note_ids: set | None = None
     if tag:
-        click.echo(f"🔍 搜索: {query}  [标签: {tag}]\n")
+        click.echo(f"?? 搜索: {query}  [标签: {tag}]\n")
         matched_notes = metadata_store.list_notes_by_tag(tag, limit=10000)
         tag_note_ids = {n.id for n in matched_notes}
         if not tag_note_ids:
             click.echo(f"  没有标记为 '{tag}' 的笔记。")
             return
     else:
-        click.echo(f"🔍 搜索: {query}\n")
+        click.echo(f"?? 搜索: {query}\n")
 
-    results = vector_store.search(query, top_k=max(top_k * 2, 20))
+    results = hybrid_searcher.search(query, top_k=max(top_k * 2, 20))
 
     if not results:
         click.echo("  没有找到相关结果。")
@@ -279,34 +283,34 @@ def ask(question: str, simple: bool):
       brain ask "我关于 Agent 架构的思考有哪些关键结论？"
       brain ask -s "ChromaDB 参数"    # 简单 RAG 模式
     """
-    vector_store, metadata_store = _get_search_components()
+    vector_store, metadata_store, hybrid_searcher = _get_search_components()
 
     if simple:
         # 降级模式：简单 RAG
-        _ask_simple(question, vector_store, metadata_store)
+        _ask_simple(question, vector_store, metadata_store, hybrid_searcher)
     else:
         # DeepAgents 模式：多步推理
-        _ask_deep(question, vector_store, metadata_store)
+        _ask_deep(question, vector_store, metadata_store, hybrid_searcher)
 
 
-def _ask_deep(question: str, vector_store, metadata_store) -> None:
+def _ask_deep(question: str, vector_store, metadata_store, hybrid_searcher) -> None:
     """DeepAgents 多步推理问答"""
     from brain.agents.researcher import ResearcherAgent
 
-    click.echo("🧠 深度研究中...（多次搜索 + 关联追踪）")
+    click.echo("?? 深度研究中...（多次搜索 + 关联追踪）")
 
     try:
-        agent = ResearcherAgent(vector_store, metadata_store)
+        agent = ResearcherAgent(vector_store, metadata_store, hybrid_searcher=hybrid_searcher)
         answer = _run_async(agent.research(question))
         click.echo(f"\n{answer}\n")
     except Exception as e:
-        click.echo(f"❌ DeepAgents 研究失败: {e}")
+        click.echo(f"? DeepAgents 研究失败: {e}")
         click.echo("提示: 使用 brain ask -s 切换简单 RAG 模式。")
 
 
-def _ask_simple(question: str, vector_store, metadata_store) -> None:
+def _ask_simple(question: str, vector_store, metadata_store, hybrid_searcher) -> None:
     """简单 RAG 模式（降级方案）"""
-    results = vector_store.search(question, top_k=5)
+    results = hybrid_searcher.search(question, top_k=5)
     if not results:
         click.echo("  没有找到相关内容来回答这个问题。")
         return
@@ -331,7 +335,7 @@ def _ask_simple(question: str, vector_store, metadata_store) -> None:
 请基于知识库内容回答。引用具体的来源（笔记标题）。
 如果知识库中没有足够信息，请诚实说明。"""
 
-    click.echo("🤔 思考中...")
+    click.echo("?? 思考中...")
 
     try:
         from brain.llm import get_chat_model
@@ -341,11 +345,11 @@ def _ask_simple(question: str, vector_store, metadata_store) -> None:
         answer = response.content
 
         click.echo(f"\n{answer}\n")
-        click.echo("📚 参考来源:")
+        click.echo("?? 参考来源:")
         for r in results[:5]:
-            click.echo(f"  • {r.note_title} (相似度: {r.score:.2f})")
+            click.echo(f"  ? {r.note_title} (相似度: {r.score:.2f})")
     except Exception as e:
-        click.echo(f"❌ LLM 调用失败: {e}")
+        click.echo(f"? LLM 调用失败: {e}")
         click.echo("提示: 检查 DEEPSEEK_API_KEY 环境变量是否已设置。")
 
 
@@ -357,7 +361,7 @@ def _ask_simple(question: str, vector_store, metadata_store) -> None:
 @cli.command()
 def status():
     """查看知识库统计信息。"""
-    vector_store, metadata_store = _get_search_components()
+    vector_store, metadata_store, _ = _get_search_components()
 
     chunk_count = vector_store.count()
     note_count = metadata_store.count_notes()
@@ -368,7 +372,7 @@ def status():
     # 每条关联在 degree_map 中被两端各计一次，总关联数 = 度数总和 / 2
     total_connections = sum(degree_map.values()) // 2
 
-    click.echo("🧠 Brain 知识库状态\n")
+    click.echo("?? Brain 知识库状态\n")
     click.echo(f"  笔记总数:   {note_count}")
     click.echo(f"  分块总数:   {chunk_count}")
     click.echo(f"  AI 标签数:  {len(tag_counts)}")
@@ -377,7 +381,7 @@ def status():
     # 热门标签
     if tag_counts:
         top_tags = sorted(tag_counts.items(), key=lambda x: x[1], reverse=True)[:8]
-        click.echo("\n🏷️  热门标签:")
+        click.echo("\n???  热门标签:")
         for name, count in top_tags:
             click.echo(f"  [{count}] {name}")
 
@@ -386,7 +390,7 @@ def status():
     if recent_notes:
         # 一次 SQL 批量取标签，避免 5 次 get_note_tags
         tags_map = metadata_store.get_tags_batch([n.id for n in recent_notes])
-        click.echo("\n📝 最近摄入的笔记:")
+        click.echo("\n?? 最近摄入的笔记:")
         for note in recent_notes:
             date_str = note.ingested_at[:10] if note.ingested_at else "未知"
             note_tags = tags_map.get(note.id, [])
@@ -411,17 +415,17 @@ def connections(note_id: str | None):
       brain connections                   # 列出全部关联
       brain connections -n a1b2c3d4e5f6  # 指定笔记的关联
     """
-    _, metadata_store = _get_search_components()
+    _, metadata_store, _ = _get_search_components()
 
     if note_id:
         # 查看特定笔记的关联
         note = metadata_store.get_note(note_id)
         if note is None:
-            click.echo(f"❌ 笔记不存在: {note_id}")
+            click.echo(f"? 笔记不存在: {note_id}")
             return
 
         conns = metadata_store.get_connections(note_id)
-        click.echo(f"🔗 {note.title} 的关联 ({len(conns)} 条)\n")
+        click.echo(f"?? {note.title} 的关联 ({len(conns)} 条)\n")
 
         if not conns:
             click.echo("  暂无关联。")
@@ -434,11 +438,11 @@ def connections(note_id: str | None):
             other_title = other_note.title if other_note else other_id[:8]
 
             relation_icon = {
-                "related": "🔗",
-                "extends": "➡️",
-                "contradicts": "⚡",
-                "references": "📖",
-            }.get(c.relation_type.value, "🔗")
+                "related": "??",
+                "extends": "??",
+                "contradicts": "?",
+                "references": "??",
+            }.get(c.relation_type.value, "??")
 
             click.echo(f"  {relation_icon} [{c.relation_type.value}] → {other_title}")
             if c.description:
@@ -449,7 +453,7 @@ def connections(note_id: str | None):
         # 一次 SQL 取全部关联（含双端标题），替代逐篇 get_connections + get_note
         all_conns = metadata_store.get_all_connections_flat()
 
-        click.echo(f"🔗 知识库关联 ({len(all_conns)} 条)\n")
+        click.echo(f"?? 知识库关联 ({len(all_conns)} 条)\n")
 
         if not all_conns:
             click.echo("  暂无 AI 发现的关联。摄入更多同主题笔记后会自动发现。")
@@ -458,11 +462,11 @@ def connections(note_id: str | None):
         for c in all_conns:
             relation_type = c["relation_type"]
             relation_icon = {
-                "related": "🔗",
-                "extends": "➡️",
-                "contradicts": "⚡",
-                "references": "📖",
-            }.get(relation_type, "🔗")
+                "related": "??",
+                "extends": "??",
+                "contradicts": "?",
+                "references": "??",
+            }.get(relation_type, "??")
 
             src_title = c["source_title"] or c["source"][:8]
             tgt_title = c["target_title"] or c["target"][:8]
@@ -492,17 +496,17 @@ def digest(weekly: bool):
       brain digest           # 昨日知识简报
       brain digest --weekly  # 本周知识趋势
     """
-    _, metadata_store = _get_search_components()
+    _, metadata_store, _ = _get_search_components()
 
     from brain.services.digest import DigestService
 
     svc = DigestService(metadata_store)
 
     if weekly:
-        click.echo("📊 生成每周趋势...")
+        click.echo("?? 生成每周趋势...")
         result = _run_async(svc.weekly())
     else:
-        click.echo("📅 生成每日摘要...")
+        click.echo("?? 生成每日摘要...")
         result = _run_async(svc.daily())
 
     click.echo(f"\n{result}")
@@ -523,7 +527,7 @@ def review(limit: int):
       brain review
       brain review -n 10
     """
-    _, metadata_store = _get_search_components()
+    _, metadata_store, _ = _get_search_components()
 
     from brain.services.review import ReviewService
 
@@ -531,18 +535,18 @@ def review(limit: int):
     due = svc.get_due_items_sync(limit=limit)
 
     if not due:
-        click.echo("✅ 暂无需要复习的内容。")
+        click.echo("? 暂无需要复习的内容。")
         return
 
-    click.echo(f"📖 需要复习的笔记 ({len(due)} 条)\n")
+    click.echo(f"?? 需要复习的笔记 ({len(due)} 条)\n")
 
     for i, item in enumerate(due, 1):
         title = item["title"]
         if item["is_new"]:
-            status = "🆕"
+            status = "??"
             schedule = "首次进入复习"
         else:
-            status = "🔁"
+            status = "??"
             schedule = (
                 f"第 {item['review_count']} 次复习 | 间隔 {item['interval_days']} 天"
             )
@@ -583,7 +587,7 @@ def watch(dir: str):
         debounce_seconds=cfg.ingestion.debounce_seconds,
     )
 
-    click.echo(f"👀 监听目录: {watch_dir}")
+    click.echo(f"?? 监听目录: {watch_dir}")
     click.echo("   放入/修改 .md 文件将自动摄入，Ctrl+C 停止")
 
     try:
@@ -602,9 +606,9 @@ def _record_ingest(watcher, pipeline, file_path) -> None:
     try:
         note_id = pipeline.ingest_file_sync(file_path)
         watcher.record_event(file_path.name, note_id)
-        click.echo(f"✅ 已摄入: {file_path.name} → {note_id}")
+        click.echo(f"? 已摄入: {file_path.name} → {note_id}")
     except Exception as e:
-        click.echo(f"❌ 摄入失败: {file_path.name}: {e}")
+        click.echo(f"? 摄入失败: {file_path.name}: {e}")
 
 
 # ============================================================
@@ -622,19 +626,19 @@ def rss():
 def rss_add(url: str):
     """添加 RSS 订阅源。"""
     pipeline = _get_pipeline()
-    _, metadata_store = _get_search_components()
+    _, metadata_store, _ = _get_search_components()
 
     from brain.ingestion.sources.rss import RssSource
 
     source = RssSource(pipeline, metadata_store)
     feed_id = source.add_feed(url)
-    click.echo(f"✅ 已添加订阅源 #{feed_id}: {url}")
+    click.echo(f"? 已添加订阅源 #{feed_id}: {url}")
 
 
 @rss.command("list")
 def rss_list():
     """列出全部 RSS 订阅源。"""
-    _, metadata_store = _get_search_components()
+    _, metadata_store, _ = _get_search_components()
 
 
     # RssSource 只需要 metadata_store 就能列
@@ -654,27 +658,27 @@ def rss_list():
 def rss_fetch():
     """立即拉取所有订阅源的新文章。"""
     pipeline = _get_pipeline()
-    _, metadata_store = _get_search_components()
+    _, metadata_store, _ = _get_search_components()
 
     from brain.ingestion.sources.rss import RssSource
 
     source = RssSource(pipeline, metadata_store)
     summary = source.fetch_all()
-    click.echo(f"📡 检查 {summary['feeds_checked']} 个源，新增摄入 {summary['new_entries']} 条")
+    click.echo(f"?? 检查 {summary['feeds_checked']} 个源，新增摄入 {summary['new_entries']} 条")
     for err in summary["errors"]:
-        click.echo(f"  ❌ {err}")
+        click.echo(f"  ? {err}")
 
 
 @rss.command("remove")
 @click.argument("feed_id", type=int)
 def rss_remove(feed_id: int):
     """删除 RSS 订阅源。"""
-    _, metadata_store = _get_search_components()
+    _, metadata_store, _ = _get_search_components()
     ok = metadata_store.delete_rss_feed(feed_id)
     if ok:
-        click.echo(f"✅ 已删除订阅源 #{feed_id}")
+        click.echo(f"? 已删除订阅源 #{feed_id}")
     else:
-        click.echo(f"❌ 订阅源 #{feed_id} 不存在")
+        click.echo(f"? 订阅源 #{feed_id} 不存在")
 
 
 # ============================================================
@@ -705,15 +709,15 @@ def metrics(hours: int, traces: int):
 
     # 健康检查
     health = check_health(metadata_store, vector_store, embedding_fn)
-    click.echo("🏥 系统健康状态\n")
+    click.echo("?? 系统健康状态\n")
     for comp, status in health["components"].items():
-        icon = "✅" if status == "ok" else ("⏭️" if status == "skipped" else "❌")
+        icon = "?" if status == "ok" else ("??" if status == "skipped" else "?")
         click.echo(f"  {icon} {comp:12s} {status}")
     click.echo(f"  总体: {health['status']}\n")
 
     # 指标汇总
     summary = metadata_store.get_metrics_summary(hours=hours)
-    click.echo(f"📊 最近 {hours} 小时指标\n")
+    click.echo(f"?? 最近 {hours} 小时指标\n")
     click.echo(f"  问答次数:     {summary['ask_count']}")
     click.echo(f"  平均问答延迟: {summary['avg_ask_latency_ms']} ms")
     click.echo(f"  工具调用次数: {summary['tool_call_count']}")
@@ -725,7 +729,7 @@ def metrics(hours: int, traces: int):
     # 最近调用链
     recent = metadata_store.get_recent_traces(limit=traces)
     if recent:
-        click.echo(f"\n🔁 最近 {len(recent)} 条调用链\n")
+        click.echo(f"\n?? 最近 {len(recent)} 条调用链\n")
         for t in recent:
             time_str = t["started_at"][11:19] if t["started_at"] else "?"
             click.echo(
@@ -763,37 +767,37 @@ def cost(hours: int, days: int):
 
     summary = ms.get_cost_summary()
 
-    click.echo("💰 LLM 成本统计\n")
-    click.echo(f"  今日: ¥{summary['today']['cost']:.4f} ({summary['today']['tokens']} token)")
-    click.echo(f"  本月: ¥{summary['month']['cost']:.4f} ({summary['month']['tokens']} token)")
-    click.echo(f"  总计: ¥{summary['total']['cost']:.4f} ({summary['total']['tokens']} token)")
+    click.echo("?? LLM 成本统计\n")
+    click.echo(f"  今日: ￥{summary['today']['cost']:.4f} ({summary['today']['tokens']} token)")
+    click.echo(f"  本月: ￥{summary['month']['cost']:.4f} ({summary['month']['tokens']} token)")
+    click.echo(f"  总计: ￥{summary['total']['cost']:.4f} ({summary['total']['tokens']} token)")
 
     # 配额进度
     cost_cfg = cfg.cost
-    click.echo("\n📋 配额用量")
+    click.echo("\n?? 配额用量")
     token_pct = summary['today']['tokens'] / cost_cfg.daily_token_limit * 100
     cost_pct = summary['today']['cost'] / cost_cfg.daily_cost_limit * 100
     click.echo(f"  日 token: {summary['today']['tokens']}/{cost_cfg.daily_token_limit} ({token_pct:.1f}%)")
-    click.echo(f"  日成本:  ¥{summary['today']['cost']:.4f}/¥{cost_cfg.daily_cost_limit} ({cost_pct:.1f}%)")
+    click.echo(f"  日成本:  ￥{summary['today']['cost']:.4f}/￥{cost_cfg.daily_cost_limit} ({cost_pct:.1f}%)")
     month_pct = summary['month']['tokens'] / cost_cfg.monthly_token_limit * 100
     click.echo(f"  月 token: {summary['month']['tokens']}/{cost_cfg.monthly_token_limit} ({month_pct:.1f}%)")
 
     # 按模型
     by_model = ms.get_cost_by_model(hours=hours)
     if by_model:
-        click.echo(f"\n🏷️ 按模型（最近 {hours} 小时）\n")
+        click.echo(f"\n??? 按模型（最近 {hours} 小时）\n")
         for m in by_model:
             click.echo(
-                f"  {m['model']:20s} ¥{m['cost']:.4f}  "
+                f"  {m['model']:20s} ￥{m['cost']:.4f}  "
                 f"{m['total_tokens']} token ({m['calls']} 次)"
             )
 
     # 按日
     by_day = ms.get_cost_by_day(days=days)
     if by_day:
-        click.echo(f"\n📅 按日（最近 {days} 天）\n")
+        click.echo(f"\n?? 按日（最近 {days} 天）\n")
         for d in by_day:
-            click.echo(f"  {d['day']}  ¥{d['cost']:.4f}  {d['total_tokens']} token ({d['calls']} 次)")
+            click.echo(f"  {d['day']}  ￥{d['cost']:.4f}  {d['total_tokens']} token ({d['calls']} 次)")
 
 
 # ============================================================
@@ -835,15 +839,15 @@ def eval_cmd(dataset: str | None, limit: int | None, verbose: bool):
 
     runner = EvalRunner(vs, ms)
     src = dataset or "数据库"
-    click.echo(f"🧪 开始评估（dataset={src}）\n")
+    click.echo(f"?? 开始评估（dataset={src}）\n")
     report = runner.run(dataset, limit=limit)
 
     click.echo(report.summary())
 
     if verbose:
-        click.echo("\n📋 全部用例详情\n")
+        click.echo("\n?? 全部用例详情\n")
         for r in report.results:
-            status = "✅" if r.passed else "❌"
+            status = "?" if r.passed else "?"
             click.echo(f"  {status} {r.case.id} [{r.case.question[:35]}]")
             click.echo(f"     得分 {r.score:.3f}（阈值 {r.case.min_score}）")
             if r.error:
@@ -891,21 +895,21 @@ def budget(reset: bool, reset_month: bool, set_limit: int | None):
         scope = "今日" if reset else "本月"
         # 只清零用量计数器，不删除 trace_events 历史调用记录
         store.reset_usage_counters(period)
-        click.echo(f"✅ {scope}用量已重置（历史记录保留）")
+        click.echo(f"? {scope}用量已重置（历史记录保留）")
 
     summary = store.get_cost_summary()
     click.echo("\n=== 预算用量 ===")
-    click.echo(f"今日：{summary['today']['tokens']} token / ¥{summary['today']['cost']}")
-    click.echo(f"本月：{summary['month']['tokens']} token / ¥{summary['month']['cost']}")
-    click.echo(f"累计：{summary['total']['tokens']} token / ¥{summary['total']['cost']}")
+    click.echo(f"今日：{summary['today']['tokens']} token / ￥{summary['today']['cost']}")
+    click.echo(f"本月：{summary['month']['tokens']} token / ￥{summary['month']['cost']}")
+    click.echo(f"累计：{summary['total']['tokens']} token / ￥{summary['total']['cost']}")
 
     cost_cfg = cfg.cost
-    click.echo(f"\n配额：日 {cost_cfg.daily_token_limit} token / ¥{cost_cfg.daily_cost_limit}，"
+    click.echo(f"\n配额：日 {cost_cfg.daily_token_limit} token / ￥{cost_cfg.daily_cost_limit}，"
                f"月 {cost_cfg.monthly_token_limit} token")
 
     if set_limit is not None:
         cost_cfg.daily_token_limit = set_limit
-        click.echo(f"\n⚠️  日 token 配额已临时设为 {set_limit}（仅本次进程生效）")
+        click.echo(f"\n??  日 token 配额已临时设为 {set_limit}（仅本次进程生效）")
     store.close()
 
 
@@ -927,8 +931,8 @@ def ui(port: int, host: str):
     """
     import uvicorn
 
-    click.echo(f"🧠 Brain API 启动: http://{host}:{port}")
-    click.echo(f"📖 API 文档: http://{host}:{port}/docs")
+    click.echo(f"?? Brain API 启动: http://{host}:{port}")
+    click.echo(f"?? API 文档: http://{host}:{port}/docs")
     uvicorn.run(
         "brain.api.server:app",
         host=host,

@@ -90,6 +90,9 @@ class EvalRunner:
     def __init__(self, vector_store, metadata_store):
         self._vs = vector_store
         self._ms = metadata_store
+        # Phase 5F：评估时也启用混合检索（评估检索质量改进效果）
+        from brain.retrieval import build_hybrid_searcher
+        self._hybrid = build_hybrid_searcher(vector_store, metadata_store)
 
     def load_dataset(self, dataset_path: str | Path | None = None) -> list[EvalCase]:
         """加载 Golden Dataset。
@@ -154,7 +157,7 @@ class EvalRunner:
         if limit:
             cases = cases[:limit]
 
-        agent = ResearcherAgent(self._vs, self._ms)
+        agent = ResearcherAgent(self._vs, self._ms, hybrid_searcher=self._hybrid)
         results: list[EvalResult] = []
         start = datetime.now()
 

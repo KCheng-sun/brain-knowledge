@@ -13,9 +13,17 @@ from brain.storage.vector_store import VectorStore
 class ResearcherAgent:
     """DeepAgents 深度研究 Agent。"""
 
-    def __init__(self, vector_store: VectorStore, metadata_store: MetadataStore):
+    def __init__(
+        self,
+        vector_store: VectorStore,
+        metadata_store: MetadataStore,
+        hybrid_searcher=None,
+    ):
         self._vector_store = vector_store
         self._metadata_store = metadata_store
+        # Phase 5F：注入混合检索器（BM25+向量+RRF+Rerank+查询改写）
+        # 为 None 时 search_notes 工具回退到纯向量检索（向后兼容）
+        self._hybrid_searcher = hybrid_searcher
 
     def research_sync(
         self,
@@ -419,11 +427,16 @@ class ResearcherAgent:
     def _build_tools(self) -> list:
         vs = self._vector_store
         ms = self._metadata_store
+        hs = self._hybrid_searcher  # Phase 5F 混合检索器（可能为 None）
 
         @tool
         def search_notes(query: str, top_k: int = 5) -> str:
             """语义搜索知识库，返回最相关的笔记片段。"""
-            results = vs.search(query, top_k=top_k)
+            # Phase 5F：优先用混合检索（BM25+向量+RRF+Rerank），无则回退纯向量
+            if hs is not None:
+                results = hs.search(query, top_k=top_k)
+            else:
+                results = vs.search(query, top_k=top_k)
             if not results:
                 return "未找到相关笔记。"
             lines = []

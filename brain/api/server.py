@@ -27,6 +27,7 @@ from brain.agents.researcher import ResearcherAgent
 from brain.config import get_config
 from brain.embedding import get_embedding_fn
 from brain.ingestion.pipeline import IngestionPipeline
+from brain.retrieval import HybridSearcher, build_hybrid_searcher
 from brain.services.digest import DigestService
 from brain.services.review import ReviewService
 from brain.storage.metadata import MetadataStore
@@ -66,13 +67,14 @@ app.add_middleware(
 _pipeline: IngestionPipeline | None = None
 _vector_store: VectorStore | None = None
 _metadata_store: MetadataStore | None = None
+_hybrid_searcher: HybridSearcher | None = None  # Phase 5F 混合检索器
 _checkpointer = None  # LangGraph SqliteSaver——HIL 中断恢复用
 _watcher = None  # FileWatcher——文件监听（可经 API 启停）
 _scheduler = None  # TaskScheduler——定时任务调度
 
 
 def _init():
-    global _pipeline, _vector_store, _metadata_store, _checkpointer, _scheduler
+    global _pipeline, _vector_store, _metadata_store, _hybrid_searcher, _checkpointer, _scheduler
     if _metadata_store is not None:
         return
     cfg = get_config()
@@ -86,6 +88,8 @@ def _init():
         chunk_size=cfg.ingestion.chunk_size,
         chunk_overlap=cfg.ingestion.chunk_overlap,
     )
+    # Phase 5F：组装混合检索器（供 ResearcherAgent 和 /api/search 使用）
+    _hybrid_searcher = build_hybrid_searcher(_vector_store, _metadata_store)
 
     # HIL 中断恢复所需的 checkpointer（thread_id = session_id）
     import sqlite3
@@ -310,7 +314,7 @@ def ask_question(req: AskRequest):
 
     # 生成 trace_id 贯穿本次问答（Phase 5A）
     trace_id = new_trace_id()
-    agent = ResearcherAgent(_vector_store, _metadata_store)
+    agent = ResearcherAgent(_vector_store, _metadata_store, hybrid_searcher=_hybrid_searcher)
     with MetricsTimer(
         _metadata_store, "ask", "latency_ms",
         {"question": req.question[:50]}, trace_id=trace_id,
@@ -352,7 +356,7 @@ def ask_question_stream(req: AskRequest):
     from brain.observability import new_trace_id
     trace_id = new_trace_id()  # noqa: F841 在 event_stream 闭包中使用
 
-    agent = ResearcherAgent(_vector_store, _metadata_store)
+    agent = ResearcherAgent(_vector_store, _metadata_store, hybrid_searcher=_hybrid_searcher)
 
     # 会话处理：未指定则自动创建
     created_new_session = False
@@ -506,7 +510,7 @@ def ask_question_resume(req: ResumeRequest):
 
     _init()
 
-    agent = ResearcherAgent(_vector_store, _metadata_store)
+    agent = ResearcherAgent(_vector_store, _metadata_store, hybrid_searcher=_hybrid_searcher)
 
     # HIL 恢复也生成新 trace_id（Phase 5A）
     from brain.observability import new_trace_id

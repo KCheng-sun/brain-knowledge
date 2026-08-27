@@ -109,6 +109,25 @@ class CostSettings(BaseSettings):
     recursion_limit: int = 25             # Agent 最大递归步数（防死循环）
 
 
+class RetrievalSettings(BaseSettings):
+    """RAG 检索配置（Phase 5F FR58-60）。
+
+    混合检索 = BM25 + 向量 + RRF 融合；可选 Rerank 精排和查询改写。
+    任一环节失败均降级，不阻塞主流程。
+    """
+
+    model_config = SettingsConfigDict(env_prefix="BRAIN_RETRIEVAL_")
+
+    hybrid_enabled: bool = True          # 混合检索总开关（False=纯向量）
+    rrf_k: int = 60                      # RRF 融合常数（标准值 60）
+    candidate_top_n: int = 30            # RRF 融合后送 Rerank 的候选数
+    rerank_enabled: bool = True          # Rerank 精排开关
+    rerank_model: str = "BAAI/bge-reranker-v2-m3"
+    rerank_top_n: int = 30               # Rerank 输入候选数（= candidate_top_n）
+    query_rewrite_enabled: bool = True   # 查询改写开关
+    query_rewrite_count: int = 3         # Multi-Query 改写版本数
+
+
 # ============================================================
 # 顶层配置
 # ============================================================
@@ -131,6 +150,7 @@ class AppConfig(BaseSettings):
     ingestion: IngestionSettings = Field(default_factory=IngestionSettings)
     agents: AgentSettings = Field(default_factory=AgentSettings)
     cost: CostSettings = Field(default_factory=CostSettings)
+    retrieval: RetrievalSettings = Field(default_factory=RetrievalSettings)
 
     # 应用级配置
     dry_run: bool = False  # mock LLM 调用

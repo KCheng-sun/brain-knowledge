@@ -229,13 +229,30 @@
 - judge 提示词含 `{question}/{answer}/{context}` 占位符，用 `is_template=1` 标记，走 `get_prompt_template(key, **kw)` 渲染
 - 其余 5 个提示词为纯文本（`is_template=0`），直接读取使用
 
-#### Phase 5F — RAG 质量增强
+#### Phase 5F — RAG 质量增强（当前进行中）
 
-| FR# | 功能 | 描述 | 优先级 |
-|-----|------|------|--------|
-| FR58 | 混合检索 | BM25（SQLite FTS5）+ 向量 + RRF 融合 | P1 |
-| FR59 | Rerank 精排 | Cross-Encoder（BGE-Reranker 本地）对 Top-50 精排 | P2 |
-| FR60 | 查询改写 | Multi-Query 生成 3 个改写版本提升召回 | P2 |
+> 衔接 5A-5E：可观测性/成本/评估/提示词已就绪，本阶段把检索从「纯向量召回」
+> 升级为「BM25 + 向量 + RRF 融合 + Rerank 精排 + 查询改写」的工业级 RAG。
+> 优化效果可直接在 Observability 看板和 `brain eval` 评估集上量化对比。
+> **设计约束（基于代码实测）：**
+> - Chunk 全文只存 ChromaDB，SQLite 仅有 `content_preview`(200 字)。BM25 索引笔记标题+预览，
+>   不双写 chunk 全文（BM25 价值在精确关键词命中，标题/预览已覆盖主要关键词）
+> - 双后端兼容：SQLite 用 FTS5，MySQL 用 FULLTEXT + MATCH...AGAINST，复用 `_exec` 语法翻译机制
+> - Rerank 走 SiliconFlow `/v1/rerank` API（`BAAI/bge-reranker-v2-m3`），复用现有 API Key，
+>   不引入本地 GB 级 cross-encoder 模型（与轻量原则一致）
+> - 查询改写复用主 LLM（DeepSeek），不引入新模型
+
+| FR# | 功能 | 描述 | 优先级 | 状态 |
+|-----|------|------|--------|------|
+| FR58 | 混合检索 | BM25（SQLite FTS5 / MySQL FULLTEXT 索引笔记标题+预览）+ 向量召回 + RRF 融合；`brain/retrieval/hybrid_search.py` 统一入口；`search_notes` 工具与 `/api/search` 切换调用 | P1 | ✅ |
+| FR59 | Rerank 精排 | SiliconFlow `/v1/rerank`（bge-reranker-v2-m3）对融合后 Top-N 精排；`brain/retrieval/reranker.py`；config 开关 + top_n 可配 | P2 | ✅ |
+| FR60 | 查询改写 | Multi-Query：LLM 生成 3 个改写版本，多路召回去重后融合，提升语义召回；`brain/retrieval/query_rewriter.py` | P2 | ✅ |
+
+**Phase 5F 设计约束：**
+- 本地优先：BM25 索引存 SQLite/MySQL，Rerank 走已有 SiliconFlow API，不引入新基础设施
+- 向后兼容：混合检索失败时降级为纯向量召回（现有 `VectorStore.search`），不阻塞主流程
+- 可量化：5A 的 trace_events 已记录每次检索的 tool_call，5F 上线后跑 `brain eval` 对比通过率变化
+- 双调用方统一：`server.search_notes`(API) 和 `researcher.search_notes`(工具) 都切到 `HybridSearcher`
 
 **Phase 5 设计约束：**
 - 本地优先：指标存 SQLite、日志存本地文件、Trace 存 messages 表，不引入外部时序库

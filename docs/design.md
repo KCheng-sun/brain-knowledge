@@ -1260,3 +1260,209 @@ CREATE TABLE IF NOT EXISTS prompts (
 - 列表展示 key/名称/版本/启用状态；点击进入编辑
 - 编辑器：大文本框 + 保存按钮；保存后调 `reload_prompts()` 即时生效
 - API：GET /api/prompts、GET /api/prompts/{key}、PUT /api/prompts/{key}
+
+---
+
+### §16 Phase 5F — RAG 质量增强
+
+> 目标：把检索从「纯向量召回」升级为「BM25 + 向量 + RRF 融合 + Rerank 精排 + 查询改写」。
+> 详见 [requirements.md §4 Phase 5F](./requirements.md#phase-5f--rag-质量增强当前进行中)。
+
+#### 16.1 现状与问题
+
+当前检索链路（`brain/retrieval/` 目录为空，逻辑散落在两处）：
+
+```
+researcher.search_notes 工具  ──┐
+                               ├─→ VectorStore.search()  (纯向量, cosine)
+/api/search (server.py)       ──┘
+```
+
+**问题：**
+1. 纯向量召回对精确关键词（专有名词、代码标识符、人名）不敏感——语义相近但关键词不命中
+2. 无精排，Top-K 直接由向量相似度决定，相似度高 ≠ 最相关
+3. 单一查询表达，用户问法多样时召回不全
+
+#### 16.2 目标架构
+
+```
+用户查询 query
+    │
+    ▼
+┌─────────────────────────────┐
+│ QueryRewriter (FR60, 可选)   │  LLM 生成 3 个改写版本
+│  失败/关闭 → 降级为 [query]   │  （多路召回提升语义覆盖）
+└──────────┬──────────────────┘
+           │ queries: list[str]
+           ▼
+┌─────────────────────────────────────────────┐
+│ HybridSearcher (FR58)                         │
+│  对每个 q 并行执行两路召回：                  │
+│    ├─ VectorStore.search(q)  → 向量分 (0~1)   │
+│    └─ MetadataStore.bm25_search(q) → BM25 分  │
+│  RRF 融合 → 去重(note_id 粒度) → Top-N 候选    │
+└──────────┬──────────────────────────────────┘
+           │ candidates: list[SearchResult]
+           ▼
+┌─────────────────────────────┐
+│ Reranker (FR59, 可选)        │  SiliconFlow /v1/rerank
+│  失败/关闭 → 原序返回 Top-K  │  cross-encoder 精排
+└──────────┬──────────────────┘
+           │ final: list[SearchResult] (Top-K)
+           ▼
+    返回给 search_notes 工具 / /api/search
+```
+
+**降级链（任一环节失败不阻塞）：**
+- QueryRewriter 失败 → 用原 query 单路
+- BM25 失败 → 仅向量召回
+- Reranker 失败/关闭 → 用 RRF 融合后的原序
+
+#### 16.3 FR58 混合检索 + RRF 融合
+
+**BM25 索引设计（双后端）：**
+
+索引对象：笔记标题 + content_preview（SQLite 已有字段，不双写 chunk 全文）。
+理由：BM25 价值在精确关键词命中，标题和前 200 字预览已覆盖主要关键词；
+chunk 全文只在 ChromaDB，双写会引入数据一致性问题。
+
+```sql
+-- SQLite: FTS5 虚拟表（contentless，映射到 notes 表现有列）
+CREATE VIRTUAL TABLE IF NOT EXISTS notes_fts USING fts5(
+    note_id UNINDEXED,
+    title,
+    content_preview,
+    content='notes',
+    contentless_delete='1'
+);
+-- 触发器同步：notes 插入/更新/删除时维护 FTS
+
+-- MySQL: FULLTEXT 索引（直接加在 notes 表）
+ALTER TABLE notes ADD FULLTEXT INDEX ft_notes_text (title, content_preview);
+-- 查询：MATCH(title, content_preview) AGAINST(? IN NATURAL LANGUAGE MODE)
+```
+
+`_exec` 语法翻译层新增两条规则（复用现有机制）：
+- `MATCH(...) AGAINST(... IN NATURAL LANGUAGE MODE)` 在 SQLite 不存在 → SQLite 路径用 FTS5 的 `MATCH notes_fts(?)`
+- 统一封装在 `MetadataStore.bm25_search(query, top_k)` 内，调用方无感知后端差异
+
+**RRF 融合公式：**
+
+对每个候选 chunk c，其在向量结果排名 r_v、BM25 结果排名 r_b（从 1 开始，未出现记 ∞）：
+
+```
+RRF_score(c) = Σ  1 / (k + rank_i)    # k=60 (标准常数)
+             over {向量, BM25}
+```
+
+去重粒度：note_id（同一笔记多 chunk 命中只取最高分 chunk 代表）。
+返回 Top-N 候选（默认 30）供 Reranker 精排。
+
+**统一入口 `brain/retrieval/hybrid_search.py`：**
+```python
+class HybridSearcher:
+    def __init__(self, vector_store, metadata_store, reranker=None, rewriter=None):
+        ...
+
+    def search(self, query: str, top_k: int = 5) -> list[SearchResult]:
+        # 1. 查询改写（可选）
+        queries = self._rewriter.rewrite(query) if self._rewriter else [query]
+        # 2. 多路召回 + RRF 融合
+        candidates = self._retrieve_and_fuse(queries, top_n=30)
+        # 3. Rerank 精排（可选）
+        if self._reranker:
+            candidates = self._reranker.rerank(query, candidates, top_k=top_k)
+        else:
+            candidates = candidates[:top_k]
+        return candidates
+```
+
+**双调用方改造：**
+- `researcher._build_tools()`：`search_notes` 工具内部 `vs.search()` → `hybrid_searcher.search()`
+- `server.search_notes()`：`_vector_store.search()` → `_hybrid_searcher.search()`
+- `ResearcherAgent.__init__` 注入 `HybridSearcher`（构造时由 server/CLI 组装依赖）
+
+#### 16.4 FR59 Rerank 精排
+
+**SiliconFlow Rerank API：**
+```
+POST https://api.siliconflow.cn/v1/rerank
+{
+  "model": "BAAI/bge-reranker-v2-m3",
+  "query": "用户原始问题",
+  "documents": ["候选1文本", "候选2文本", ...],
+  "top_n": 5,
+  "return_documents": false
+}
+→ {"results": [{"index": 0, "relevance_score": 0.98}, ...]}
+```
+复用现有 `SILICONFLOW_API_KEY` 和 `base_url`，零新依赖。
+
+**`brain/retrieval/reranker.py`：**
+```python
+class Reranker:
+    def __init__(self, api_key, base_url, model="BAAI/bge-reranker-v2-m3"):
+        self._client = OpenAI(api_key=api_key, base_url=base_url)
+        self._model = model
+
+    def rerank(self, query: str, candidates: list[SearchResult], top_k: int) -> list[SearchResult]:
+        documents = [c.content[:500] for c in candidates]  # 截断防超限
+        resp = self._client.post("/rerank", ...)
+        # 按 relevance_score 降序重排 candidates，取 top_k
+        # 失败 → log warning, 原序返回 top_k（降级）
+```
+
+**config 开关：**
+```python
+class RetrievalSettings(BaseSettings):
+    model_config = SettingsConfigDict(env_prefix="BRAIN_RETRIEVAL_")
+    hybrid_enabled: bool = True        # 混合检索总开关
+    bm25_weight: float = 0.5          # RRF 中 BM25 路权重（预留，RRF 本身无权重）
+    rerank_enabled: bool = True       # Rerank 开关
+    rerank_top_n: int = 30            # Rerank 输入候选数
+    rerank_model: str = "BAAI/bge-reranker-v2-m3"
+    query_rewrite_enabled: bool = True  # 查询改写开关
+    query_rewrite_count: int = 3      # 改写版本数
+```
+
+#### 16.5 FR60 查询改写（Multi-Query）
+
+**`brain/retrieval/query_rewriter.py`：**
+```python
+class QueryRewriter:
+    def __init__(self, llm, count=3):
+        self._llm = llm
+        self._count = count
+
+    def rewrite(self, query: str) -> list[str]:
+        prompt = "用不同表达方式改写以下搜索查询，生成 {n} 个语义等价但用词不同的版本，"
+                "用于提升知识库召回率。每行一个，不要编号。\n\n原查询：{q}"
+        resp = self._llm.invoke([HumanMessage(prompt.format(n=self._count, q=query))])
+        lines = [l.strip() for l in resp.content.split("\n") if l.strip()]
+        return [query] + lines[:self._count]  # 首位保留原查询
+```
+
+复用主 LLM（DeepSeek），提示词纳入 5E 的 prompts 表（key=`query_rewriter`），
+页面可编辑。失败时降级为 `[query]`。
+
+**多路召回去重：**
+多个 query 各自走 HybridSearcher 的向量+BM25 两路，结果按 note_id 去重
+（取最高 RRF 分），再进 Reranker。
+
+#### 16.6 依赖组装
+
+`server.py` / `cli/main.py` 初始化时组装检索链路：
+```python
+reranker = Reranker(...) if config.retrieval.rerank_enabled else None
+rewriter = QueryRewriter(get_chat_model(), ...) if config.retrieval.query_rewrite_enabled else None
+hybrid_searcher = HybridSearcher(vector_store, metadata_store, reranker, rewriter)
+researcher = ResearcherAgent(vector_store, metadata_store, hybrid_searcher)
+```
+
+#### 16.7 测试策略
+
+- `tests/test_retrieval/test_hybrid_search.py`：RRF 融合逻辑（mock 两路结果验证排名）、降级路径（BM25 失败仅向量）
+- `tests/test_retrieval/test_reranker.py`：mock SiliconFlow API 响应，验证重排 + 失败降级
+- `tests/test_retrieval/test_query_rewriter.py`：mock LLM 响应，验证解析 + 失败降级
+- `tests/test_storage/test_bm25.py`：FTS5/FULLTEXT 双后端检索（用临时 SQLite + MySQL schema 测试）
+- 集成测试：`brain eval` 跑 golden dataset，对比 5F 前后通过率（量化收益）

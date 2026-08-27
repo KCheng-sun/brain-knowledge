@@ -272,6 +272,18 @@ ruff check brain/
   - **MySQL 长连接必须用 autocommit=True**：autocommit=False 时第一次 SELECT 隐式开启事务，REPEATABLE READ 隔离级别下后续读都卡在事务开始时的快照，看不到其他连接的提交（表现为 server 进程读不到外部脚本清理的数据）。改为 autocommit=True，每条语句自动提交，读操作始终看最新数据。原有 37 处 self._conn.commit() 对 autocommit=True 无害（空操作）。_synchronized 锁已保证单线程串行，UPSERT 累加无并发竞态
   - **threading.Lock 不可重入会死锁**：update_prompt 持锁后调 get_prompt（也要同一把锁），Lock 不可重入导致死锁。改为 threading.RLock（可重入锁），允许同一线程多次获取。凡是「同步方法内部调用另一个同步方法」的场景都必须用 RLock
   - **前端需引入 Vue Router 实现页面独立 URL**：早期所有页面共用 `/` 地址靠 activeView 状态切换，刷新丢失、地址不变。引入 vue-router 后每个页面有独立路由（/ask/:sessionId?、/search、/admin/prompts 等）。Ask 组件需访问会话列表/seed，由 App.vue 直接渲染（路由 component 用空占位 { render: () => null }）；其余页面走 <router-view>。后端加 catch-all 路由 /{full_path:path} 做 SPA fallback，非 /api 路径都返回 index.html，深层路由刷新不 404
+- 经验（5F）：
+  - **BM25 不双写 chunk 全文**：chunk 内容只存 ChromaDB，SQLite 仅有 content_preview(200字)。BM25 索引标题+预览即可覆盖主要关键词，双写全文会引入数据一致性问题。BM25 价值在精确关键词命中（专有名词/代码标识符），语义匹配交给向量检索
+  - **SQLite FTS5 中文分词陷阱**：默认 unicode61 分词器对 CJK 按字切分，“RAG 优化”会切成 RAG/优/化 三个 token，“教程”切成教/程。MATCH '教程' 查不到（索引里没“教程”这个 token）。解决方案：FTS 结果为空时用 LIKE '%query%' 兜底，英文走 FTS（有 BM25 排序），中文走 LIKE（保证召回，牺牲排序精度）
+  - **FTS5 contentless 表的 contentless_delete=1 有版本要求**，旧 SQLite 报 `contentless_delete=1 requires a contentless table`。改用普通 FTS5 表（独立存索引数据，由 _sync_fts_note 维护同步），兼容性更好
+  - **bm25() 函数返回值极小**（1e-06 量级），round(,4) 后变 0.0，但不影响 ORDER BY 排序（原始值有区分度）。RRF 融合只用排名不用绝对分，所以 score=0.0 对融合无影响
+  - **Rerank 走 SiliconFlow /v1/rerank API 而非本地模型**：现有 embedding 已走 SiliconFlow API，本地 cross-encoder 会引入 GB 级模型下载，违背轻量原则。复用现有 SILICONFLOW_API_KEY，零新依赖。OpenAI SDK 不直接支持 /rerank 端点，用 client._client.post 走原始 HTTP
+  - **QueryRewriter 必须懒加载 LLM**：__init__ 里调 get_chat_model() 会在测试环境（无 API key）报错。改为首次 rewrite() 时才初始化 LLM，build_hybrid_searcher 构造时不触发任何外部调用
+  - **HybridSearcher 调用 BM25 要双保险 try/except**：bm25_search 内部已有 try/except 返回空列表，但 mock side_effect 会绕过内部处理直接抛异常。_retrieve_and_fuse 调用处再加一层 try/except，任一环节失败都不阻塞主流程（降级为纯向量）
+  - **测试 fixture 必须强制 SQLite 隔离**：client fixture 创建新 AppConfig 但没设 database.host=None，会读 .env 的 BRAIN_DB_HOST 连真实 MySQL，导致测试间数据污染（test_delete_session 因残留数据失败）。新增 `cfg.database.host = None` 强制 SQLite，并重置 _hybrid_searcher 全局单例。这是既有问题，5F 新增全局变量时顺带修复
+  - **PowerShell Set-Content 默认 GBK 编码会破坏中文**：用 `Get-Content -Raw | Set-Content` 批量替换文本时，默认编码把 UTF-8 中文写成 GBK，导致 SyntaxError。必须用 Python 重写文件（`open(path,'w',encoding='utf-8')`）或 PowerShell 指定 `-Encoding utf8`。教训：涉及中文的文件批量替换优先用 Python 而非 PowerShell
+  - **提示词种子要支持增量补充**：_seed_prompts 原本仅空表时写入全部默认值，旧库升级时新增的 query_rewriter 不会被补充。改为「空表写全部 + 非空表补充缺失 key」，让 5F 新增的提示词能自动出现在已初始化的库里
+  - **检索链路双调用方统一**：researcher.search_notes 工具和 server /api/search 原本各自调 VectorStore.search，5F 抽出 HybridSearcher 统一入口，两者都注入。CLI 的 _get_search_components 返回三元组，所有解包处同步更新
 
 ---
 
