@@ -84,6 +84,17 @@ class AgentSettings(BaseSettings):
     min_strength: float = 0.5
 
 
+class CostSettings(BaseSettings):
+    """成本治理配置（Phase 5B FR48）"""
+
+    model_config = SettingsConfigDict(env_prefix="BRAIN_COST_")
+
+    daily_token_limit: int = 500_000      # 日 token 配额
+    monthly_token_limit: int = 5_000_000  # 月 token 配额
+    daily_cost_limit: float = 10.0        # 日成本上限（¥）
+    recursion_limit: int = 25             # Agent 最大递归步数（防死循环）
+
+
 # ============================================================
 # 顶层配置
 # ============================================================
@@ -104,6 +115,7 @@ class AppConfig(BaseSettings):
     embedding: EmbeddingSettings = Field(default_factory=EmbeddingSettings)
     ingestion: IngestionSettings = Field(default_factory=IngestionSettings)
     agents: AgentSettings = Field(default_factory=AgentSettings)
+    cost: CostSettings = Field(default_factory=CostSettings)
 
     # 应用级配置
     dry_run: bool = False  # mock LLM 调用
@@ -148,7 +160,7 @@ def _setup_file_logging(cfg: AppConfig) -> None:
     log_dir = cfg.storage.data_dir / "logs"
     log_dir.mkdir(parents=True, exist_ok=True)
 
-    # 每个文件最多 5MB，保留 3 个滚动文件
+    # 每个文件最多 5MB，保留 3 个滚动文件（人类可读格式）
     logger.add(
         log_dir / "brain.log",
         rotation="5 MB",
@@ -156,6 +168,20 @@ def _setup_file_logging(cfg: AppConfig) -> None:
         level=cfg.log_level,
         encoding="utf-8",
         enqueue=True,  # 多线程安全
+        backtrace=False,
+        diagnose=False,
+    )
+
+    # 结构化 JSON 日志（Phase 5A）：便于机器解析和按 trace_id 过滤
+    # 字段含 timestamp/level/trace_id/agent/tool/message
+    logger.add(
+        log_dir / "brain.json.log",
+        rotation="5 MB",
+        retention=7,
+        level=cfg.log_level,
+        encoding="utf-8",
+        enqueue=True,
+        serialize=True,  # 输出 JSON 格式
         backtrace=False,
         diagnose=False,
     )

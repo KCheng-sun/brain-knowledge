@@ -26,8 +26,8 @@ def _mock_embedding(texts: list[str]) -> list[list[float]]:
 @pytest.fixture
 def client(tmp_path, monkeypatch):
     """构造指向临时目录的测试客户端。"""
-    import brain.config as config_module
     import brain.api.server as server_module
+    import brain.config as config_module
 
     # 1. 重定向配置到临时目录（checkpoints.db 需要 data 目录存在）
     from brain.config import AppConfig, StorageSettings
@@ -177,7 +177,6 @@ class TestRssAPI:
 
     def test_add_rss_feed(self, client, monkeypatch):
         """添加订阅源——mock fetch_feed 避免真实网络请求。"""
-        import brain.api.server as server_module
         from brain.ingestion.sources.rss import RssSource
 
         monkeypatch.setattr(RssSource, "fetch_feed", lambda self, feed_id, limit=10: 0)
@@ -231,3 +230,103 @@ class TestStatusAPI:
         data = client.get("/api/status").json()
         assert data["note_count"] == 1
         assert data["chunk_count"] >= 1
+
+
+class TestHILInterrupt:
+    """HIL 中断的多 proposals 场景测试。
+
+    验证 DeepSeek 一次提议多个知识片段时，interrupt 事件能完整传递全部
+    action_requests，避免恢复时 decisions 数量不匹配报错。
+    """
+
+    def test_interrupt_with_multiple_proposals(self, client, monkeypatch):
+        """中断含 2 个 action_requests 时，SSE 应返回 2 个 proposals。"""
+        from brain.agents.researcher import ResearcherAgent
+
+        # mock research_stream：yield 一个含 2 个 action_requests 的 interrupt
+        def fake_research_stream(self, question, session_id, history, memory, checkpointer=None, trace_id=None):
+            yield {"type": "session", "session_id": session_id}
+            yield {"type": "token", "content": "我发现了两个值得保存的片段。"}
+            yield {
+                "type": "interrupt",
+                "request": {
+                    "action_requests": [
+                        {
+                            "name": "propose_knowledge",
+                            "args": {"title": "片段A", "content": "内容A"},
+                            "description": "提议保存知识片段",
+                        },
+                        {
+                            "name": "propose_knowledge",
+                            "args": {"title": "片段B", "content": "内容B"},
+                            "description": "提议保存知识片段",
+                        },
+                    ],
+                },
+            }
+
+        monkeypatch.setattr(ResearcherAgent, "research_stream", fake_research_stream)
+
+        resp = client.post(
+            "/api/ask/stream",
+            json={"question": "测试多片段中断", "session_id": None},
+        )
+        assert resp.status_code == 200
+
+        # 解析 SSE 事件
+        events = []
+        for line in resp.text.split("\n"):
+            if line.startswith("data: "):
+                import json
+
+                events.append(json.loads(line[6:]))
+
+        # 找到 interrupt 事件
+        interrupt_event = next((e for e in events if e["type"] == "interrupt"), None)
+        assert interrupt_event is not None, "应收到 interrupt 事件"
+        assert interrupt_event["session_id"]  # 应携带 session_id
+
+        # 核心断言：proposals 应含 2 项（而非旧的只取第一个）
+        proposals = interrupt_event.get("proposals", [])
+        assert len(proposals) == 2, f"应返回 2 个 proposals，实际 {len(proposals)}"
+        assert proposals[0]["args"]["title"] == "片段A"
+        assert proposals[1]["args"]["title"] == "片段B"
+
+    def test_interrupt_with_single_proposal_still_works(self, client, monkeypatch):
+        """单个 proposal 的回归测试（确保向后兼容）。"""
+        from brain.agents.researcher import ResearcherAgent
+
+        def fake_research_stream(self, question, session_id, history, memory, checkpointer=None, trace_id=None):
+            yield {"type": "session", "session_id": session_id}
+            yield {
+                "type": "interrupt",
+                "request": {
+                    "action_requests": [
+                        {
+                            "name": "propose_knowledge",
+                            "args": {"title": "单个片段", "content": "内容"},
+                            "description": "提议保存",
+                        },
+                    ],
+                },
+            }
+
+        monkeypatch.setattr(ResearcherAgent, "research_stream", fake_research_stream)
+
+        resp = client.post(
+            "/api/ask/stream",
+            json={"question": "测试单片段中断", "session_id": None},
+        )
+        assert resp.status_code == 200
+
+        import json
+
+        events = [
+            json.loads(line[6:])
+            for line in resp.text.split("\n")
+            if line.startswith("data: ")
+        ]
+        interrupt_event = next(e for e in events if e["type"] == "interrupt")
+        proposals = interrupt_event.get("proposals", [])
+        assert len(proposals) == 1
+        assert proposals[0]["args"]["title"] == "单个片段"

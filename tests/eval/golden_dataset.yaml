@@ -1,0 +1,46 @@
+# Golden Dataset — 离线评估测试集（Phase 5D FR53）
+#
+# 每条用例包含：
+#   id:               唯一标识
+#   question:         用户问题
+#   expected_keywords: 期望回答中出现的关键词（至少命中部分才算合格）
+#   expected_sources:  期望引用的笔记 id 列表（可空，空则不检查来源）
+#   min_score:        低于此分判为失败（0.0-1.0）
+#
+# 评分维度与权重：
+#   关键词命中 0.5 + 来源正确性 0.3 + 完整性 0.2 = 总分
+#
+# 维护原则：
+#   - 新增知识点后补充对应用例
+#   - bad case 经人工 review 后转为 golden 用例
+#   - 改 prompt/换模型后跑 brain eval 确认无退化
+
+- id: eval_001
+  question: "LangGraph 的 checkpoint 机制是什么？"
+  expected_keywords: ["checkpoint", "SqliteSaver", "持久化", "中断恢复"]
+  expected_sources: ["00cb4a4e7c05", "b4a2ead6ffbd"]
+  min_score: 0.7
+
+- id: eval_002
+  question: "DeepAgents 是什么框架？有什么特点？"
+  expected_keywords: ["DeepAgents", "深度智能体", "LangChain", "子智能体"]
+  expected_sources: ["8a0a188c86a7"]
+  min_score: 0.7
+
+- id: eval_003
+  question: "Python 的 asyncio 事件循环是怎么工作的？"
+  expected_keywords: ["asyncio", "事件循环", "epoll", "任务调度"]
+  expected_sources: ["f2aa979a8082"]
+  min_score: 0.7
+
+- id: eval_004
+  question: "LangGraph 的 StateGraph 如何构建 Agent 流水线？"
+  expected_keywords: ["StateGraph", "节点", "边", "Agent"]
+  expected_sources: ["581684a1782c"]
+  min_score: 0.6
+
+- id: eval_005
+  question: "知识库里都讲了哪些技术主题？"
+  expected_keywords: ["LangGraph", "DeepAgents", "asyncio"]
+  expected_sources: []
+  min_score: 0.6

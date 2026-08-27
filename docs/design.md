@@ -1,8 +1,8 @@
 # 个人知识管家（第二大脑）— 项目设计文档
 
-> 版本: v0.3.0
-> 最后更新: 2024-08-12
-> 状态: Phase 3 设计中
+> 版本: v0.5.0
+> 最后更新: 2024-08-13
+> 状态: Phase 1-3 已完成，Phase 4 进行中，Phase 5 设计中
 > 依赖文档: [需求文档](./requirements.md)
 
 ---
@@ -655,14 +655,14 @@ CLI 层       | 捕获所有异常 → 友好的错误信息 + 日志路径提�
 
 ---
 
-## 11. Phase 2 开发任务清单（当前进行中）
+## 11. Phase 2 开发任务清单 ✅（已完成）
 
-- [ ] Agent 基类：`brain/agents/base.py` — DeepAgents 配置 + 通用执行器
-- [ ] 分类 Agent：`brain/agents/classifier.py` — 分析笔记生成多维标签
-- [ ] 关联 Agent：`brain/agents/connector.py` — 向量粗筛 + DeepAgents 深度分析
-- [ ] 流水线扩展：`classify` 和 `connect` 节点，并行执行后写入 SQLite
-- [ ] CLI 扩展：`search --tag` 按标签过滤
-- [ ] 测试：Agent 输出格式验证（mock LLM 响应）
+- [x] Agent 基类：`brain/agents/base.py` — DeepAgents 配置 + 通用执行器
+- [x] 分类 Agent：`brain/agents/classifier.py` — 分析笔记生成多维标签
+- [x] 关联 Agent：`brain/agents/connector.py` — 向量粗筛 + DeepAgents 深度分析
+- [x] 流水线扩展：`classify` 和 `connect` 节点，执行后写入 SQLite
+- [x] CLI 扩展：`search --tag` 按标签过滤、`brain connections` 查看关联
+- [x] 测试：Agent 输出格式验证（mock LLM 响应）
 
 ### 11.1 Phase 2 核心设计
 
@@ -700,20 +700,23 @@ DeepAgents 结构化 Prompt:
 **流水线变化：**
 ```
 Phase 1: parse → chunk → embed → index
-Phase 2: parse → chunk → embed → classify ─┬→ index
-                                      connect ─┘
-                                        (并行)
+Phase 2: parse → chunk → embed → classify → connect → index
 ```
-classify 和 connect 互不依赖，在 embed 后并行执行，都完成后进入 index。
+classify 和 connect 在 embed 后串行执行（实际实现中为顺序节点，避免并发写入冲突），都完成后进入 index。
 
 ---
 
-## 12. Phase 3 开发任务清单（当前进行中）
+## 12. Phase 3 开发任务清单 ✅（已完成）
 
-- [ ] DigestService：`brain/services/digest.py` — 每日摘要 + 每周趋势
-- [ ] ReviewService：`brain/services/review.py` — 复习提醒
-- [ ] CLI：`brain digest` / `brain digest --weekly` / `brain review`
-- [ ] 测试：服务层测试
+- [x] DigestService：`brain/services/digest.py` — 每日摘要 + 每周趋势
+- [x] ReviewService：`brain/services/review.py` — SM-2 间隔重复复习
+- [x] TaskScheduler：`brain/services/scheduler.py` — 后台线程定时任务
+- [x] CLI：`brain digest [--weekly]` / `brain review` / `brain watch` / `brain rss`
+- [x] Web UI：FastAPI 后端 + Vue3 前端（问答/搜索/图谱/复习/片段/RSS）
+- [x] 流式问答：SSE 思考/工具/答案分区输出
+- [x] 会话管理 + 三层记忆（工作窗口/向量检索/HIL 知识沉淀）
+- [x] 知识图谱可视化（ECharts 力导向图）
+- [x] 测试：92 项全绿（存储/API/HIL/性能回归）
 
 ### 12.1 Phase 3 核心设计
 
@@ -754,16 +757,447 @@ brain digest --weekly
 4. 终端输出
 ```
 
-**复习提醒流程：**
+**复习提醒流程（演进为 SM-2）：**
 ```
 brain review
     │
     ▼
-1. 查询所有 active 笔记，按 ingested_at 排序
+1. 查询 reviews 表到期条目（due_date <= today）
     │
     ▼
-2. 衰减公式: score = 1 / (1 + days_since_ingest / 7)
+2. 不足部分从 notes 表取未进复习系统的笔记（首次候选）
     │
     ▼
-3. 返回 score < 0.3 的笔记（超过 2 周未复习）
+3. 卡片流程：回想标题 → 展开内容 → 四档评分
+    │
+    ▼
+4. SM-2 算法更新 ease_factor / interval_days / due_date
 ```
+
+---
+
+## 13. Phase 4 开发任务清单（当前进行中）
+
+> 详见 [requirements.md §4 Phase 4](./requirements.md#phase-4--需求补全与工程加固当前进行中)。
+> 拆为 4A/4B/4C 三个子阶段，遵循"先文档后代码、不引入新框架"约束。
+
+### 13.1 Phase 4A — 文档对齐与质量加固 ✅（已完成）
+
+- [x] FR30 文档同步：requirements/design/CLAUDE.md 对齐 Phase 1-3 已完成状态
+- [x] FR31 CLI 性能修复：`brain status`/`connections` 改用 `get_tag_counts`/`get_all_connections_flat`/`get_note_degree_map`，消除 N+1
+- [x] FR32 API lifespan 迁移：`@app.on_event("startup")` → `lifespan` 上下文管理器
+- [x] FR33 测试提速：`bulk_client` fixture 改 module 级复用，500 条笔记只摄入一次
+
+### 13.2 Phase 4B — P1 功能闭环
+
+- [ ] FR34 书签导入：`brain/ingestion/sources/bookmark.py`（解析 Chrome/Firefox JSON），遵循 `SourceProtocol`；CLI `brain bookmarks <path>`；API `POST /api/bookmarks/import`
+- [ ] FR35 标签浏览：`MetadataStore.list_all_tags()` 新方法；CLI `brain tags`；API `GET /api/tags`；前端标签云
+- [ ] FR36 笔记编辑：`MetadataStore.update_note_tags`/`delete_connection`；CLI `brain edit <id>`；API `PATCH /api/notes/{id}`、`DELETE /api/connections/{id}`
+- [ ] FR37 多跳推理增强：ResearcherAgent 系统提示词增加显式子问题分解环节
+
+### 13.3 Phase 4C — 实用性增强
+
+- [ ] FR38 数据导出/导入：`brain export` → Markdown 包 + metadata.json；`brain import` 恢复
+- [ ] FR39 Embedding 迁移工具：`brain reindex --model <name>` 全量重算向量
+- [ ] FR40 主动复习提醒：调度器加超期复习提醒任务，digest 附加待复习条目
+- [ ] FR41 测试补齐：书签源/编辑链路/导出导入集成测试
+
+### 13.4 Phase 4 核心设计
+
+**书签源设计（对齐 RSS 源结构）：**
+```
+brain bookmarks ./bookmarks.json
+    │
+    ▼
+1. BookmarkSource.parse(path) → list[ParsedDocument]
+   - Chrome 导出格式：嵌套 children 数组
+   - Firefox 导出格式：平铺条目数组
+   - 每个书签 → title + url（内容为 "# {title}\n{url}"）
+    │
+    ▼
+2. 逐个走 IngestionPipeline.ingest_document()
+   - source_type = BOOKMARK
+   - file_hash 基于 url 计算（去重）
+    │
+    ▼
+3. 批量摄入，返回成功/失败统计
+```
+
+**标签浏览设计：**
+```
+brain tags
+    │
+    ▼
+1. MetadataStore.get_tag_counts() → {tag_name: count}
+   （已有方法，一次 SQL 完成）
+    │
+    ▼
+2. 按计数降序输出标签云
+    │
+    ▼
+3. CLI: 显示 [count] tagname 表格
+   API: 返回 [{name, category, count}]
+   前端: 点击标签 → 跳转 search?tag=xxx
+```
+
+**笔记编辑设计：**
+```
+brain edit <note_id> --title "新标题" --add-tag python --remove-tag java
+    │
+    ▼
+1. MetadataStore.update_note(id, title=...)  — 已存在
+2. MetadataStore.update_note_tags(id, add=[...], remove=[...])  — 新增
+3. MetadataStore.delete_connection(conn_id)  — 新增
+4. 笔记内容不变（内容编辑走重新摄入流程）
+```
+
+**数据导出格式：**
+```
+brain export --output ./backup.zip
+    │
+    ▼
+输出 ZIP 包结构：
+  backup/
+  ├── notes/
+  │   ├── {note_id}.md          # 原始 Markdown
+  │   └── ...
+  ├── metadata.json             # [{id, title, tags, connections, ...}]
+  └── manifest.json             # 导出版本、时间、笔记数
+```
+
+**Embedding 迁移流程：**
+```
+brain reindex --model BAAI/bge-m3
+    │
+    ▼
+1. 遍历 SQLite 全部 active 笔记
+    │
+    ▼
+2. 逐个用新 embedding_fn 重新分块嵌入
+    │
+    ▼
+3. 删除旧 ChromaDB collection，重建
+    │
+    ▼
+4. 进度条显示，支持 --dry-run 预览
+```
+
+---
+
+## 14. Phase 5 开发任务清单（生产化加固，当前进行中）
+
+> 目标：从「能跑」到「可维护」，补足上线后的可观测性、成本治理、容灾、评估能力。
+> 面向本地优先单用户场景裁剪生产级要点，不引入 K8s/Redis/Kafka 等重型基础设施。
+> 详见 [requirements.md §4 Phase 5](./requirements.md#phase-5--生产化加固当前进行中)。
+
+### 14.1 Phase 5A — 可观测性基础
+
+- [x] FR42 全链路 Trace ID：每次问答生成 trace_id，贯穿 LLM/工具/日志，写入 messages 表
+- [x] FR43 结构化 JSON 日志：loguru 增加 JSON sink，带 trace_id/agent/tool 字段
+- [x] FR44 核心指标采集：问答延迟/工具调用次数/Token 消耗/摄入耗时写入 metrics 表
+- [x] FR45 健康检查：/api/health 探测 LLM/Embedding/SQLite/ChromaDB 连通性
+- [x] FR46 可观测性页面：前端 Observability 页（健康状态/指标看板/最近调用链）
+
+### 14.2 Phase 5A 核心设计
+
+**设计原则：本地优先，轻量实现**
+- 不引入 Prometheus/ELK/Jaeger，指标存 SQLite、日志存本地文件、Trace 存 messages 表
+- trace_id 用 UUID4 短格式，与现有 note_id 风格一致
+- 指标表只追加不修改，符合审计日志原则
+
+**Trace ID 贯穿机制：**
+```
+用户提问
+    │
+    ▼
+1. /api/ask 或 /api/ask/stream 入口生成 trace_id（UUID4 短格式）
+    │
+    ▼
+2. trace_id 写入 messages 表（timeline 字段补充 trace_id）
+    │
+    ▼
+3. 通过 contextvars 透传到 ResearcherAgent / 工具调用
+    │
+    ▼
+4. 所有日志带 trace_id，便于按会话过滤完整调用链
+    │
+    ▼
+5. 指标记录关联 trace_id，可反查某次问答的全部工具调用
+```
+
+**metrics 表设计（核心指标采集）：**
+```sql
+CREATE TABLE IF NOT EXISTS metrics (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    trace_id TEXT,              -- 关联问答会话
+    metric_type TEXT NOT NULL,  -- 'ask'|'ingest'|'tool_call'|'llm_call'
+    metric_name TEXT NOT NULL,  -- 'latency_ms'|'token_count'|'count'
+    value REAL NOT NULL,
+    metadata TEXT,              -- JSON: {model, tool_name, status, ...}
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_metrics_type_time ON metrics(metric_type, created_at);
+CREATE INDEX IF NOT EXISTS idx_metrics_trace ON metrics(trace_id);
+```
+
+**trace_events 表设计（完整调用链回放）：**
+```sql
+CREATE TABLE IF NOT EXISTS trace_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    trace_id TEXT NOT NULL,
+    seq INTEGER NOT NULL,          -- 同一 trace 内递增序号
+    event_type TEXT NOT NULL,     -- 'llm_start'|'llm_end'|'tool_start'|'tool_end'
+    name TEXT,                     -- 模型名 / 工具名
+    input TEXT,                    -- 请求 prompt / 工具入参（截断 2000 字符）
+    output TEXT,                   -- 响应文本 / 工具出参（截断 2000 字符）
+    token_usage TEXT,             -- JSON: {prompt, completion, total}
+    latency_ms REAL,               -- 本步耗时
+    run_id TEXT,                   -- LangChain run_id（关联 start/end）
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_trace_events_trace ON trace_events(trace_id, seq);
+```
+metrics 表存数值指标（用于看板聚合统计），trace_events 表存完整入参出参（用于调用链回放）。
+两者通过 trace_id 关联，前端展开调用链时同时展示。
+
+**健康检查设计：**
+```
+GET /api/health
+    │
+    ▼
+返回各组件状态:
+{
+  "status": "healthy"|"degraded"|"unhealthy",
+  "components": {
+    "sqlite": "ok"|"error",
+    "chromadb": "ok"|"error",
+    "embedding": "ok"|"error",
+    "llm": "ok"|"skipped"|"error"
+  },
+  "timestamp": "..."
+}
+```
+LLM/Embedding 探测用最小调用（dry-run 或 1 token），避免消耗配额。
+
+**可观测性页面（前端 Observability.vue）：**
+- 健康状态卡片：四组件状态灯（SQLite/ChromaDB/Embedding/LLM）
+- 指标看板：今日问答数、平均延迟、工具调用总数、Token 消耗（折线图/数字卡片）
+- 最近调用链：最近 20 条 ask 记录，点击展开看完整调用链回放（LLM 请求响应文本 + 工具入参出参）和数值指标
+
+---
+
+### §14 Phase 5B — 成本治理
+
+#### FR47 Token 实时计费
+
+**设计思路：** 不新建 llm_usage 表，复用 5A 的 trace_events 表——llm_end 事件已记录 token_usage，
+只需在 TraceEventLogger.on_llm_end 里增加 cost 字段（按价格表换算）。成本数据天然随 trace_id 关联，
+无需额外表。
+
+**内置价格表（¥/1M token，DeepSeek 官方定价 2025-08）：**
+```python
+MODEL_PRICING = {
+    "deepseek-v4-flash": {
+        "input": {"idle": {"cache_hit": 0.05, "cache_miss": 1.5},
+                 "peak": {"cache_hit": 0.10, "cache_miss": 3.0}},
+        "output": {"idle": 4.5, "peak": 9.0},
+    },
+    "deepseek-v4-pro": {
+        "input": {"idle": {"cache_hit": 0.15, "cache_miss": 4.5},
+                 "peak": {"cache_hit": 0.30, "cache_miss": 9.0}},
+        "output": {"idle": 13.5, "peak": 27.0},
+    },
+    # 旧型号别名 → v4-flash
+    "deepseek-chat": {"_alias": "deepseek-v4-flash"},
+}
+```
+成本计算区分：
+- **空闲/高峰时段**：高峰约 2 倍（默认空闲）
+- **缓存命中/未命中**：命中价便宜约 30 倍，DeepSeek 返回在 usage_metadata.input_token_details.cache_read
+`cost = cache_hit_tokens/1e6 * hit_price + cache_miss_tokens/1e6 * miss_price + completion_tokens/1e6 * output_price`
+
+**改动点：**
+- `brain/observability.py`：TraceEventLogger.on_llm_end 增加 cost 计算，写入 token_usage.cost
+- `brain/observability.py`：新增 `calc_token_cost(model, prompt, completion)` 工具函数
+- trace_events.token_usage JSON 增加 `cost` 字段（单位：¥，保留 6 位小数）
+
+#### FR48 预算配额与熔断
+
+**设计思路：** 两层防护——
+1. **预算熔断（软限制）：** 问答入口检查当日/当月累计 token 是否超配额，超限则拒绝新问答（返回 429）
+2. **recursion_limit（硬限制）：** ResearcherAgent 的 agent.stream/invoke 传 `recursion_limit`，防止死循环烧 token
+
+**配额配置（config.yaml / 环境变量）：**
+```python
+class CostSettings(BaseSettings):
+    model_config = SettingsConfigDict(env_prefix="BRAIN_COST_")
+    daily_token_limit: int = 500_000      # 日配额（token）
+    monthly_token_limit: int = 5_000_000  # 月配额
+    daily_cost_limit: float = 10.0        # 日成本上限（¥）
+    recursion_limit: int = 25             # Agent 最大递归步数（防死循环）
+```
+
+**熔断检查流程：**
+```
+/api/ask 或 /api/ask/stream 入口
+    │
+    ▼
+check_budget(metadata_store) → 查今日/本月累计 token
+    │
+    ├─ 未超限 → 正常执行
+    └─ 超限 → 返回 429 + {error: "budget_exceeded", used, limit}
+```
+
+**recursion_limit 实现：**
+researcher.py 的 agent.stream(config={...}) 增加 `recursion_limit`，超限 LangGraph 抸 RecursionError，
+被 server 层捕获转为友好提示。
+
+**改动点：**
+- `brain/config.py`：新增 CostSettings
+- `brain/observability.py`：新增 `check_budget(ms) -> (ok, used, limit)`
+- `brain/api/server.py`：ask/stream/resume 入口加预算检查；recursion_limit 传入
+- `brain/agents/researcher.py`：stream/invoke 的 config 增加 recursion_limit
+
+#### FR49 成本报表
+
+**改动点：**
+- `brain/storage/metadata.py`：新增 `get_cost_summary(hours)` 聚合查询（总成本/按模型/按日）
+- `brain/api/server.py`：新增 `GET /api/cost/summary`、`GET /api/cost/by-model`、`GET /api/cost/daily`
+- `brain/cli/main.py`：新增 `brain cost` 命令
+- `frontend/src/components/Observability.vue`：看板增加成本卡片（今日成本/月成本/配额进度条）
+
+**数据流：**
+```
+trace_events.token_usage.cost
+    │
+    ▼ 聚合
+get_cost_summary(hours) → {today_cost, month_cost, daily_limit, used_ratio, by_model, by_day}
+    │
+    ▼
+前端看板：今日 ¥X.XX / 配额进度条 / 按模型成本占比 / 按日趋势
+```
+
+---
+
+### §15 Phase 5D — 评估闭环
+
+#### FR53 离线评估测试集
+
+**Golden Dataset 存数据库（golden_cases 表），支持页面 CRUD：**
+```sql
+CREATE TABLE IF NOT EXISTS golden_cases (
+    id TEXT PRIMARY KEY,              -- 如 eval_001
+    question TEXT NOT NULL,
+    expected_keywords TEXT,           -- JSON 数组
+    expected_sources TEXT,            -- JSON 数组（note_id 列表）
+    min_score REAL DEFAULT 0.7,
+    enabled INTEGER DEFAULT 1,        -- 0=禁用，1=启用
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+```
+YAML 文件（tests/eval/golden_dataset.yaml）仅作为种子数据，首次启动导入数据库，
+之后全部走数据库 + 页面管理。
+
+**评分维度（规则为主，不调 LLM）：**
+1. 关键词命中（权重 0.5）：expected_keywords 在回答中出现比例
+2. 来源正确性（权重 0.3）：trace_events 里 tool_call 的 note_id 是否命中 expected_sources
+3. 完整性（权重 0.2）：回答非空、长度合理（>50 字）
+
+**评分流程：**
+```
+brain eval [--dataset golden_dataset.yaml] [--limit N]
+    │
+    ▼ 逐条
+ResearcherAgent.research_sync(question, trace_id=eval_xxx)
+    │
+    ├─ 提取回答文本 → 关键词命中分
+    ├─ 查 trace_events 的 tool_call → 来源正确性分
+    └─ 回答长度 → 完整性分
+    │
+    ▼ 加权
+score = 0.5*keyword + 0.3*source + 0.2*complete
+    │
+    ▼
+报告：通过率、平均分、失败用例详情
+```
+
+**改动点：**
+- `brain/storage/metadata.py`：新增 golden_cases 表 + CRUD（add/get/update/delete/toggle）
+- `brain/eval/runner.py`：load_dataset 改为从数据库加载
+- `brain/api/server.py`：新增 golden cases CRUD 端点
+- `brain/cli/main.py`：`brain eval` 从数据库加载；加 `brain eval seed` 从 YAML 导入种子
+- `frontend/src/components/EvalCenter.vue`：golden cases 管理（增删改查 + 启用禁用）
+
+#### FR54 Bad Case 回流
+
+**收集触发点：**
+1. 用户点踩（Ask.vue 加 👎 按钮）→ POST /api/eval/feedback
+2. 问答失败（异常/空回答/recursion_limit 超限）→ server 层自动收集
+
+**bad_cases 存数据库（bad_cases 表），支持页面查看/删除/转 golden：**
+```sql
+CREATE TABLE IF NOT EXISTS bad_cases (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    trace_id TEXT,
+    question TEXT,
+    answer TEXT,
+    reason TEXT,          -- 'user_thumbs_down'|'empty_answer'|'error'|'recursion_limit'
+    extra TEXT,           -- JSON 附加信息
+    collected_at TEXT NOT NULL
+);
+```
+收集写入数据库，页面可查看/删除/一键转为 golden case。
+
+**改动点：**
+- `brain/storage/metadata.py`：新增 bad_cases 表 + CRUD
+- `brain/eval/collector.py`：`collect_bad_case` 改为写数据库
+- `brain/api/server.py`：新增 bad cases CRUD 端点 + 一键转 golden
+- `frontend/src/components/EvalCenter.vue`：bad cases 管理（查看/删除/转 golden）
+
+#### FR55 LLM-as-Judge 抽样
+
+**Judge prompt 设计：**
+输入：问题 + 回答 + 知识库相关片段（从 trace_events 提取）
+输出：JSON {score: 1-5, dimensions: {relevance, accuracy, completeness}, comment}
+
+**eval_scores 表：**
+```sql
+CREATE TABLE IF NOT EXISTS eval_scores (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    trace_id TEXT,
+    question TEXT,
+    answer TEXT,
+    score INTEGER,           -- 1-5
+    dimensions TEXT,         -- JSON
+    comment TEXT,
+    judged_at TEXT NOT NULL
+);
+```
+
+**改动点：**
+- `brain/storage/metadata.py`：新增 eval_scores 表 + CRUD
+- `brain/eval/judge.py`：`LLMJudge` 调 DeepSeek 打分
+- `brain/services/scheduler.py`：加 weekly_eval 周任务（抽 10%）
+- `brain/api/server.py`：新增 GET /api/eval/scores 查趋势
+
+#### 评估历史持久化
+
+**eval_runs 表：记录每次评估批次（离线评估 + Judge 抽样）**
+```sql
+CREATE TABLE IF NOT EXISTS eval_runs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_type TEXT NOT NULL,     -- 'offline' | 'judge'
+    total INTEGER,              -- 用例数 / 抽样数
+    passed INTEGER,             -- 通过数（离线评估）
+    pass_rate REAL,             -- 通过率
+    avg_score REAL,             -- 平均分
+    duration_ms REAL,           -- 耗时
+    details TEXT,               -- JSON：完整报告摘要（失败用例/各维度均分）
+    created_at TEXT NOT NULL
+);
+```
+- 离线评估：`/api/eval/run` 跑完后写入 eval_runs（run_type='offline'）
+- Judge 抽样：`/api/eval/judge` 跑完后写入 eval_runs（run_type='judge'）
+- `eval_scores` 表加 `run_id` 字段关联 Judge 批次
+- API：`GET /api/eval/runs` 查历史，前端总览页显示趋势

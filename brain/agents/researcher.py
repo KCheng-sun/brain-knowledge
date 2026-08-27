@@ -1,4 +1,4 @@
-"""深度研究 Agent — 基于 DeepAgents 框架 + 官方 AgentMiddleware。"""
+﻿"""深度研究 Agent — 基于 DeepAgents 框架 + 官方 AgentMiddleware。"""
 
 from langchain_core.tools import tool
 from loguru import logger
@@ -21,15 +21,16 @@ class ResearcherAgent:
         question: str,
         session_id: str | None = None,
         history: list[dict] | None = None,
+        trace_id: str | None = None,
     ) -> str:
         """同步执行深度研究。"""
-        return self._do_research(question, session_id, history)
+        return self._do_research(question, session_id, history, trace_id=trace_id)
 
     async def research(self, question: str, session_id: str | None = None) -> str:
         """异步执行深度研究。"""
         return self._do_research(question, session_id)
 
-    def _build_agent(self, session_id: str | None = None, checkpointer=None):
+    def _build_agent(self, session_id: str | None = None, checkpointer=None, trace_id: str | None = None):
         """构建 DeepAgent（复用逻辑）。
 
         主 Agent 配备:
@@ -39,7 +40,11 @@ class ResearcherAgent:
 
         HIL: propose_knowledge 工具注册在 interrupt_on，
         用户批准(approve)后才真正执行保存。
+
+        Args:
+            trace_id: 可观测性 trace_id，用于 LLM token 跟踪回调（Phase 5A）
         """
+        self._trace_id = trace_id  # 供 stream config 的 token 回调使用
         tools = self._build_tools()
         llm = get_chat_model()
         ms = self._metadata_store
@@ -152,7 +157,7 @@ class ResearcherAgent:
 5. **查看详情**: 对关键笔记使用 get_note_detail 获取完整内容和标签
 6. **迭代搜索**: 如果初步结果不够，调整关键词继续搜索
 7. **综合回答**: 汇总所有发现，给出有引用来源的完整答案
-8. **知识沉淀（必须执行）**: 回答完用户问题后，使用 task 工具委派 knowledge-extractor 子智能体，把本次对话的结论发送给它提取知识片段。这是固定流程，不要跳过。
+8. **知识沉淀（必须执行）**: 回答完用户问题后如果这轮对话产生了有价值的知识，使用 task 工具委派 knowledge-extractor 子智能体，把本次对话的结论发送给它提取知识片段。
 
 规则：
 - 至少执行 2 次搜索（用不同角度/关键词）
@@ -170,6 +175,7 @@ class ResearcherAgent:
         history: list[dict] | None = None,
         memory_hits: list | None = None,
         checkpointer=None,
+        trace_id: str | None = None,
     ):
         """流式执行研究，逐事件 yield。
 
@@ -188,7 +194,7 @@ class ResearcherAgent:
           - {"type": "interrupt", "request": dict}           HIL 中断（等待用户决策）
           - {"type": "done", "content": str}                 完成（完整答案）
         """
-        agent = self._build_agent(session_id, checkpointer=checkpointer)
+        agent = self._build_agent(session_id, checkpointer=checkpointer, trace_id=trace_id)
 
         # 组装多轮消息列表：系统上下文 + 历史 + 当前问题
         messages: list[dict] = []
@@ -233,8 +239,16 @@ class ResearcherAgent:
 
         # thread_id = session_id：HIL 中断后可用同一 thread_id 恢复
         stream_config = (
-            {"configurable": {"thread_id": session_id}} if checkpointer and session_id else None
+            {"configurable": {"thread_id": session_id}} if checkpointer and session_id else {}
         )
+        # recursion_limit 防死循环（Phase 5B FR48）
+        from brain.config import get_config
+        stream_config["recursion_limit"] = get_config().cost.recursion_limit
+        # 注入 token 跟踪回调（Phase 5A）
+        if self._trace_id:
+            from brain.observability import TraceEventLogger
+            token_cb = TraceEventLogger(self._metadata_store, self._trace_id)
+            stream_config.setdefault("callbacks", []).append(token_cb)
 
         for mode, chunk in agent.stream(
             {"messages": messages},
@@ -313,6 +327,7 @@ class ResearcherAgent:
         session_id: str,
         decision: dict,
         checkpointer=None,
+        trace_id: str | None = None,
     ):
         """HIL 决策后恢复 Agent 执行，继续流式输出。
 
@@ -320,11 +335,21 @@ class ResearcherAgent:
             session_id: 会话 ID（作为 thread_id 定位 checkpoint）
             decision: HIL 决策，格式 {"decisions": [{"type": "approve"|"edit"|"reject", ...}]}
             checkpointer: 与初始流相同的 checkpointer 实例
+            trace_id: 可观测性 trace_id（Phase 5A）
         """
         from langgraph.types import Command
 
-        agent = self._build_agent(session_id, checkpointer=checkpointer)
+        agent = self._build_agent(session_id, checkpointer=checkpointer, trace_id=trace_id)
         config = {"configurable": {"thread_id": session_id}}
+        # recursion_limit 防死循环（Phase 5B FR48）
+        from brain.config import get_config
+        config["recursion_limit"] = get_config().cost.recursion_limit
+        # 注入 token 跟踪回调（Phase 5A）
+        if self._trace_id:
+            from brain.observability import TraceEventLogger
+            config.setdefault("callbacks", []).append(
+                TraceEventLogger(self._metadata_store, self._trace_id)
+            )
 
         logger.info(f"[researcher] 恢复执行 (session={session_id})")
 
@@ -397,8 +422,9 @@ class ResearcherAgent:
         question: str,
         session_id: str | None = None,
         history: list[dict] | None = None,
+        trace_id: str | None = None,
     ) -> str:
-        agent = self._build_agent(session_id)
+        agent = self._build_agent(session_id, trace_id=trace_id)
 
         # 组装多轮消息列表：历史 + 当前问题
         messages: list[dict] = []
@@ -410,7 +436,16 @@ class ResearcherAgent:
         logger.info(
             f"[researcher] 开始研究: {question} (含 {len(messages) - 1} 条历史消息)"
         )
-        result = agent.invoke({"messages": messages})
+        invoke_config = {}
+        # recursion_limit 防死循环（Phase 5B FR48）
+        from brain.config import get_config
+        invoke_config["recursion_limit"] = get_config().cost.recursion_limit
+        if self._trace_id:
+            from brain.observability import TraceEventLogger
+            invoke_config["callbacks"] = [
+                TraceEventLogger(self._metadata_store, self._trace_id)
+            ]
+        result = agent.invoke({"messages": messages}, config=invoke_config or None)
 
         result_messages = result.get("messages", [])
         if result_messages:

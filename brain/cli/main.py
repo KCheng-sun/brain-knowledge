@@ -362,18 +362,11 @@ def status():
     chunk_count = vector_store.count()
     note_count = metadata_store.count_notes()
 
-    # 标签统计
-    all_notes = metadata_store.list_notes(limit=10000)
-    tag_counts: dict[str, int] = {}
-    total_connections = 0
-    for note in all_notes:
-        tags = metadata_store.get_note_tags(note.id)
-        for t in tags:
-            tag_counts[t.name] = tag_counts.get(t.name, 0) + 1
-        conns = metadata_store.get_connections(note.id)
-        total_connections += len(conns)
-    # 每个 connection 被数了两次（source 和 target 各一次）
-    total_connections //= 2
+    # 标签统计 / 关联总数——一次 SQL 完成，避免逐篇 N+1 遍历
+    tag_counts = metadata_store.get_tag_counts()  # {tag_name: count}
+    degree_map = metadata_store.get_note_degree_map()  # {note_id: 度数}
+    # 每条关联在 degree_map 中被两端各计一次，总关联数 = 度数总和 / 2
+    total_connections = sum(degree_map.values()) // 2
 
     click.echo("🧠 Brain 知识库状态\n")
     click.echo(f"  笔记总数:   {note_count}")
@@ -388,16 +381,18 @@ def status():
         for name, count in top_tags:
             click.echo(f"  [{count}] {name}")
 
-    # 最近笔记
+    # 最近笔记（仅 5 篇，单独取标签可接受）
     recent_notes = metadata_store.list_notes(limit=5)
     if recent_notes:
+        # 一次 SQL 批量取标签，避免 5 次 get_note_tags
+        tags_map = metadata_store.get_tags_batch([n.id for n in recent_notes])
         click.echo("\n📝 最近摄入的笔记:")
         for note in recent_notes:
             date_str = note.ingested_at[:10] if note.ingested_at else "未知"
-            tags = metadata_store.get_note_tags(note.id)
+            note_tags = tags_map.get(note.id, [])
             tag_str = ""
-            if tags:
-                tag_str = "  [" + ", ".join(t.name for t in tags[:3]) + "]"
+            if note_tags:
+                tag_str = "  [" + ", ".join(t.name for t in note_tags[:3]) + "]"
             click.echo(f"  [{date_str}] {note.title}{tag_str}")
 
 
@@ -451,24 +446,8 @@ def connections(note_id: str | None):
             click.echo(f"    强度: {c.strength:.0%}  |  id: {other_id}")
             click.echo()
     else:
-        # 列出全部关联
-        all_notes = metadata_store.list_notes(limit=10000)
-        all_conns: list[tuple] = []  # (conn, source_title, target_title)
-        seen = set()
-
-        for note in all_notes:
-            conns = metadata_store.get_connections(note.id)
-            for c in conns:
-                pair = tuple(sorted([c.source_note_id, c.target_note_id]))
-                if pair not in seen:
-                    seen.add(pair)
-                    source_note = metadata_store.get_note(c.source_note_id)
-                    target_note = metadata_store.get_note(c.target_note_id)
-                    all_conns.append((
-                        c,
-                        source_note.title if source_note else c.source_note_id[:8],
-                        target_note.title if target_note else c.target_note_id[:8],
-                    ))
+        # 一次 SQL 取全部关联（含双端标题），替代逐篇 get_connections + get_note
+        all_conns = metadata_store.get_all_connections_flat()
 
         click.echo(f"🔗 知识库关联 ({len(all_conns)} 条)\n")
 
@@ -476,19 +455,25 @@ def connections(note_id: str | None):
             click.echo("  暂无 AI 发现的关联。摄入更多同主题笔记后会自动发现。")
             return
 
-        for conn, src_title, tgt_title in all_conns:
+        for c in all_conns:
+            relation_type = c["relation_type"]
             relation_icon = {
                 "related": "🔗",
                 "extends": "➡️",
                 "contradicts": "⚡",
                 "references": "📖",
-            }.get(conn.relation_type.value, "🔗")
+            }.get(relation_type, "🔗")
 
-            click.echo(f"  {relation_icon} [{conn.relation_type.value}] {src_title}")
+            src_title = c["source_title"] or c["source"][:8]
+            tgt_title = c["target_title"] or c["target"][:8]
+            description = c.get("description", "")
+            strength = c["strength"]
+
+            click.echo(f"  {relation_icon} [{relation_type}] {src_title}")
             click.echo(f"    → {tgt_title}")
-            if conn.description:
-                click.echo(f"    {conn.description}")
-            click.echo(f"    强度: {conn.strength:.0%}")
+            if description:
+                click.echo(f"    {description}")
+            click.echo(f"    强度: {strength:.0%}")
             click.echo()
 
 
@@ -690,6 +675,190 @@ def rss_remove(feed_id: int):
         click.echo(f"✅ 已删除订阅源 #{feed_id}")
     else:
         click.echo(f"❌ 订阅源 #{feed_id} 不存在")
+
+
+# ============================================================
+# brain metrics — 可观测性指标
+# ============================================================
+
+
+@cli.command()
+@click.option("--hours", "-h", default=24, help="统计时间窗口（小时，默认 24）")
+@click.option("--traces", "-n", default=10, help="显示最近调用链数量（默认 10）")
+def metrics(hours: int, traces: int):
+    """查看可观测性指标（Phase 5A）。
+
+    \b
+    显示最近 N 小时的指标汇总和最近调用链。
+    示例:
+      brain metrics
+      brain metrics -h 72      # 最近 3 天
+      brain metrics -n 20      # 显示 20 条调用链
+    """
+    from brain.observability import check_health
+
+    cfg = get_config()
+    embedding_fn = get_embedding_fn()
+    vector_store = VectorStore(persist_dir=cfg.storage.chroma_dir, embedding_fn=embedding_fn)
+    metadata_store = MetadataStore(db_path=cfg.storage.db_path)
+    metadata_store.initialize()
+
+    # 健康检查
+    health = check_health(metadata_store, vector_store, embedding_fn)
+    click.echo("🏥 系统健康状态\n")
+    for comp, status in health["components"].items():
+        icon = "✅" if status == "ok" else ("⏭️" if status == "skipped" else "❌")
+        click.echo(f"  {icon} {comp:12s} {status}")
+    click.echo(f"  总体: {health['status']}\n")
+
+    # 指标汇总
+    summary = metadata_store.get_metrics_summary(hours=hours)
+    click.echo(f"📊 最近 {hours} 小时指标\n")
+    click.echo(f"  问答次数:     {summary['ask_count']}")
+    click.echo(f"  平均问答延迟: {summary['avg_ask_latency_ms']} ms")
+    click.echo(f"  工具调用次数: {summary['tool_call_count']}")
+    click.echo(f"  LLM Token:    {summary['llm_token_total']}")
+    click.echo(f"  摄入次数:     {summary['ingest_count']}")
+    if summary['ingest_count']:
+        click.echo(f"  平均摄入延迟: {summary['avg_ingest_latency_ms']} ms")
+
+    # 最近调用链
+    recent = metadata_store.get_recent_traces(limit=traces)
+    if recent:
+        click.echo(f"\n🔁 最近 {len(recent)} 条调用链\n")
+        for t in recent:
+            time_str = t["started_at"][11:19] if t["started_at"] else "?"
+            click.echo(
+                f"  [{time_str}] {t['trace_id']}  "
+                f"耗时 {t['duration_ms']}ms  工具 {t['tool_calls']}次  "
+                f"Token {t['tokens']}"
+            )
+    else:
+        click.echo("\n  暂无调用链记录（进行一次问答后可观测）")
+
+
+# ============================================================
+# brain cost — 成本统计
+# ============================================================
+
+
+@cli.command()
+@click.option("--hours", "-h", default=24, help="按模型统计的时间窗口（小时，默认 24）")
+@click.option("--days", "-d", default=30, help="按日统计的天数（默认 30）")
+def cost(hours: int, days: int):
+    """查看 LLM 调用成本（Phase 5B）。
+
+    \b
+    显示今日/本月/总累计成本和配额用量。
+    示例:
+      brain cost
+      brain cost -h 72      # 按模型看最近 3 天
+      brain cost -d 7       # 按日看最近 7 天
+    """
+    from brain.config import get_config
+
+    cfg = get_config()
+    ms = MetadataStore(db_path=cfg.storage.db_path)
+    ms.initialize()
+
+    summary = ms.get_cost_summary()
+
+    click.echo("💰 LLM 成本统计\n")
+    click.echo(f"  今日: ¥{summary['today']['cost']:.4f} ({summary['today']['tokens']} token)")
+    click.echo(f"  本月: ¥{summary['month']['cost']:.4f} ({summary['month']['tokens']} token)")
+    click.echo(f"  总计: ¥{summary['total']['cost']:.4f} ({summary['total']['tokens']} token)")
+
+    # 配额进度
+    cost_cfg = cfg.cost
+    click.echo("\n📋 配额用量")
+    token_pct = summary['today']['tokens'] / cost_cfg.daily_token_limit * 100
+    cost_pct = summary['today']['cost'] / cost_cfg.daily_cost_limit * 100
+    click.echo(f"  日 token: {summary['today']['tokens']}/{cost_cfg.daily_token_limit} ({token_pct:.1f}%)")
+    click.echo(f"  日成本:  ¥{summary['today']['cost']:.4f}/¥{cost_cfg.daily_cost_limit} ({cost_pct:.1f}%)")
+    month_pct = summary['month']['tokens'] / cost_cfg.monthly_token_limit * 100
+    click.echo(f"  月 token: {summary['month']['tokens']}/{cost_cfg.monthly_token_limit} ({month_pct:.1f}%)")
+
+    # 按模型
+    by_model = ms.get_cost_by_model(hours=hours)
+    if by_model:
+        click.echo(f"\n🏷️ 按模型（最近 {hours} 小时）\n")
+        for m in by_model:
+            click.echo(
+                f"  {m['model']:20s} ¥{m['cost']:.4f}  "
+                f"{m['total_tokens']} token ({m['calls']} 次)"
+            )
+
+    # 按日
+    by_day = ms.get_cost_by_day(days=days)
+    if by_day:
+        click.echo(f"\n📅 按日（最近 {days} 天）\n")
+        for d in by_day:
+            click.echo(f"  {d['day']}  ¥{d['cost']:.4f}  {d['total_tokens']} token ({d['calls']} 次)")
+
+
+# ============================================================
+# brain eval — 离线评估
+# ============================================================
+
+
+@cli.command()
+@click.option(
+    "--dataset", "-d",
+    default=None,
+    help="Golden Dataset YAML 路径（默认从数据库加载）",
+)
+@click.option("--limit", "-n", default=None, type=int, help="只跑前 N 条（调试用）")
+@click.option("--verbose", "-v", is_flag=True, help="显示每条用例详情")
+def eval_cmd(dataset: str | None, limit: int | None, verbose: bool):
+    """跑离线评估测试集（Phase 5D FR53）。
+
+    \b
+    对 Golden Dataset 逐条问答，规则打分（关键词+来源+完整性），
+    生成通过率报告。改 prompt/换模型后跑此命令确认无退化。
+
+    \b
+    示例:
+      brain eval                  # 从数据库加载用例
+      brain eval -n 2             # 只跑前 2 条（调试）
+      brain eval -v               # 显示详情
+      brain eval -d custom.yaml   # 从 YAML 文件加载
+    """
+    from brain.embedding import get_embedding_fn
+    from brain.eval.runner import EvalRunner
+    from brain.storage.metadata import MetadataStore
+    from brain.storage.vector_store import VectorStore
+
+    cfg = get_config()
+    vs = VectorStore(persist_dir=cfg.storage.chroma_dir, embedding_fn=get_embedding_fn())
+    ms = MetadataStore(db_path=cfg.storage.db_path)
+    ms.initialize()
+
+    runner = EvalRunner(vs, ms)
+    src = dataset or "数据库"
+    click.echo(f"🧪 开始评估（dataset={src}）\n")
+    report = runner.run(dataset, limit=limit)
+
+    click.echo(report.summary())
+
+    if verbose:
+        click.echo("\n📋 全部用例详情\n")
+        for r in report.results:
+            status = "✅" if r.passed else "❌"
+            click.echo(f"  {status} {r.case.id} [{r.case.question[:35]}]")
+            click.echo(f"     得分 {r.score:.3f}（阈值 {r.case.min_score}）")
+            if r.error:
+                click.echo(f"     错误: {r.error}")
+            else:
+                hit = r.details.get("hit_keywords", [])
+                miss = r.details.get("missed_keywords", [])
+                click.echo(f"     命中关键词: {hit}")
+                if miss:
+                    click.echo(f"     未命中: {miss}")
+            click.echo(f"     回答预览: {r.answer[:80]}...\n")
+
+    # CI 模式：失败则退出码 1
+    if report.failed > 0:
+        raise click.ClickException(f"评估未通过：{report.failed} 条用例失败")
 
 
 # ============================================================

@@ -91,13 +91,17 @@ class IngestionPipeline:
 
     def ingest_file_sync(self, file_path: Path) -> str:
         """摄入文件（同步版本，供非异步上下文调用）。"""
-        raw_text = file_path.read_text(encoding="utf-8")
-        state: IngestionState = {
-            "source_path": str(file_path), "raw_text": raw_text,
-            "parsed_doc": None, "chunks": [], "tags": [], "connections": [],
-            "note_id": "", "errors": [], "status": "running",
-        }
-        final_state = self._graph.invoke(state)
+        from brain.observability import MetricsTimer, record_metric
+
+        with MetricsTimer(self.metadata_store, "ingest", "latency_ms", {"source": "file"}):
+            raw_text = file_path.read_text(encoding="utf-8")
+            state: IngestionState = {
+                "source_path": str(file_path), "raw_text": raw_text,
+                "parsed_doc": None, "chunks": [], "tags": [], "connections": [],
+                "note_id": "", "errors": [], "status": "running",
+            }
+            final_state = self._graph.invoke(state)
+        record_metric(self.metadata_store, "ingest", "count", 1, {"source": "file"})
         return final_state["note_id"]
 
     async def ingest_text(self, text: str, title: str | None = None) -> str:

@@ -9,6 +9,8 @@ import Fragments from "./components/Fragments.vue";
 import RssFeeds from "./components/RssFeeds.vue";
 import GraphView from "./components/GraphView.vue";
 import Review from "./components/Review.vue";
+import Observability from "./components/Observability.vue";
+import EvalCenter from "./components/EvalCenter.vue";
 import { listSessions, deleteSession } from "./api/index.js";
 
 // 问答是主视图；其他功能是侧边栏工具
@@ -21,6 +23,8 @@ const tools = [
   { key: "review", label: "间隔复习", icon: "🎴", component: Review },
   { key: "rss", label: "RSS 订阅", icon: "📡", component: RssFeeds },
   { key: "dashboard", label: "知识概览", icon: "📊", component: Dashboard },
+  { key: "observability", label: "系统监控", icon: "🩺", component: Observability },
+  { key: "eval", label: "评估中心", icon: "🧪", component: EvalCenter },
 ];
 
 const activeView = ref("ask"); // 默认主页面就是问答

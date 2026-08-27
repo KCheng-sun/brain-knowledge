@@ -15,6 +15,7 @@
 
 import tempfile
 import uuid
+from contextlib import asynccontextmanager
 from pathlib import Path
 
 from fastapi import FastAPI, File, Query, UploadFile
@@ -35,7 +36,20 @@ from brain.storage.vector_store import VectorStore
 # FastAPI 应用
 # ============================================================
 
-app = FastAPI(title="Brain API", version="0.1.0")
+# ============================================================
+# 应用生命周期——lifespan 上下文管理器（替代废弃的 @app.on_event）
+# ============================================================
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """应用生命周期：启动时初始化服务，关闭时可放清理逻辑。"""
+    _init()
+    yield
+    # shutdown：调度器停止等清理可放这里（当前由进程退出回收）
+
+
+app = FastAPI(title="Brain API", version="0.1.0", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -94,12 +108,6 @@ def _init():
             _vector_store.add_fragment(frag["id"], frag["title"], frag["content"])
         except Exception as e:
             logger.warning(f"片段 #{frag['id']} 向量回填失败: {e}")
-
-
-# 启动时预初始化
-@app.on_event("startup")
-def _startup():
-    _init()
 
 
 # ============================================================
@@ -290,11 +298,26 @@ def search_notes(
 @app.post("/api/ask", response_model=AskResponse)
 def ask_question(req: AskRequest):
     """DeepAgents 深度问答（非流式）。"""
+    from brain.observability import MetricsTimer, check_budget, new_trace_id, record_metric
+
     _init()
 
-    agent = ResearcherAgent(_vector_store, _metadata_store)
-    answer = agent.research_sync(req.question)
+    # 预算熔断检查（Phase 5B FR48）
+    budget = check_budget(_metadata_store)
+    if not budget["ok"]:
+        from fastapi import HTTPException
+        raise HTTPException(status_code=429, detail=budget)
 
+    # 生成 trace_id 贯穿本次问答（Phase 5A）
+    trace_id = new_trace_id()
+    agent = ResearcherAgent(_vector_store, _metadata_store)
+    with MetricsTimer(
+        _metadata_store, "ask", "latency_ms",
+        {"question": req.question[:50]}, trace_id=trace_id,
+    ):
+        answer = agent.research_sync(req.question, trace_id=trace_id)
+    # 记录问答计数（与 latency 分开，便于独立统计问答次数）
+    record_metric(_metadata_store, "ask", "count", 1, {"question": req.question[:50]}, trace_id=trace_id)
     return AskResponse(question=req.question, answer=answer)
 
 
@@ -317,6 +340,17 @@ def ask_question_stream(req: AskRequest):
     from fastapi.responses import StreamingResponse
 
     _init()
+
+    # 预算熔断检查（Phase 5B FR48）
+    from brain.observability import check_budget
+    budget = check_budget(_metadata_store)
+    if not budget["ok"]:
+        from fastapi import HTTPException
+        raise HTTPException(status_code=429, detail=budget)
+
+    # 生成 trace_id 贯穿本次问答（Phase 5A 可观测性）
+    from brain.observability import new_trace_id
+    trace_id = new_trace_id()  # noqa: F841 在 event_stream 闭包中使用
 
     agent = ResearcherAgent(_vector_store, _metadata_store)
 
@@ -351,58 +385,93 @@ def ask_question_stream(req: AskRequest):
 
     def event_stream():
         # 收集回答内容和工具轨迹，流结束后落库
+        import time as _time
+
+        from brain.observability import record_metric
+
         answer_parts: list[str] = []
         timeline: list[dict] = []
+        _t0 = _time.perf_counter()
 
-        yield f"data: {json.dumps({'type': 'session', 'session_id': session_id}, ensure_ascii=False)}\n\n"
+        yield f"data: {json.dumps({'type': 'session', 'session_id': session_id, 'trace_id': trace_id}, ensure_ascii=False)}\n\n"
 
-        for event in agent.research_stream(
-            req.question, session_id, history, memory_hits, checkpointer=_checkpointer
-        ):
-            if event["type"] == "token":
-                answer_parts.append(event["content"])
-            elif event["type"] == "interrupt":
-                # HIL 中断：保存已流出的答案，向用户请求决策
-                answer = "".join(answer_parts)
-                if answer:
-                    _metadata_store.add_message(session_id, "assistant", answer, timeline=timeline)
-                    _metadata_store.touch_session(session_id)
-                # 提取提议的知识片段（propose_knowledge 的 args）
-                request = event.get("request") or {}
-                action_requests = request.get("action_requests", [])
-                proposal = None
-                if action_requests:
-                    first = action_requests[0]
-                    proposal = {
-                        "name": first.get("name", ""),
-                        "args": first.get("args", {}),
-                        "description": first.get("description", ""),
-                    }
-                yield f"data: {json.dumps({'type': 'interrupt', 'session_id': session_id, 'proposal': proposal}, ensure_ascii=False)}\n\n"
-                return  # 流结束，等待 /api/ask/resume 恢复
-            elif event["type"] == "tool_start" and event.get("name"):
-                timeline.append(
-                    {"kind": "tool", "name": event["name"], "args": event.get("args", {}), "done": False}
-                )
-            elif event["type"] == "tool_end" and event.get("name"):
-                # 从后往前标记同名工具完成
-                for item in reversed(timeline):
-                    if item["kind"] == "tool" and item["name"] == event["name"] and not item["done"]:
-                        item["done"] = True
-                        break
-            elif event["type"] == "done":
-                # 保存 assistant 消息（同时写入记忆向量）
-                answer = "".join(answer_parts)
-                if answer:
-                    assistant_msg_id = _metadata_store.add_message(
-                        session_id, "assistant", answer, timeline=timeline
+        try:
+            for event in agent.research_stream(
+                req.question, session_id, history, memory_hits,
+                checkpointer=_checkpointer, trace_id=trace_id,
+            ):
+                if event["type"] == "token":
+                    answer_parts.append(event["content"])
+                elif event["type"] == "interrupt":
+                    # HIL 中断：保存已流出的答案，向用户请求决策
+                    answer = "".join(answer_parts)
+                    if answer:
+                        _metadata_store.add_message(session_id, "assistant", answer, timeline=timeline)
+                        _metadata_store.touch_session(session_id)
+                    # 提取全部提议的知识片段（LangGraph 可能一次提议多个，需逐一审批）
+                    request = event.get("request") or {}
+                    action_requests = request.get("action_requests", [])
+                    proposals = [
+                        {
+                            "name": ar.get("name", ""),
+                            "args": ar.get("args", {}),
+                            "description": ar.get("description", ""),
+                        }
+                        for ar in action_requests
+                    ]
+                    yield f"data: {json.dumps({'type': 'interrupt', 'session_id': session_id, 'proposals': proposals}, ensure_ascii=False)}\n\n"
+                    return  # 流结束，等待 /api/ask/resume 恢复
+                elif event["type"] == "tool_start" and event.get("name"):
+                    timeline.append(
+                        {"kind": "tool", "name": event["name"], "args": event.get("args", {}), "done": False}
                     )
-                    _vector_store.add_memory(
-                        assistant_msg_id, session_id, "assistant", answer
+                    # 记录工具调用指标（Phase 5A）
+                    record_metric(
+                        _metadata_store, "tool_call", "count", 1,
+                        {"tool_name": event["name"], "args": str(event.get("args", {}))[:200]},
+                        trace_id=trace_id,
                     )
-                    _metadata_store.touch_session(session_id)
+                elif event["type"] == "tool_end" and event.get("name"):
+                    # 从后往前标记同名工具完成
+                    for item in reversed(timeline):
+                        if item["kind"] == "tool" and item["name"] == event["name"] and not item["done"]:
+                            item["done"] = True
+                            break
+                elif event["type"] == "done":
+                    # 保存 assistant 消息（同时写入记忆向量）
+                    answer = "".join(answer_parts)
+                    if answer:
+                        assistant_msg_id = _metadata_store.add_message(
+                            session_id, "assistant", answer, timeline=timeline
+                        )
+                        _vector_store.add_memory(
+                            assistant_msg_id, session_id, "assistant", answer
+                        )
+                        _metadata_store.touch_session(session_id)
+                    # 记录问答 latency 和计数（Phase 5A）
+                    elapsed_ms = round((_time.perf_counter() - _t0) * 1000, 1)
+                    record_metric(_metadata_store, "ask", "latency_ms", elapsed_ms,
+                                  {"question": req.question[:50], "status": "done"},
+                                  trace_id=trace_id)
+                    record_metric(_metadata_store, "ask", "count", 1,
+                                  {"question": req.question[:50]},
+                                  trace_id=trace_id)
 
-            yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
+                yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
+        except Exception as e:
+            # 问答异常：自动收集 bad case（Phase 5D FR54）
+            from brain.eval.collector import collect_bad_case
+            reason = "recursion_limit" if "recursion" in str(e).lower() else "error"
+            collect_bad_case(
+                _metadata_store,
+                trace_id=trace_id, question=req.question,
+                answer="".join(answer_parts), reason=reason,
+                extra={"error": str(e)[:200]},
+            )
+            yield f"data: {json.dumps({'type': 'error', 'message': f'问答失败: {e}'}, ensure_ascii=False)}\n\n"
+
+        # 流正常结束时清理 trace_id 上下文
+        # （trace_id 为闭包变量，随生成器回收自动消失，无需 reset）
 
     return StreamingResponse(
         event_stream(),
@@ -439,20 +508,35 @@ def ask_question_resume(req: ResumeRequest):
 
     agent = ResearcherAgent(_vector_store, _metadata_store)
 
+    # HIL 恢复也生成新 trace_id（Phase 5A）
+    from brain.observability import new_trace_id
+    resume_trace_id = new_trace_id()
+
     def resume_stream():
+        import time as _time
+
+        from brain.observability import record_metric
+
         answer_parts: list[str] = []
         timeline: list[dict] = []
+        _t0 = _time.perf_counter()
 
         for event in agent.resume_stream(
             req.session_id,
             {"decisions": req.decisions},
             checkpointer=_checkpointer,
+            trace_id=resume_trace_id,
         ):
             if event["type"] == "token":
                 answer_parts.append(event["content"])
             elif event["type"] == "tool_start" and event.get("name"):
                 timeline.append(
                     {"kind": "tool", "name": event["name"], "args": event.get("args", {}), "done": False}
+                )
+                record_metric(
+                    _metadata_store, "tool_call", "count", 1,
+                    {"tool_name": event["name"], "args": str(event.get("args", {}))[:200]},
+                    trace_id=resume_trace_id,
                 )
             elif event["type"] == "tool_end" and event.get("name"):
                 for item in reversed(timeline):
@@ -469,8 +553,14 @@ def ask_question_resume(req: ResumeRequest):
                         assistant_msg_id, req.session_id, "assistant", answer
                     )
                     _metadata_store.touch_session(req.session_id)
+                elapsed_ms = round((_time.perf_counter() - _t0) * 1000, 1)
+                record_metric(_metadata_store, "ask", "latency_ms", elapsed_ms,
+                              {"session_id": req.session_id, "status": "resumed"},
+                              trace_id=resume_trace_id)
 
             yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
+
+        # （resume_trace_id 为闭包变量，随生成器回收自动消失，无需 reset）
 
     return StreamingResponse(
         resume_stream(),
@@ -795,6 +885,341 @@ def knowledge_graph():
     return {"nodes": nodes, "edges": edges}
 
 
+# ============================================================
+# 可观测性 API（Phase 5A）
+# ============================================================
+
+
+@app.get("/api/health")
+def get_health():
+    """健康检查——探测 LLM/Embedding/SQLite/ChromaDB 连通性。
+
+    LLM 探测默认跳过（避免烧配额），仅 dry_run 时真调。
+    Embedding 探测用空字符串，不消耗有意义配额。
+    """
+    from brain.observability import check_health
+
+    _init()
+    # embedding_fn 懒加载传入（避免在 health 检查外初始化）
+    try:
+        embedding_fn = get_embedding_fn()
+    except Exception:
+        embedding_fn = None
+    return check_health(_metadata_store, _vector_store, embedding_fn)
+
+
+@app.get("/api/metrics/summary")
+def get_metrics_summary(hours: int = Query(24, ge=1, le=168, description="统计时间窗口（小时）")):
+    """指标汇总（看板用）。"""
+    _init()
+    return _metadata_store.get_metrics_summary(hours=hours)
+
+
+@app.get("/api/metrics/traces")
+def get_recent_traces(limit: int = Query(20, ge=1, le=100)):
+    """最近问答调用链列表。"""
+    _init()
+    return _metadata_store.get_recent_traces(limit=limit)
+
+
+# ============================================================
+# 成本治理 API（Phase 5B FR49）
+# ============================================================
+
+
+@app.get("/api/cost/summary")
+def get_cost_summary():
+    """成本汇总（今日/本月/总累计 + 配额用量）。"""
+    _init()
+    from brain.observability import check_budget
+
+    summary = _metadata_store.get_cost_summary()
+    budget = check_budget(_metadata_store)
+    return {**summary, "budget": budget}
+
+
+@app.get("/api/cost/by-model")
+def get_cost_by_model(hours: int = Query(24, ge=1, le=720)):
+    """按模型聚合成本。"""
+    _init()
+    return _metadata_store.get_cost_by_model(hours=hours)
+
+
+@app.get("/api/cost/by-day")
+def get_cost_by_day(days: int = Query(30, ge=1, le=365)):
+    """按日聚合成本趋势。"""
+    _init()
+    return _metadata_store.get_cost_by_day(days=days)
+
+
+# ============================================================
+# 评估反馈 API（Phase 5D FR54）
+# ============================================================
+
+
+class EvalFeedbackRequest(BaseModel):
+    trace_id: str | None = Field(None, description="问答的 trace_id（便于回溯）")
+    question: str = Field(..., description="用户问题")
+    answer: str = Field(..., description="Agent 回答")
+    reason: str = Field("user_thumbs_down", description="点踩原因")
+
+
+@app.post("/api/eval/feedback")
+def submit_eval_feedback(req: EvalFeedbackRequest):
+    """用户点踩 bad case → 收集到数据库。"""
+    from brain.eval.collector import collect_bad_case
+
+    _init()
+    collect_bad_case(
+        _metadata_store,
+        trace_id=req.trace_id,
+        question=req.question,
+        answer=req.answer,
+        reason=req.reason,
+    )
+    return {"message": "已收集，感谢反馈"}
+
+
+@app.get("/api/eval/scores")
+def get_eval_scores(limit: int = Query(50, ge=1, le=200)):
+    """获取最近的 LLM-as-Judge 打分。"""
+    _init()
+    return _metadata_store.get_eval_scores(limit=limit)
+
+
+@app.get("/api/eval/scores/summary")
+def get_eval_score_summary():
+    """评估打分汇总（平均分/分布）。"""
+    _init()
+    return _metadata_store.get_eval_score_summary()
+
+
+@app.get("/api/eval/bad-cases")
+def get_bad_cases():
+    """查看已收集的 bad cases。"""
+    _init()
+    return _metadata_store.get_bad_cases()
+
+
+@app.delete("/api/eval/bad-cases/{case_id}")
+def delete_bad_case(case_id: int):
+    """删除一条 bad case。"""
+    from fastapi import HTTPException
+
+    _init()
+    if _metadata_store.delete_bad_case(case_id):
+        return {"message": "已删除"}
+    raise HTTPException(status_code=404, detail="bad case 不存在")
+
+
+@app.post("/api/eval/bad-cases/{case_id}/to-golden")
+def bad_case_to_golden(case_id: int, min_score: float = Query(0.7, ge=0, le=1.0)):
+    """将 bad case 转为 golden case（需人工补充关键词后可启用）。"""
+    from fastapi import HTTPException
+
+    _init()
+    cases = _metadata_store.get_bad_cases(limit=1000)
+    target = next((c for c in cases if c["id"] == case_id), None)
+    if not target:
+        raise HTTPException(status_code=404, detail="bad case 不存在")
+
+    # 生成 case_id：bc_<id>
+    new_id = f"bc_{case_id}"
+    _metadata_store.add_golden_case(
+        case_id=new_id,
+        question=target["question"],
+        expected_keywords=[],  # 待人工补充
+        expected_sources=[],
+        min_score=min_score,
+        enabled=False,  # 默认禁用，补充关键词后手动启用
+    )
+    return {"message": f"已转为 golden case（id={new_id}），请补充关键词后启用", "golden_id": new_id}
+
+
+# ---- Golden Cases CRUD（Phase 5D FR53） ----
+
+
+@app.get("/api/eval/golden-cases")
+def get_golden_cases(enabled_only: bool = Query(False)):
+    """获取 golden cases 列表。"""
+    _init()
+    return _metadata_store.get_golden_cases(enabled_only=enabled_only)
+
+
+class GoldenCaseRequest(BaseModel):
+    id: str = Field(..., description="用例 ID，如 eval_001")
+    question: str = Field(..., description="问题")
+    expected_keywords: list[str] = Field(default_factory=list, description="期望关键词")
+    expected_sources: list[str] = Field(default_factory=list, description="期望引用笔记 id")
+    min_score: float = Field(0.7, ge=0, le=1.0, description="及格分")
+    enabled: bool = Field(True, description="是否启用")
+
+
+@app.post("/api/eval/golden-cases")
+def create_golden_case(req: GoldenCaseRequest):
+    """新增/更新 golden case（id 相同则覆盖）。"""
+    _init()
+    _metadata_store.add_golden_case(
+        case_id=req.id,
+        question=req.question,
+        expected_keywords=req.expected_keywords,
+        expected_sources=req.expected_sources,
+        min_score=req.min_score,
+        enabled=req.enabled,
+    )
+    return {"message": "已保存", "id": req.id}
+
+
+@app.patch("/api/eval/golden-cases/{case_id}")
+def update_golden_case(case_id: str, req: GoldenCaseRequest):
+    """更新 golden case。"""
+    _init()
+    _metadata_store.update_golden_case(
+        case_id,
+        question=req.question,
+        expected_keywords=req.expected_keywords,
+        expected_sources=req.expected_sources,
+        min_score=req.min_score,
+        enabled=req.enabled,
+    )
+    return {"message": "已更新"}
+
+
+@app.delete("/api/eval/golden-cases/{case_id}")
+def delete_golden_case(case_id: str):
+    """删除 golden case。"""
+    from fastapi import HTTPException
+
+    _init()
+    if _metadata_store.delete_golden_case(case_id):
+        return {"message": "已删除"}
+    raise HTTPException(status_code=404, detail="golden case 不存在")
+
+
+@app.post("/api/eval/golden-cases/{case_id}/toggle")
+def toggle_golden_case(case_id: str):
+    """启用/禁用 golden case。"""
+    from fastapi import HTTPException
+
+    _init()
+    cases = _metadata_store.get_golden_cases()
+    target = next((c for c in cases if c["id"] == case_id), None)
+    if not target:
+        raise HTTPException(status_code=404, detail="golden case 不存在")
+    _metadata_store.update_golden_case(case_id, enabled=not target["enabled"])
+    return {"message": "已切换", "enabled": not target["enabled"]}
+
+
+@app.post("/api/eval/seed")
+def seed_golden_cases():
+    """从 YAML 种子文件导入 golden cases 到数据库。"""
+    _init()
+    from brain.eval.runner import seed_golden_dataset
+
+    count = seed_golden_dataset(_metadata_store)
+    return {"message": f"已导入 {count} 条", "count": count}
+
+
+@app.get("/api/eval/runs")
+def get_eval_runs(
+    limit: int = Query(20, ge=1, le=100),
+    run_type: str | None = Query(None, description="offline | judge，空=全部"),
+):
+    """获取评估批次历史（Phase 5D）。"""
+    _init()
+    return _metadata_store.get_eval_runs(limit=limit, run_type=run_type)
+
+
+@app.post("/api/eval/judge")
+def run_judge_sample(sample_rate: float = Query(0.1, ge=0.01, le=1.0), limit: int = Query(10, ge=1, le=50)):
+    """手动触发 LLM-as-Judge 抽样打分（Phase 5D FR55）。"""
+    _init()
+    from brain.eval.judge import LLMJudge
+
+    judge = LLMJudge(_metadata_store)
+    results = judge.judge_recent_traces(sample_rate=sample_rate, limit=limit)
+    return {"judged": len(results), "results": results}
+
+
+@app.post("/api/eval/run")
+def run_eval_dataset(limit: int = Query(0, ge=0, le=50, description="只跑前 N 条，0=全部")):
+    """手动触发离线评估测试集（Phase 5D FR53）。
+
+    跑 Golden Dataset，返回打分报告。注意：会真实调用 LLM，消耗 token。
+    """
+    _init()
+    from brain.eval.runner import EvalRunner
+
+    runner = EvalRunner(_vector_store, _metadata_store)
+    actual_limit = limit if limit > 0 else None
+    report = runner.run(limit=actual_limit)  # None=从数据库加载
+
+    # 持久化评估批次到 eval_runs（Phase 5D）——存完整结果供历史查看
+    all_results = [
+        {
+            "id": r.case.id,
+            "question": r.case.question[:60],
+            "answer": r.answer[:200],
+            "score": r.score,
+            "passed": r.passed,
+            "min_score": r.case.min_score,
+            "details": r.details,
+            "trace_id": r.trace_id,
+            "error": r.error,
+        }
+        for r in report.results
+    ]
+    _metadata_store.add_eval_run(
+        run_type="offline",
+        total=report.total,
+        passed=report.passed,
+        pass_rate=round(report.pass_rate, 4),
+        avg_score=round(report.avg_score, 4),
+        duration_ms=round(report.duration_ms, 0),
+        details={"results": all_results},
+    )
+
+    # 序列化报告（dataclass → dict）
+    return {
+        "total": report.total,
+        "passed": report.passed,
+        "failed": report.failed,
+        "pass_rate": round(report.pass_rate, 4),
+        "avg_score": round(report.avg_score, 4),
+        "duration_ms": round(report.duration_ms, 0),
+        "started_at": report.started_at,
+        "results": [
+            {
+                "id": r.case.id,
+                "question": r.case.question,
+                "answer": r.answer,
+                "score": r.score,
+                "passed": r.passed,
+                "min_score": r.case.min_score,
+                "details": r.details,
+                "trace_id": r.trace_id,
+                "error": r.error,
+            }
+            for r in report.results
+        ],
+    }
+
+
+@app.get("/api/metrics/traces/{trace_id}")
+def get_trace_detail(trace_id: str):
+    """某条 trace 的完整调用链。
+
+    返回两个部分：
+      - events: trace_events 表的完整调用日志（LLM 请求响应、工具入参出参）
+      - metrics: metrics 表的数值指标（latency/token/count）
+    """
+    _init()
+    return {
+        "events": _metadata_store.get_trace_events(trace_id),
+        "metrics": _metadata_store.get_trace_detail(trace_id),
+    }
+
+
 @app.get("/api/status", response_model=StatusResponse)
 def get_status():
     """知识库统计概览。
@@ -903,6 +1328,12 @@ def record_review(req: ReviewRecordRequest):
 # ============================================================
 
 _frontend_dist = Path(__file__).resolve().parent.parent.parent / "frontend" / "dist"
+
+# 挂载静态资源目录（JS/CSS 等），否则 /assets/*.js 返回 404
+_assets_dir = _frontend_dist / "assets"
+if _assets_dir.exists():
+    from fastapi.staticfiles import StaticFiles
+    app.mount("/assets", StaticFiles(directory=str(_assets_dir)), name="assets")
 
 
 @app.get("/")

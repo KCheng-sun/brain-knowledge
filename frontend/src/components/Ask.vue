@@ -1,6 +1,6 @@
 <script setup>
 import { ref, reactive, nextTick, watch, onMounted, inject } from "vue";
-import { getSessionMessages } from "../api/index.js";
+import { getSessionMessages, submitEvalFeedback } from "../api/index.js";
 
 // 跨页跳转：点击答案中的 [笔记引用] 跳搜索页
 const jumpToSearch = inject("jumpToSearch", null);
@@ -31,6 +31,22 @@ watch(
   },
   { immediate: true }
 );
+
+async function thumbsDown(msg) {
+  if (msg.thumbsDown) return;
+  msg.thumbsDown = true;
+  try {
+    await submitEvalFeedback(
+      msg.traceId || null,
+      msg.question || "",
+      msg.content || "",
+      "user_thumbs_down"
+    );
+  } catch (e) {
+    console.error("反馈失败", e);
+    msg.thumbsDown = false;
+  }
+}
 
 function renderMarkdown(text) {
   if (!text) return "";
@@ -76,17 +92,26 @@ async function loadHistory(sessionId) {
   }
   try {
     const data = await getSessionMessages(sessionId);
-    messages.value = data.messages.map((m) => ({
-      role: m.role,
-      content: m.content,
-      // 历史消息的 timeline 里 args 是对象，格式化为字符串以便模板显示
-      timeline: (m.timeline || []).map((item) => ({
-        ...item,
-        args: item.kind === "tool" && item.args && typeof item.args === "object"
-          ? formatArgs(item.args)
-          : item.args,
-      })),
-    }));
+    // 历史消息：给 assistant 消息关联前一条 user 消息的内容作为 question（点踩反馈用）
+    const msgs = data.messages;
+    messages.value = msgs.map((m, i) => {
+      const msg = {
+        role: m.role,
+        content: m.content,
+        // 历史消息的 timeline 里 args 是对象，格式化为字符串以便模板显示
+        timeline: (m.timeline || []).map((item) => ({
+          ...item,
+          args: item.kind === "tool" && item.args && typeof item.args === "object"
+            ? formatArgs(item.args)
+            : item.args,
+        })),
+      };
+      // assistant 消息的 question = 前一条 user 消息
+      if (m.role === "assistant" && i > 0 && msgs[i - 1].role === "user") {
+        msg.question = msgs[i - 1].content;
+      }
+      return msg;
+    });
     scrollToBottom();
   } catch (e) {
     console.error("加载历史失败", e);
@@ -121,6 +146,7 @@ async function send() {
     content: "",
     timeline: [], // 统一时间线: [{kind: 'thought'|'tool', ...}] 按发生顺序
     status: "",
+    question: q, // 保存对应问题（点踩反馈用）
   });
   messages.value.push(assistantMsg);
   scrollToBottom();
@@ -159,7 +185,25 @@ async function readStream(url, body, assistantMsg) {
     cache: "no-store",
   });
 
-  if (!response.ok) throw new Error(`HTTP ${response.status}`);
+  if (!response.ok) {
+    // 429 预算超限：提取后端返回的 detail 显示友好提示
+    if (response.status === 429) {
+      try {
+        const detail = await response.json();
+        const reason = detail?.detail?.reason || detail?.reason || "配额已用尽";
+        const today = detail?.detail?.today || detail?.today || {};
+        const limits = detail?.detail?.limits || detail?.limits || {};
+        throw new Error(
+          `⛔ ${reason}\n\n今日用量：${today.tokens || 0} token / ¥${(today.cost || 0).toFixed(4)}\n` +
+          `配额上限：日 ${limits.daily_token || "-"} token / ¥${limits.daily_cost || "-"}`
+        );
+      } catch (parseErr) {
+        if (parseErr.message.startsWith("⛔")) throw parseErr;
+        throw new Error("⛔ 配额已用尽，请明天再试或调整 BRAIN_COST_* 配置");
+      }
+    }
+    throw new Error(`HTTP ${response.status}`);
+  }
 
   const reader = response.body.getReader();
   const decoder = new TextDecoder();
@@ -196,29 +240,48 @@ async function readStream(url, body, assistantMsg) {
 function waitForDecision(interruptInfo, assistantMsg) {
   return new Promise((resolve) => {
     const sessionId = interruptInfo.session_id;
-    const proposal = interruptInfo.proposal || {};
-    const args = proposal.args || {};
+    const proposals = interruptInfo.proposals || [];
 
-    // 在时间线末尾添加一个待确认的片段卡片
-    assistantMsg.timeline.push({
-      kind: "proposal",
-      title: args.title || "知识片段",
-      content: args.content || "",
-      decided: false,
+    // 为每个提议的知识片段添加一张待确认卡片（多张可逐一审批）
+    const proposalItems = proposals.map((p) => {
+      const args = p.args || {};
+      return {
+        kind: "proposal",
+        title: args.title || "知识片段",
+        content: args.content || "",
+        decided: false,
+        decision: null,
+      };
     });
-    // 保存决策回调供模板按钮调用
+    assistantMsg.timeline.push(...proposalItems);
+
+    // 保存决策回调供模板按钮调用（每点一个按钮记录一条决策，全部决策完才恢复）
     assistantMsg._decide = async (decision) => {
-      // 标记已决策，更新卡片状态
+      // 找到第一个未决策的卡片并标记
       const item = assistantMsg.timeline.find((t) => t.kind === "proposal" && !t.decided);
       if (item) {
         item.decided = true;
         item.decision = decision.type;
       }
 
+      // 还有未决策的卡片 → 等用户继续点按钮
+      const pending = assistantMsg.timeline.filter((t) => t.kind === "proposal" && !t.decided);
+      if (pending.length > 0) return;
+
+      // 全部决策完成，按顺序收集 decisions 发给后端恢复
+      const decisions = assistantMsg.timeline
+        .filter((t) => t.kind === "proposal")
+        .map((t) => {
+          if (t.decision === "approve") return { type: "approve" };
+          if (t.decision === "reject") return { type: "reject", message: "用户拒绝" };
+          // edit 暂不支持，按 approve 处理
+          return { type: "approve" };
+        });
+
       try {
         await readStream(
           "http://127.0.0.1:7860/api/ask/resume",
-          { session_id: sessionId, decisions: [decision] },
+          { session_id: sessionId, decisions },
           assistantMsg,
         );
       } catch (e) {
@@ -240,6 +303,10 @@ function handleEvent(event, assistantMsg) {
         if (isNew) {
           emit("session-created", event.session_id);
         }
+      }
+      // 存储 trace_id 供点踩反馈用（Phase 5D）
+      if (event.trace_id) {
+        assistantMsg.traceId = event.trace_id;
       }
       break;
     }
@@ -294,7 +361,7 @@ function handleEvent(event, assistantMsg) {
 
     case "interrupt":
       // HIL 中断：返回中断信息，由外层 waitForDecision 处理
-      return { session_id: event.session_id, proposal: event.proposal };
+      return { session_id: event.session_id, proposals: event.proposals || [] };
 
     case "done":
       // 回答完成，通知父组件刷新会话列表（标题/时间已更新）
@@ -405,6 +472,17 @@ function formatArgs(args) {
             class="answer-text"
             v-html="renderMarkdown(m.content)"
           ></div>
+
+          <!-- 点踩按钮（Phase 5D FR54 bad case 回流） -->
+          <div v-if="m.content && m.role === 'assistant'" class="message-actions">
+            <button
+              v-if="!m.thumbsDown"
+              class="feedback-btn"
+              @click="thumbsDown(m)"
+              title="这个回答不好，反馈给开发"
+            >👎</button>
+            <span v-else class="feedback-done">已反馈 ✓</span>
+          </div>
 
           <!-- 思考中 -->
           <div
@@ -724,6 +802,32 @@ function formatArgs(args) {
   font-size: 15px;
   line-height: 1.75;
   color: var(--text-main);
+}
+
+/* 点踩反馈按钮 */
+.message-actions {
+  margin-top: 6px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.feedback-btn {
+  background: none;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 2px 8px;
+  font-size: 14px;
+  cursor: pointer;
+  opacity: 0.5;
+  transition: opacity 0.15s;
+}
+.feedback-btn:hover {
+  opacity: 1;
+  border-color: var(--danger);
+}
+.feedback-done {
+  font-size: 12px;
+  color: var(--text-faint);
 }
 
 .answer-text :deep(strong) {

@@ -213,4 +213,26 @@ def build_default_scheduler(pipeline, metadata_store, vector_store) -> TaskSched
         )
     )
 
+    # Phase 5D FR55：每周 LLM-as-Judge 抽样评估
+    def _weekly_eval() -> str:
+        from brain.eval.judge import LLMJudge
+
+        judge = LLMJudge(metadata_store)
+        results = judge.judge_recent_traces(sample_rate=0.1, limit=10)
+        if not results:
+            return "无可用 trace，跳过评估"
+        avg = sum(r.get("score", 0) for r in results) / len(results)
+        return f"已评估 {len(results)} 条，平均分 {avg:.1f}/5"
+
+    scheduler.add_task(
+        ScheduledTask(
+            name="weekly_eval",
+            interval_minutes=7 * 24 * 60,
+            run_at_hour=10,
+            run_at_weekday=0,  # 周一 10:00
+            func=_weekly_eval,
+            description="每周 LLM-as-Judge 抽样（周一 10:00）",
+        )
+    )
+
     return scheduler

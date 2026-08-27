@@ -1,8 +1,8 @@
 # 个人知识管家（第二大脑）— 需求文档
 
-> 版本: v0.3.0
-> 最后更新: 2024-08-12
-> 状态: Phase 2 完成，Phase 3 进行中
+> 版本: v0.5.0
+> 最后更新: 2024-08-13
+> 状态: Phase 1-3 已完成，Phase 4/5 进行中
 
 ---
 
@@ -85,42 +85,150 @@
 | — | 关联查看 | `brain connections` 查看笔记之间的 AI 关联图谱 | ✅ |
 | — | 状态增强 | `brain status` 显示标签数、关联数、热门标签排行 | ✅ |
 
-### Phase 3 — 主动服务（当前进行中）
+### Phase 3 — 主动服务 + Web UI + 会话记忆 ✅（已完成）
 
-| FR# | 功能 | 描述 |
-|-----|------|------|
-| FR11 | 每日摘要 | `brain digest` — LLM 基于昨日摄入生成结构化知识简报 |
-| FR12 | 每周趋势 | `brain digest --weekly` — 本周知识主题分布和趋势分析 |
-| FR13 | 复习提醒 | `brain review` — 列出太久没回顾的笔记，建议重温 |
-| FR14 | 知识问答增强 | 问答结果中展示相关标签和关联，丰富上下文 |
-| FR15 | Web UI | FastAPI + Vue3 前后端分离界面，问答为主页 |
-| FR16 | 流式问答 | SSE 流式输出：思考片段 + 工具调用轨迹 + 答案逐字输出 |
-| FR17 | 会话管理 | 多会话支持：会话列表、历史消息持久化（SQLite）、可切换/删除 |
-| FR18 | 多层记忆 | 工作记忆（最近10轮）+ 检索记忆（历史消息向量化按需取回） |
-| FR19 | 知识沉淀（HIL） | 子智能体提取知识片段 → 用户确认后保存；不静默污染笔记库 |
-| FR20 | 知识片段闭环 | 前端片段浏览页（查看/删除）；问答搜索同时检索片段 |
-| FR21 | 文件监听 | `brain watch` 监听目录自动摄入，前端显示监听状态 |
-| FR22 | RSS 订阅 | 配置 RSS 源，定时拉取文章自动摄入 |
-| FR23 | 测试补齐 | 存储/API/HIL 链路测试，防回归 |
-| FR24 | 定时任务调度 | RSS 自动拉取（每60分钟）、每日摘要（08:00）、每周趋势（周一）自动生成并持久化 |
-| FR25 | 知识图谱可视化 | 笔记-关联交互式图谱：节点大小=关联数，点击高亮邻居，边色=关联类型 |
-| FR26 | 知识片段向量化 | 片段写入 ChromaDB 独立 collection，search_fragments 改语义检索 |
-| FR27 | 同会话记忆加权 | 检索记忆时同会话旧消息权重提升，保住超窗口对话连续性 |
-| FR28 | SM-2 间隔重复 | 复习卡片 + 四档评分（忘记/困难/良好/简单）+ SM-2 算法调度 |
-| FR29 | 工程化 | GitHub Actions CI、loguru 日志文件持久化、性能回归测试、README 重写 |
+| FR# | 功能 | 描述 | 状态 |
+|-----|------|------|------|
+| FR11 | 每日摘要 | `brain digest` — LLM 基于昨日摄入生成结构化知识简报 | ✅ |
+| FR12 | 每周趋势 | `brain digest --weekly` — 本周知识主题分布和趋势分析 | ✅ |
+| FR13 | 复习提醒 | `brain review` — SM-2 算法复习卡片调度（演进自简单衰减） | ✅ |
+| FR14 | 知识问答增强 | 问答结果中展示相关标签和关联，丰富上下文 | ✅ |
+| FR15 | Web UI | FastAPI + Vue3 前后端分离界面，问答为主页 | ✅ |
+| FR16 | 流式问答 | SSE 流式输出：思考片段 + 工具调用轨迹 + 答案逐字输出 | ✅ |
+| FR17 | 会话管理 | 多会话支持：会话列表、历史消息持久化（SQLite）、可切换/删除 | ✅ |
+| FR18 | 多层记忆 | 工作记忆（最近10轮）+ 检索记忆（历史消息向量化按需取回） | ✅ |
+| FR19 | 知识沉淀（HIL） | 子智能体提取知识片段 → 用户确认后保存；不静默污染笔记库 | ✅ |
+| FR20 | 知识片段闭环 | 前端片段浏览页（查看/删除）；问答搜索同时检索片段 | ✅ |
+| FR21 | 文件监听 | `brain watch` 监听目录自动摄入，前端显示监听状态 | ✅ |
+| FR22 | RSS 订阅 | 配置 RSS 源，定时拉取文章自动摄入 | ✅ |
+| FR23 | 测试补齐 | 存储/API/HIL 链路测试，防回归 | ✅ |
+| FR24 | 定时任务调度 | RSS 自动拉取（每60分钟）、每日摘要（08:00）、每周趋势（周一）自动生成并持久化 | ✅ |
+| FR25 | 知识图谱可视化 | 笔记-关联交互式图谱：节点大小=关联数，点击高亮邻居，边色=关联类型 | ✅ |
+| FR26 | 知识片段向量化 | 片段写入 ChromaDB 独立 collection，search_fragments 改语义检索 | ✅ |
+| FR27 | 同会话记忆加权 | 检索记忆时同会话旧消息权重提升，保住超窗口对话连续性 | ✅ |
+| FR28 | SM-2 间隔重复 | 复习卡片 + 四档评分（忘记/困难/良好/简单）+ SM-2 算法调度 | ✅ |
+| FR29 | 工程化 | GitHub Actions CI、loguru 日志文件持久化、性能回归测试、README 重写 | ✅ |
 
-**Phase 3 技术要点：**
-- 新增 `brain/services/` 层：DigestService + ReviewService
-- 摘要生成：收集昨日笔记→按主题分组→LLM 合成（LangChain PromptTemplate）
-- 每周趋势：统计本周标签分布→向量聚类→LLM 解读趋势
-- 复习提醒：基于摄入时间的简单衰减算法（先不做 SM-2）
+**Phase 3 实现要点：**
+- 新增 `brain/services/` 层：DigestService + ReviewService + TaskScheduler
+- 摘要生成：收集昨日笔记→LLM 合成；每周趋势：标签分布统计→LLM 解读
+- 复习调度从简单衰减演进为完整 SM-2 算法（ease_factor / interval / due_date）
+- 三层记忆 + DeepAgents `interrupt_on` 实现 HIL 知识沉淀
 
-| FR# | 功能 | 描述 |
-|-----|------|------|
-| FR10 | 每日摘要 | 生成昨日摄入内容的摘要，包含新关联和回顾建议 |
-| FR11 | 每周趋势 | 分析本周知识积累的主题分布和趋势 |
-| FR12 | 间隔重复 | 基于艾宾浩斯遗忘曲线的复习提醒 |
-| FR13 | 定时任务 | 可配置的定时任务（摘要、关联扫描、复习提醒） |
+---
+
+### Phase 4 — 需求补全与工程加固（当前进行中）
+
+> 目标：补齐需求文档中标 P1 但未实现的功能（书签导入/标签浏览/笔记编辑），
+> 消除 Phase 3 遗留的技术债（N+1 查询/废弃 API），并补强数据可移植性。
+> 拆为 4A（文档与质量加固）/ 4B（P1 功能闭环）/ 4C（实用性增强）三个子阶段。
+
+#### Phase 4A — 文档对齐与质量加固 ✅（已完成）
+
+| FR# | 功能 | 描述 | 优先级 |
+|-----|------|------|--------|
+| FR30 | 文档同步 | requirements/design/CLAUDE.md 对齐 Phase 1-3 已完成状态，清理重复冲突内容 | P0 ✅ |
+| FR31 | CLI 性能修复 | `brain status`/`connections` 改用已有批量查询方法，消除 N+1 全表遍历 | P0 ✅ |
+| FR32 | API lifespan 迁移 | FastAPI `@app.on_event` 废弃装饰器改 `lifespan` 上下文管理器 | P0 ✅ |
+| FR33 | 测试提速 | `bulk_client` fixture 改 module 级复用，500 条笔记只摄入一次（92s→16s） | P1 ✅ |
+
+#### Phase 4B — P1 功能闭环
+
+| FR# | 功能 | 描述 | 优先级 |
+|-----|------|------|--------|
+| FR34 | 书签导入 | 解析 Chrome/Firefox 书签 JSON 导出，作为 `bookmark` 类型笔记摄入；CLI `brain bookmarks <path>` + API `/api/bookmarks/import` | P1 |
+| FR35 | 标签浏览 | CLI `brain tags` 列出标签计数排行；API `/api/tags`；前端标签云浏览页 | P1 |
+| FR36 | 笔记编辑 | 暴露已有 `update_note`：CLI `brain edit <id>`；API `PATCH /api/notes/{id}`；新增编辑标签/删除关联 | P2 |
+| FR37 | 多跳推理增强 | ResearcherAgent 显式子问题分解环节（现多次搜索但非显式分解→综合） | P2 |
+
+#### Phase 4C — 实用性增强
+
+| FR# | 功能 | 描述 | 优先级 |
+|-----|------|------|--------|
+| FR38 | 数据导出/导入 | `brain export` 导出全部笔记为 Markdown 包；`brain import` 恢复，满足本地优先可移植性 | P2 |
+| FR39 | Embedding 迁移工具 | `brain reindex --model <name>` 全量重算向量，支持换模型不丢数据 | P2 |
+| FR40 | 主动复习提醒 | 调度器加超期复习提醒任务，每日摘要附加待复习条目 | P2 |
+| FR41 | 测试补齐 | 书签源/编辑链路/导出导入的集成测试 | P1 |
+
+**Phase 4 设计约束：**
+- 不引入新框架，全部基于现有 LangGraph + DeepAgents + ChromaDB + SQLite 扩展
+- 书签源遵循 `SourceProtocol`，与 RSS 源结构对齐
+- 数据导出格式以 Markdown 为主，附带 metadata.json 保留标签/关联，便于跨实例迁移
+
+---
+
+### Phase 5 — 生产化加固（当前进行中）
+
+> 目标：从「能跑」到「可维护」。补足上线后的可观测性、成本治理、容灾、评估能力。
+> 面向本地优先单用户场景裁剪生产级 Agent 要点，不引入 K8s/Redis/Kafka 等重型基础设施。
+> 拆为 5A（可观测性）/ 5B（成本治理）/ 5C（容灾备份）/ 5D（评估闭环）/ 5E（提示词外部化）/ 5F（RAG 增强）。
+
+#### Phase 5A — 可观测性基础
+
+| FR# | 功能 | 描述 | 优先级 |
+|-----|------|------|--------|
+| FR42 | 全链路 Trace ID | 每次问答生成 trace_id，贯穿 LLM/工具调用/日志，写入 messages 表 | P0 ✅ |
+| FR43 | 结构化 JSON 日志 | loguru 增加 JSON sink，带 trace_id/agent/tool 字段，便于过滤检索 | P0 ✅ |
+| FR44 | 核心指标采集 | 问答延迟/工具调用次数/Token 消耗/摄入耗时写入 metrics 表；CLI `brain metrics` | P0 ✅ |
+| FR45 | 健康检查 | `/api/health` 探测 LLM/Embedding/SQLite/ChromaDB 连通性 | P0 ✅ |
+| FR46 | 可观测性页面 | 前端 Observability 页：健康状态灯 + 指标看板 + 最近调用链 | P0 ✅ |
+
+#### Phase 5B — 成本治理（当前进行中）
+
+> 衔接 5A：5A 的 trace_events 已记录每次 LLM 调用的 token_usage（prompt/completion/total），
+> 5B 在此基础上加价格表换算成本 + 配额熔断 + 成本报表，是最低成本增量。
+
+| FR# | 功能 | 描述 | 优先级 | 状态 |
+|-----|------|------|--------|------|
+| FR47 | Token 实时计费 | 内置模型价格表（¥/1M token），trace_events 的 llm_end 事件同时记录成本；CLI/API 可查 | P1 | ✅ |
+| FR48 | 预算配额与熔断 | 日/月 Token 配额（config 可配，默认日 50万/月 500万）；超限拒绝新问答；ResearcherAgent 加 recursion_limit 硬上限防死循环 | P1 | ✅ |
+| FR49 | 成本报表 | `brain cost` 按模型/会话/日期统计；API `/api/cost`；前端 Observability 页加成本看板 | P1 | ✅ |
+
+#### Phase 5C — 容灾与备份
+
+| FR# | 功能 | 描述 | 优先级 |
+|-----|------|------|--------|
+| FR50 | 数据备份/恢复 | `brain backup` 导出 SQLite+ChromaDB+checkpoints 到 ZIP；`brain restore` 恢复 | P1 |
+| FR51 | LLM 调用容灾 | 指数退避重试 + fallback 模型配置 | P2 |
+| FR52 | 记忆/片段清理 | 知识片段和会话历史 TTL 清理（调度器加任务） | P2 |
+
+#### Phase 5D — 评估闭环（当前进行中）
+
+> 为非确定性 LLM 输出装上「回归测试」：改 prompt/换模型后能量化质量变化，
+> bad case 持续沉淀成测试集，LLM-as-Judge 提供主观质量趋势。
+> 本地优先：测试集存 YAML，评分用规则+LLM，不引入重框架。
+
+| FR# | 功能 | 描述 | 优先级 | 状态 |
+|-----|------|------|--------|------|
+| FR53 | 离线评估测试集 | Golden Dataset 存 YAML；`brain eval` 批量问答打分（关键词命中+来源正确性+完整性）；报告总体通过率/失败详情；CI 可接入 | P1 | ✅ |
+| FR54 | Bad Case 回流 | 问答页加点踩按钮；点踩/失败/空回答自动收集到 bad_cases.yaml（带 trace_id）；定期人工 review 转为 golden 用例 | P2 | ✅ |
+| FR55 | LLM-as-Judge 抽样 | scheduler 周任务抽 10% 问答；DeepSeek 当 Judge 打 1-5 分+评语；写入 eval_scores 表；看板查平均分趋势 | P2 | ✅ |
+
+**Phase 5D 设计约束：**
+- 测试集可版本管理（YAML 存 git），不依赖数据库
+- 评分以规则为主（关键词/来源/完整性），LLM-as-Judge 为辅（成本可控）
+- bad case 收集不影响主流程（异步、失败静默）
+- 评估脚本可独立运行（`brain eval`），也可接入 pytest
+
+#### Phase 5E — 提示词外部化
+
+| FR# | 功能 | 描述 | 优先级 |
+|-----|------|------|--------|
+| FR56 | 提示词外部化 | researcher/classifier/connector 的 system_prompt 抽到 prompts/*.yaml | P1 |
+| FR57 | 配置集中化 | 模型路由、Agent 参数、工具注册集中到 config | P2 |
+
+#### Phase 5F — RAG 质量增强
+
+| FR# | 功能 | 描述 | 优先级 |
+|-----|------|------|--------|
+| FR58 | 混合检索 | BM25（SQLite FTS5）+ 向量 + RRF 融合 | P1 |
+| FR59 | Rerank 精排 | Cross-Encoder（BGE-Reranker 本地）对 Top-50 精排 | P2 |
+| FR60 | 查询改写 | Multi-Query 生成 3 个改写版本提升召回 | P2 |
+
+**Phase 5 设计约束：**
+- 本地优先：指标存 SQLite、日志存本地文件、Trace 存 messages 表，不引入外部时序库
+- 轻量：健康检查用最小调用（dry-run 或 1 token）避免消耗配额
+- 可观测性是基础：5A 优先做，后续 5B 成本数据天然依赖 trace_id 和指标采集
 
 ---
 
@@ -153,9 +261,9 @@
 
 | 方式 | 命令 | Phase |
 |------|------|-------|
-| CLI | `brain add/search/ask/digest/config` | P0 |
-| 配置文件 | `~/.brain/config.yaml` | P0 |
-| Web UI（可选） | 本地浏览器仪表盘 | 远期 |
+| CLI | `brain add/search/ask/digest/review/watch/rss/status/connections` | P0 |
+| Web UI | `brain ui` 启动 FastAPI + Vue3 本地界面（问答为主页） | ✅ 已实现 |
+| 配置文件 | 项目根目录 `.env`（API Key）+ `config.py` 默认值 | P0 |
 
 ---
 

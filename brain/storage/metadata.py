@@ -6,7 +6,7 @@
 
 import sqlite3
 import threading
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from pathlib import Path
 
 from loguru import logger
@@ -197,7 +197,139 @@ class MetadataStore:
             CREATE INDEX IF NOT EXISTS idx_connections_target ON connections(target_note_id);
             CREATE INDEX IF NOT EXISTS idx_sessions_updated ON sessions(updated_at DESC);
             CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id, id);
+
+            CREATE TABLE IF NOT EXISTS metrics (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                trace_id TEXT,
+                metric_type TEXT NOT NULL,
+                metric_name TEXT NOT NULL,
+                value REAL NOT NULL,
+                metadata TEXT,
+                created_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_metrics_type_time ON metrics(metric_type, created_at);
+            CREATE INDEX IF NOT EXISTS idx_metrics_trace ON metrics(trace_id);
         """)
+        self._conn.commit()
+
+        # trace_events 表单独创建（可能跨连接迁移）
+        self._conn.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS trace_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                trace_id TEXT NOT NULL,
+                seq INTEGER NOT NULL,
+                event_type TEXT NOT NULL,
+                name TEXT,
+                input TEXT,
+                output TEXT,
+                token_usage TEXT,
+                latency_ms REAL,
+                run_id TEXT,
+                created_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_trace_events_trace ON trace_events(trace_id, seq);
+            CREATE INDEX IF NOT EXISTS idx_trace_events_trace ON trace_events(trace_id, seq);
+
+            -- 评估分数表（Phase 5D FR55）：LLM-as-Judge 打分
+            CREATE TABLE IF NOT EXISTS eval_scores (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                trace_id TEXT,
+                question TEXT,
+                answer TEXT,
+                score INTEGER,
+                dimensions TEXT,
+                comment TEXT,
+                run_id INTEGER,           -- 关联 eval_runs 批次
+                judged_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_eval_scores_judged ON eval_scores(judged_at);
+
+            -- 评估批次历史表（Phase 5D：离线评估 + Judge 抽样的运行记录）
+            CREATE TABLE IF NOT EXISTS eval_runs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                run_type TEXT NOT NULL,     -- 'offline' | 'judge'
+                total INTEGER,
+                passed INTEGER,
+                pass_rate REAL,
+                avg_score REAL,
+                duration_ms REAL,
+                details TEXT,               -- JSON 摘要
+                created_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_eval_runs_created ON eval_runs(created_at);
+            """
+        )
+        self._conn.commit()
+
+        # golden_cases / bad_cases 表（Phase 5D：测试集存数据库支持页面 CRUD）
+        self._conn.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS golden_cases (
+                id TEXT PRIMARY KEY,
+                question TEXT NOT NULL,
+                expected_keywords TEXT,
+                expected_sources TEXT,
+                min_score REAL DEFAULT 0.7,
+                enabled INTEGER DEFAULT 1,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS bad_cases (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                trace_id TEXT,
+                question TEXT,
+                answer TEXT,
+                reason TEXT,
+                extra TEXT,
+                collected_at TEXT NOT NULL
+            );
+            """
+        )
+        self._conn.commit()
+
+        # 数据库迁移：补充旧表缺失的列/表（CREATE TABLE IF NOT EXISTS 不会改已有表）
+        self._migrate()
+
+    def _migrate(self) -> None:
+        """增量迁移：为旧数据库补充新增的列和表。"""
+        assert self._conn is not None
+
+        def has_column(table: str, column: str) -> bool:
+            cols = [r[1] for r in self._conn.execute(f"PRAGMA table_info({table})").fetchall()]
+            return column in cols
+
+        def has_table(table: str) -> bool:
+            r = self._conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name=?", (table,)
+            ).fetchone()
+            return r is not None
+
+        # eval_scores 补 run_id 列（Phase 5D 评估批次关联）
+        if has_table("eval_scores") and not has_column("eval_scores", "run_id"):
+            self._conn.execute("ALTER TABLE eval_scores ADD COLUMN run_id INTEGER")
+            logger.info("迁移: eval_scores 表新增 run_id 列")
+
+        # eval_runs 表（旧库可能没有）
+        if not has_table("eval_runs"):
+            self._conn.executescript(
+                """
+                CREATE TABLE IF NOT EXISTS eval_runs (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    run_type TEXT NOT NULL,
+                    total INTEGER,
+                    passed INTEGER,
+                    pass_rate REAL,
+                    avg_score REAL,
+                    duration_ms REAL,
+                    details TEXT,
+                    created_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_eval_runs_created ON eval_runs(created_at);
+                """
+            )
+            logger.info("迁移: 新建 eval_runs 表")
+
         self._conn.commit()
 
     # ---- Notes CRUD ----
@@ -884,6 +1016,729 @@ class MetadataStore:
         )
         self._conn.commit()
         return cur.lastrowid
+
+    # ---- Metrics（可观测性指标采集，Phase 5A） ----
+
+    @_synchronized
+    def record_metric(
+        self,
+        metric_type: str,
+        metric_name: str,
+        value: float,
+        trace_id: str | None = None,
+        metadata: dict | None = None,
+    ) -> int:
+        """记录一条指标。返回指标 ID。
+
+        Args:
+            metric_type: 'ask' | 'ingest' | 'tool_call' | 'llm_call'
+            metric_name: 'latency_ms' | 'token_count' | 'count' 等
+            value: 指标值
+            trace_id: 关联的问答 trace_id（ingest 类指标可为 None）
+            metadata: 附加信息 {model, tool_name, status, ...}
+        """
+        assert self._conn is not None
+        import json
+
+        meta_json = json.dumps(metadata, ensure_ascii=False) if metadata else None
+        cur = self._conn.execute(
+            """INSERT INTO metrics (trace_id, metric_type, metric_name, value, metadata, created_at)
+               VALUES (?, ?, ?, ?, ?, ?)""",
+            (trace_id, metric_type, metric_name, value, meta_json, datetime.now().isoformat()),
+        )
+        self._conn.commit()
+        return cur.lastrowid
+
+    @_synchronized
+    def get_metrics_summary(self, hours: int = 24) -> dict:
+        """获取最近 N 小时的指标汇总（看板用）。
+
+        Returns:
+            {
+                "ask_count": int,         # 问答次数
+                "avg_ask_latency_ms": float,
+                "tool_call_count": int,   # 工具调用次数
+                "llm_token_total": int,   # LLM token 总消耗
+                "ingest_count": int,      # 摄入次数
+                "avg_ingest_latency_ms": float,
+                "by_hour": [{hour, ask_count, token_total}, ...]  # 按小时分布
+            }
+        """
+        assert self._conn is not None
+        cutoff = (datetime.now() - timedelta(hours=hours)).isoformat()
+
+        # 问答次数（只数 count 行）+ 平均延迟（只取 latency_ms 行）
+        ask_row = self._conn.execute(
+            """SELECT
+                      SUM(CASE WHEN metric_name='count' THEN 1 ELSE 0 END) as cnt,
+                      AVG(CASE WHEN metric_name='latency_ms' THEN value END) as avg_lat
+               FROM metrics WHERE metric_type='ask' AND created_at >= ?""",
+            (cutoff,),
+        ).fetchone()
+
+        # 工具调用次数
+        tool_row = self._conn.execute(
+            "SELECT COUNT(*) as cnt FROM metrics WHERE metric_type='tool_call' AND created_at >= ?",
+            (cutoff,),
+        ).fetchone()
+
+        # LLM token 总消耗
+        token_row = self._conn.execute(
+            """SELECT COALESCE(SUM(value), 0) as total
+               FROM metrics WHERE metric_type='llm_call' AND metric_name='token_count' AND created_at >= ?""",
+            (cutoff,),
+        ).fetchone()
+
+        # 摄入次数（只数 count 行）+ 平均延迟
+        ingest_row = self._conn.execute(
+            """SELECT
+                      SUM(CASE WHEN metric_name='count' THEN 1 ELSE 0 END) as cnt,
+                      AVG(CASE WHEN metric_name='latency_ms' THEN value END) as avg_lat
+               FROM metrics WHERE metric_type='ingest' AND created_at >= ?""",
+            (cutoff,),
+        ).fetchone()
+
+        # 按小时分布（最近 24 小时的问答数和 token）
+        hourly_rows = self._conn.execute(
+            """SELECT strftime('%H', created_at) as hour,
+                      SUM(CASE WHEN metric_type='ask' AND metric_name='count' THEN 1 ELSE 0 END) as ask_cnt,
+                      SUM(CASE WHEN metric_type='llm_call' AND metric_name='token_count' THEN value ELSE 0 END) as token_total
+               FROM metrics WHERE created_at >= ?
+               GROUP BY hour ORDER BY hour""",
+            (cutoff,),
+        ).fetchall()
+
+        return {
+            "ask_count": (ask_row["cnt"] or 0) if ask_row else 0,
+            "avg_ask_latency_ms": round(ask_row["avg_lat"], 1) if ask_row and ask_row["avg_lat"] else 0,
+            "tool_call_count": tool_row["cnt"] if tool_row else 0,
+            "llm_token_total": int(token_row["total"]) if token_row else 0,
+            "ingest_count": (ingest_row["cnt"] or 0) if ingest_row else 0,
+            "avg_ingest_latency_ms": round(ingest_row["avg_lat"], 1) if ingest_row and ingest_row["avg_lat"] else 0,
+            "by_hour": [
+                {"hour": r["hour"], "ask_count": r["ask_cnt"] or 0, "token_total": int(r["token_total"] or 0)}
+                for r in hourly_rows
+            ],
+        }
+
+    @_synchronized
+    def get_recent_traces(self, limit: int = 20) -> list[dict]:
+        """获取最近的问答调用链（看板用）。
+
+        按 trace_id 聚合，返回每条 trace 的汇总信息。
+        """
+        assert self._conn is not None
+        rows = self._conn.execute(
+            """SELECT trace_id,
+                      MIN(created_at) as started_at,
+                      MAX(created_at) as ended_at,
+                      COUNT(*) as event_count,
+                      SUM(CASE WHEN metric_type='tool_call' THEN 1 ELSE 0 END) as tool_calls,
+                      SUM(CASE WHEN metric_type='llm_call' AND metric_name='token_count' THEN value ELSE 0 END) as tokens,
+                      AVG(CASE WHEN metric_type='ask' AND metric_name='latency_ms' THEN value END) as ask_latency
+               FROM metrics WHERE trace_id IS NOT NULL
+               GROUP BY trace_id
+               ORDER BY started_at DESC LIMIT ?""",
+            (limit,),
+        ).fetchall()
+        return [
+            {
+                "trace_id": r["trace_id"],
+                "started_at": r["started_at"],
+                "duration_ms": round(r["ask_latency"], 1) if r["ask_latency"] else 0,
+                "tool_calls": r["tool_calls"] or 0,
+                "tokens": int(r["tokens"] or 0),
+                "event_count": r["event_count"],
+            }
+            for r in rows
+        ]
+
+    @_synchronized
+    def get_trace_detail(self, trace_id: str) -> list[dict]:
+        """获取某条 trace 的全部指标事件（调用链展开）。"""
+        assert self._conn is not None
+        import json
+
+        rows = self._conn.execute(
+            """SELECT id, metric_type, metric_name, value, metadata, created_at
+               FROM metrics WHERE trace_id = ?
+               ORDER BY id""",
+            (trace_id,),
+        ).fetchall()
+        result = []
+        for r in rows:
+            try:
+                meta = json.loads(r["metadata"]) if r["metadata"] else {}
+            except json.JSONDecodeError:
+                meta = {}
+            result.append({
+                "id": r["id"],
+                "metric_type": r["metric_type"],
+                "metric_name": r["metric_name"],
+                "value": r["value"],
+                "metadata": meta,
+                "created_at": r["created_at"],
+            })
+        return result
+
+    # ---- Trace Events（完整调用链日志，Phase 5A） ----
+
+    @_synchronized
+    def add_trace_event(
+        self,
+        trace_id: str,
+        event_type: str,
+        name: str | None = None,
+        input_data: str | None = None,
+        output: str | None = None,
+        token_usage: dict | None = None,
+        latency_ms: float | None = None,
+        run_id: str | None = None,
+    ) -> int:
+        """记录一条调用链事件（LLM/工具的完整入参出参）。返回事件 ID。
+
+        Args:
+            event_type: 'llm_start' | 'llm_end' | 'tool_start' | 'tool_end'
+            name: 模型名 / 工具名
+            input_data: 请求 prompt / 工具入参（JSON 字符串）
+            output: 响应文本 / 工具出参
+            token_usage: LLM token 用量 {prompt, completion, total}
+            latency_ms: 本步耗时
+            run_id: LangChain run_id（关联 start/end）
+        """
+        assert self._conn is not None
+        import json
+
+        # seq 在同一 trace 内递增
+        seq_row = self._conn.execute(
+            "SELECT COALESCE(MAX(seq), -1) + 1 as next_seq FROM trace_events WHERE trace_id = ?",
+            (trace_id,),
+        ).fetchone()
+        seq = seq_row["next_seq"] if seq_row else 0
+
+        token_json = json.dumps(token_usage, ensure_ascii=False) if token_usage else None
+        cur = self._conn.execute(
+            """INSERT INTO trace_events
+               (trace_id, seq, event_type, name, input, output, token_usage, latency_ms, run_id, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (trace_id, seq, event_type, name, input_data, output, token_json, latency_ms,
+             run_id, datetime.now().isoformat()),
+        )
+        self._conn.commit()
+        return cur.lastrowid
+
+    @_synchronized
+    def get_trace_events(self, trace_id: str) -> list[dict]:
+        """获取某条 trace 的完整调用链事件（按序号排序，start/end 已合并）。
+
+        返回的事件类型为 'llm' | 'tool'（合并了 start/end），
+        每条同时携带 input（来自 start）和 output（来自 end）。
+        配对策略：同类型按出现顺序 FIFO（LangGraph 的 run_id 在并行场景下不可靠）。
+        """
+        assert self._conn is not None
+        import json
+
+        rows = self._conn.execute(
+            """SELECT id, seq, event_type, name, input, output, token_usage, latency_ms, run_id, created_at
+               FROM trace_events WHERE trace_id = ? ORDER BY seq""",
+            (trace_id,),
+        ).fetchall()
+
+        # 解析原始事件
+        def parse_row(r):
+            try:
+                tu = json.loads(r["token_usage"]) if r["token_usage"] else None
+            except json.JSONDecodeError:
+                tu = None
+            return {
+                "id": r["id"],
+                "seq": r["seq"],
+                "event_type": r["event_type"],
+                "name": r["name"] or "",
+                "input": r["input"] or "",
+                "output": r["output"] or "",
+                "token_usage": tu,
+                "latency_ms": r["latency_ms"],
+                "run_id": r["run_id"] or "",
+                "created_at": r["created_at"],
+            }
+
+        raw_events = [parse_row(r) for r in rows]
+
+        # start/end 配对合并（按类型 FIFO）
+        pending: dict[str, list[dict]] = {"llm": [], "tool": []}  # 等待配对的 start 事件
+        merged: list[dict] = []
+        merged_seq = 0
+
+        for e in raw_events:
+            etype = e["event_type"]
+            kind = "llm" if etype.startswith("llm") else "tool"
+
+            if etype.endswith("_start"):
+                pending[kind].append(e)
+            elif etype.endswith("_end"):
+                if pending[kind]:
+                    start = pending[kind].pop(0)  # FIFO 取最早的 start
+                    merged.append({
+                        "id": start["id"],
+                        "seq": merged_seq,
+                        "event_type": kind,
+                        "name": start["name"] or e["name"],
+                        "input": start["input"],
+                        "output": e["output"],
+                        "token_usage": e["token_usage"],
+                        "latency_ms": e["latency_ms"],
+                        "run_id": start["run_id"] or e["run_id"],
+                        "created_at": start["created_at"],
+                    })
+                    merged_seq += 1
+                else:
+                    # 只有 end 没有 start（异常情况），单独保留
+                    merged.append({
+                        **e,
+                        "seq": merged_seq,
+                        "event_type": kind,
+                    })
+                    merged_seq += 1
+
+        # 还有未配对的 start（流中断等），也保留
+        for kind, starts in pending.items():
+            for start in starts:
+                merged.append({
+                    **start,
+                    "seq": merged_seq,
+                    "event_type": kind,
+                })
+                merged_seq += 1
+
+        return merged
+
+    # ---- 成本统计（Phase 5B FR48/FR49） ----
+
+    @_synchronized
+    def get_cost_summary(self) -> dict:
+        """获取成本汇总（今日/本月/总累计 + 配额用量）。
+
+        成本数据从 trace_events.token_usage JSON 的 cost 字段聚合。
+        """
+        assert self._conn is not None
+        from datetime import datetime
+
+        now = datetime.now()
+        today_start = now.replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
+        month_start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0).isoformat()
+
+        def _sum_cost(since: str) -> tuple[float, int]:
+            """返回 (成本, token) — 从 trace_events 的 token_usage.cost 聚合。"""
+            row = self._conn.execute(
+                """SELECT
+                    COALESCE(SUM(json_extract(token_usage, '$.cost')), 0) as cost,
+                    COALESCE(SUM(json_extract(token_usage, '$.total')), 0) as tokens
+                   FROM trace_events
+                   WHERE event_type='llm_end' AND token_usage IS NOT NULL
+                     AND created_at >= ?""",
+                (since,),
+            ).fetchone()
+            return round(row["cost"], 6), int(row["tokens"] or 0)
+
+        today_cost, today_tokens = _sum_cost(today_start)
+        month_cost, month_tokens = _sum_cost(month_start)
+        total_cost, total_tokens = _sum_cost("1970-01-01")
+
+        return {
+            "today": {"cost": today_cost, "tokens": today_tokens},
+            "month": {"cost": month_cost, "tokens": month_tokens},
+            "total": {"cost": total_cost, "tokens": total_tokens},
+        }
+
+    @_synchronized
+    def get_cost_by_model(self, hours: int = 24) -> list[dict]:
+        """按模型聚合成本（最近 N 小时）。"""
+        assert self._conn is not None
+        from datetime import datetime, timedelta
+
+        cutoff = (datetime.now() - timedelta(hours=hours)).isoformat()
+        rows = self._conn.execute(
+            """SELECT
+                    COALESCE(name, 'unknown') as model,
+                    SUM(json_extract(token_usage, '$.prompt')) as prompt_t,
+                    SUM(json_extract(token_usage, '$.completion')) as completion_t,
+                    SUM(json_extract(token_usage, '$.total')) as total_t,
+                    SUM(json_extract(token_usage, '$.cost')) as cost,
+                    COUNT(*) as calls
+               FROM trace_events
+               WHERE event_type='llm_end' AND token_usage IS NOT NULL
+                 AND created_at >= ?
+               GROUP BY model ORDER BY cost DESC""",
+            (cutoff,),
+        ).fetchall()
+        return [
+            {
+                "model": r["model"],
+                "prompt_tokens": int(r["prompt_t"] or 0),
+                "completion_tokens": int(r["completion_t"] or 0),
+                "total_tokens": int(r["total_t"] or 0),
+                "cost": round(r["cost"] or 0, 6),
+                "calls": r["calls"],
+            }
+            for r in rows
+        ]
+
+    @_synchronized
+    def get_cost_by_day(self, days: int = 30) -> list[dict]:
+        """按日聚合成本（最近 N 天）。"""
+        assert self._conn is not None
+        from datetime import datetime, timedelta
+
+        cutoff = (datetime.now() - timedelta(days=days)).isoformat()
+        rows = self._conn.execute(
+            """SELECT
+                    substr(created_at, 1, 10) as day,
+                    SUM(json_extract(token_usage, '$.total')) as total_t,
+                    SUM(json_extract(token_usage, '$.cost')) as cost,
+                    COUNT(*) as calls
+               FROM trace_events
+               WHERE event_type='llm_end' AND token_usage IS NOT NULL
+                 AND created_at >= ?
+               GROUP BY day ORDER BY day""",
+            (cutoff,),
+        ).fetchall()
+        return [
+            {
+                "day": r["day"],
+                "total_tokens": int(r["total_t"] or 0),
+                "cost": round(r["cost"] or 0, 6),
+                "calls": r["calls"],
+            }
+            for r in rows
+        ]
+
+    # ---- 评估分数（Phase 5D FR55） ----
+
+    @_synchronized
+    def add_eval_score(
+        self,
+        trace_id: str | None,
+        question: str,
+        answer: str,
+        score: int,
+        dimensions: dict | None = None,
+        comment: str | None = None,
+        run_id: int | None = None,
+    ) -> int:
+        """记录一条 LLM-as-Judge 打分。返回 ID。"""
+        assert self._conn is not None
+        import json
+
+        dim_json = json.dumps(dimensions, ensure_ascii=False) if dimensions else None
+        cur = self._conn.execute(
+            """INSERT INTO eval_scores (trace_id, question, answer, score, dimensions, comment, run_id, judged_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+            (trace_id, question[:500], answer[:1000], score, dim_json, comment,
+             run_id, datetime.now().isoformat()),
+        )
+        self._conn.commit()
+        return cur.lastrowid
+
+    @_synchronized
+    def get_eval_scores(self, limit: int = 50) -> list[dict]:
+        """获取最近的评估打分（按时间倒序）。"""
+        assert self._conn is not None
+        import json
+
+        rows = self._conn.execute(
+            """SELECT id, trace_id, question, answer, score, dimensions, comment, judged_at
+               FROM eval_scores ORDER BY judged_at DESC LIMIT ?""",
+            (limit,),
+        ).fetchall()
+        result = []
+        for r in rows:
+            try:
+                dims = json.loads(r["dimensions"]) if r["dimensions"] else None
+            except json.JSONDecodeError:
+                dims = None
+            result.append({
+                "id": r["id"],
+                "trace_id": r["trace_id"] or "",
+                "question": r["question"] or "",
+                "answer": r["answer"] or "",
+                "score": r["score"],
+                "dimensions": dims,
+                "comment": r["comment"] or "",
+                "judged_at": r["judged_at"],
+            })
+        return result
+
+    @_synchronized
+    def get_eval_score_summary(self) -> dict:
+        """评估打分汇总（平均分/总数/分布）。"""
+        assert self._conn is not None
+        row = self._conn.execute(
+            """SELECT
+                    COUNT(*) as cnt,
+                    AVG(score) as avg_score,
+                    SUM(CASE WHEN score >= 4 THEN 1 ELSE 0 END) as good,
+                    SUM(CASE WHEN score = 3 THEN 1 ELSE 0 END) as mid,
+                    SUM(CASE WHEN score <= 2 THEN 1 ELSE 0 END) as bad
+               FROM eval_scores"""
+        ).fetchone()
+        return {
+            "total": row["cnt"] if row else 0,
+            "avg_score": round(row["avg_score"], 2) if row and row["avg_score"] else 0,
+            "distribution": {
+                "good": row["good"] if row else 0,   # 4-5 分
+                "mid": row["mid"] if row else 0,      # 3 分
+                "bad": row["bad"] if row else 0,       # 1-2 分
+            },
+        }
+
+    # ---- 评估批次历史（Phase 5D） ----
+
+    @_synchronized
+    def add_eval_run(
+        self,
+        run_type: str,
+        total: int,
+        passed: int | None = None,
+        pass_rate: float | None = None,
+        avg_score: float | None = None,
+        duration_ms: float | None = None,
+        details: dict | None = None,
+    ) -> int:
+        """记录一次评估批次。返回 run_id。"""
+        assert self._conn is not None
+        import json
+
+        details_json = json.dumps(details, ensure_ascii=False) if details else None
+        cur = self._conn.execute(
+            """INSERT INTO eval_runs
+               (run_type, total, passed, pass_rate, avg_score, duration_ms, details, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+            (run_type, total, passed, pass_rate, avg_score, duration_ms, details_json,
+             datetime.now().isoformat()),
+        )
+        self._conn.commit()
+        return cur.lastrowid
+
+    @_synchronized
+    def get_eval_runs(self, limit: int = 20, run_type: str | None = None) -> list[dict]:
+        """获取评估批次历史（按时间倒序）。"""
+        assert self._conn is not None
+        import json
+
+        sql = "SELECT * FROM eval_runs"
+        params: list = []
+        if run_type:
+            sql += " WHERE run_type=?"
+            params.append(run_type)
+        sql += " ORDER BY created_at DESC LIMIT ?"
+        params.append(limit)
+        rows = self._conn.execute(sql, params).fetchall()
+        result = []
+        for r in rows:
+            try:
+                det = json.loads(r["details"]) if r["details"] else None
+            except json.JSONDecodeError:
+                det = None
+            result.append({
+                "id": r["id"],
+                "run_type": r["run_type"],
+                "total": r["total"],
+                "passed": r["passed"],
+                "pass_rate": r["pass_rate"],
+                "avg_score": r["avg_score"],
+                "duration_ms": r["duration_ms"],
+                "details": det,
+                "created_at": r["created_at"],
+            })
+        return result
+
+    @_synchronized
+    def update_eval_run(self, run_id: int, **fields) -> bool:
+        """更新评估批次记录。"""
+        assert self._conn is not None
+        import json
+
+        allowed = {"total", "passed", "pass_rate", "avg_score", "duration_ms", "details"}
+        updates = {}
+        for k, v in fields.items():
+            if k not in allowed:
+                continue
+            if k == "details" and isinstance(v, dict):
+                updates[k] = json.dumps(v, ensure_ascii=False)
+            else:
+                updates[k] = v
+        if not updates:
+            return False
+        set_clause = ", ".join(f"{k}=?" for k in updates)
+        params = list(updates.values()) + [run_id]
+        cur = self._conn.execute(
+            f"UPDATE eval_runs SET {set_clause} WHERE id=?", params
+        )
+        self._conn.commit()
+        return cur.rowcount > 0
+
+    # ---- Golden Cases（测试集，Phase 5D FR53） ----
+
+    @_synchronized
+    def add_golden_case(
+        self,
+        case_id: str,
+        question: str,
+        expected_keywords: list[str] | None = None,
+        expected_sources: list[str] | None = None,
+        min_score: float = 0.7,
+        enabled: bool = True,
+    ) -> str:
+        """新增/覆盖一条 golden case。返回 case_id。"""
+        assert self._conn is not None
+        import json
+
+        now = datetime.now().isoformat()
+        kw_json = json.dumps(expected_keywords or [], ensure_ascii=False)
+        src_json = json.dumps(expected_sources or [], ensure_ascii=False)
+        self._conn.execute(
+            """INSERT INTO golden_cases (id, question, expected_keywords, expected_sources, min_score, enabled, created_at, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+               ON CONFLICT(id) DO UPDATE SET
+                 question=excluded.question,
+                 expected_keywords=excluded.expected_keywords,
+                 expected_sources=excluded.expected_sources,
+                 min_score=excluded.min_score,
+                 enabled=excluded.enabled,
+                 updated_at=excluded.updated_at""",
+            (case_id, question, kw_json, src_json, min_score, int(enabled), now, now),
+        )
+        self._conn.commit()
+        return case_id
+
+    @_synchronized
+    def get_golden_cases(self, enabled_only: bool = False) -> list[dict]:
+        """获取全部 golden cases。"""
+        assert self._conn is not None
+        import json
+
+        sql = "SELECT * FROM golden_cases"
+        if enabled_only:
+            sql += " WHERE enabled=1"
+        sql += " ORDER BY id"
+        rows = self._conn.execute(sql).fetchall()
+        result = []
+        for r in rows:
+            try:
+                kw = json.loads(r["expected_keywords"]) if r["expected_keywords"] else []
+            except json.JSONDecodeError:
+                kw = []
+            try:
+                src = json.loads(r["expected_sources"]) if r["expected_sources"] else []
+            except json.JSONDecodeError:
+                src = []
+            result.append({
+                "id": r["id"],
+                "question": r["question"],
+                "expected_keywords": kw,
+                "expected_sources": src,
+                "min_score": r["min_score"],
+                "enabled": bool(r["enabled"]),
+                "created_at": r["created_at"],
+                "updated_at": r["updated_at"],
+            })
+        return result
+
+    @_synchronized
+    def update_golden_case(self, case_id: str, **fields) -> bool:
+        """更新 golden case 的字段。返回是否成功。"""
+        assert self._conn is not None
+        import json
+
+        allowed = {"question", "expected_keywords", "expected_sources", "min_score", "enabled"}
+        updates = {}
+        for k, v in fields.items():
+            if k not in allowed:
+                continue
+            if k in ("expected_keywords", "expected_sources"):
+                updates[k] = json.dumps(v or [], ensure_ascii=False)
+            elif k == "enabled":
+                updates[k] = int(v)
+            else:
+                updates[k] = v
+        if not updates:
+            return False
+        updates["updated_at"] = datetime.now().isoformat()
+        set_clause = ", ".join(f"{k}=?" for k in updates)
+        params = list(updates.values()) + [case_id]
+        cur = self._conn.execute(
+            f"UPDATE golden_cases SET {set_clause} WHERE id=?", params
+        )
+        self._conn.commit()
+        return cur.rowcount > 0
+
+    @_synchronized
+    def delete_golden_case(self, case_id: str) -> bool:
+        """删除 golden case。"""
+        assert self._conn is not None
+        cur = self._conn.execute("DELETE FROM golden_cases WHERE id=?", (case_id,))
+        self._conn.commit()
+        return cur.rowcount > 0
+
+    # ---- Bad Cases（Phase 5D FR54） ----
+
+    @_synchronized
+    def add_bad_case(
+        self,
+        trace_id: str | None,
+        question: str,
+        answer: str,
+        reason: str,
+        extra: dict | None = None,
+    ) -> int:
+        """记录一条 bad case。返回 ID。"""
+        assert self._conn is not None
+        import json
+
+        extra_json = json.dumps(extra, ensure_ascii=False) if extra else None
+        cur = self._conn.execute(
+            """INSERT INTO bad_cases (trace_id, question, answer, reason, extra, collected_at)
+               VALUES (?, ?, ?, ?, ?, ?)""",
+            (trace_id, question[:500], answer[:1000] if answer else "",
+             reason, extra_json, datetime.now().isoformat()),
+        )
+        self._conn.commit()
+        return cur.lastrowid
+
+    @_synchronized
+    def get_bad_cases(self, limit: int = 100) -> list[dict]:
+        """获取 bad cases（按时间倒序）。"""
+        assert self._conn is not None
+        import json
+
+        rows = self._conn.execute(
+            "SELECT * FROM bad_cases ORDER BY collected_at DESC LIMIT ?", (limit,)
+        ).fetchall()
+        result = []
+        for r in rows:
+            try:
+                extra = json.loads(r["extra"]) if r["extra"] else None
+            except json.JSONDecodeError:
+                extra = None
+            result.append({
+                "id": r["id"],
+                "trace_id": r["trace_id"] or "",
+                "question": r["question"] or "",
+                "answer": r["answer"] or "",
+                "reason": r["reason"],
+                "extra": extra,
+                "collected_at": r["collected_at"],
+            })
+        return result
+
+    @_synchronized
+    def delete_bad_case(self, case_id: int) -> bool:
+        """删除 bad case。"""
+        assert self._conn is not None
+        cur = self._conn.execute("DELETE FROM bad_cases WHERE id=?", (case_id,))
+        self._conn.commit()
+        return cur.rowcount > 0
 
     # ---- Helpers ----
 

@@ -21,14 +21,18 @@ def _mock_embedding(texts: list[str]) -> list[list[float]]:
     return result
 
 
-@pytest.fixture
-def bulk_client(tmp_path, monkeypatch):
-    """500 条笔记的测试客户端。"""
+@pytest.fixture(scope="module")
+def bulk_client(tmp_path_factory):
+    """500 条笔记的测试客户端（模块级复用，只摄入一次）。
+
+    性能测试只读不写，5 个测试共享同一份数据，避免重复摄入 2500 条。
+    """
     import brain.config as config_module
     import brain.api.server as server_module
 
     from brain.config import AppConfig, StorageSettings
 
+    tmp_path = tmp_path_factory.mktemp("perf_data")
     (tmp_path / "data").mkdir(parents=True, exist_ok=True)
     cfg = AppConfig()
     cfg.storage = StorageSettings(
@@ -37,23 +41,22 @@ def bulk_client(tmp_path, monkeypatch):
         chroma_dir=tmp_path / "chroma",
         db_path=tmp_path / "metadata.db",
     )
-    monkeypatch.setattr(config_module, "_config", cfg)
-    monkeypatch.setattr(server_module, "get_embedding_fn", lambda: _mock_embedding)
+    # 手动 monkeypatch（session 级 fixture 不能用 function 级的 monkeypatch）
+    _orig_config = config_module._config
+    _orig_embed = server_module.get_embedding_fn
+    config_module._config = cfg
+    server_module.get_embedding_fn = lambda: _mock_embedding
 
     # mock AI 节点
     from brain.agents.classifier import ClassificationOutput, ClassifierAgent, TypeItem
     from brain.agents.connector import ConnectionOutput, ConnectorAgent
 
-    monkeypatch.setattr(
-        ClassifierAgent, "run",
-        lambda self, **kwargs: ClassificationOutput(
-            topics=[], content_type=TypeItem(name="总结/笔记", confidence=0.9)
-        ),
+    _orig_classifier = ClassifierAgent.run
+    _orig_connector = ConnectorAgent.run
+    ClassifierAgent.run = lambda self, **kwargs: ClassificationOutput(
+        topics=[], content_type=TypeItem(name="总结/笔记", confidence=0.9)
     )
-    monkeypatch.setattr(
-        ConnectorAgent, "run",
-        lambda self, **kwargs: ConnectionOutput(connections=[]),
-    )
+    ConnectorAgent.run = lambda self, **kwargs: ConnectionOutput(connections=[])
 
     server_module._pipeline = None
     server_module._vector_store = None
@@ -69,6 +72,17 @@ def bulk_client(tmp_path, monkeypatch):
                 "title": f"笔记 {i}",
             })
         yield c
+
+    # 还原所有 patch（session 结束）
+    config_module._config = _orig_config
+    server_module.get_embedding_fn = _orig_embed
+    ClassifierAgent.run = _orig_classifier
+    ConnectorAgent.run = _orig_connector
+    server_module._pipeline = None
+    server_module._vector_store = None
+    server_module._metadata_store = None
+    server_module._checkpointer = None
+    server_module._watcher = None
 
 
 class TestPerformance:

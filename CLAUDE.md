@@ -1,6 +1,6 @@
 # CLAUDE.md — 个人知识管家（第二大脑）
 
-> 最后更新: 2024-08-12
+> 最后更新: 2024-08-13
 
 ---
 
@@ -202,9 +202,10 @@ ruff check brain/
 
 ### Phase 3 ✅ (2024-08-13 完成)
 - 目标：主动服务 + Web UI + 智能问答 + 会话记忆
-- 范围：FR11-FR23
+- 范围：FR11-FR29
 - 成果：FastAPI + Vue3 前后端分离；SSE 流式问答（思考/工具/答案分区）；会话管理；
-  三层记忆（工作窗口/向量检索/HIL 知识沉淀）；文件监听；RSS 订阅；83 个测试全绿
+  三层记忆（工作窗口/向量检索/HIL 知识沉淀）；文件监听；RSS 订阅；SM-2 复习；
+  知识图谱可视化；定时任务调度；92 个测试全绿
 - 经验：
   - BGE 模型最大 512 token，长文本 embedding 必须分块或截断（embedding 层做兜底）
   - Gradio 6 破坏性变更多（show_copy_button 移除、launch 不阻塞），换 FastAPI+Vue 更稳
@@ -216,6 +217,49 @@ ruff check brain/
   - SQLite 连接跨线程共享必须加锁（LangGraph 工具并行执行会并发访问）
   - MetadataStore 从 aiosqlite 改同步 sqlite3 后，测试 fixture 和全部 await 调用要同步改
   - os._exit(0) 解决 ChromaDB 非 daemon 线程卡进程退出，但测试临时目录清理用 ignore_cleanup_errors
+  - 批量查询方法（get_tag_counts/get_all_connections_flat/get_note_degree_map）应优先于 N+1 遍历，
+    但 CLI status/connections 仍遗留 N+1 调用——Phase 4A 修复
+  - FastAPI @app.on_event 已废弃，测试有 DeprecationWarning——Phase 4A 迁移到 lifespan
+
+### Phase 5 🔵 (2024-08-13 进行中)
+- 目标：生产化加固——从「能跑」到「可维护」
+- 范围：FR42-FR60（拆 5A/5B/5C/5D/5E/5F 六个子阶段）
+- 5A：可观测性（trace_id + JSON 日志 + metrics 表 + 健康检查 + Observability 页面）
+- 5B：成本治理（Token 计费 + 预算熔断 + 成本报表）
+- 5C：容灾备份（数据备份/恢复 + LLM 容灾 + 记忆清理）
+- 5D：评估闭环（离线测试集 + Bad Case 回流 + LLM-as-Judge）
+- 5E：提示词外部化（prompts/*.yaml + 配置集中化）
+- 5F：RAG 增强（BM25+Rerank+查询改写）
+- 约束：本地优先，不引入 K8s/Redis/Kafka，指标存 SQLite、日志存本地文件
+- 经验（5A）：
+  - contextvars 透传 trace_id 比 threading.local 更适合异步生成器场景
+  - FastAPI StreamingResponse 的生成器在独立上下文执行，trace_id 需在生成器内部 set
+  - ruff F841 会误报闭包内使用的变量（如 trace_id 在 event_stream 闭包里用），需 noqa
+  - LLM 健康检查默认 skip 避免烧配额，仅 dry_run 时真调——本地项目成本敏感
+  - metrics 的 ask_count 要用 SUM(CASE WHEN metric_name='count') 而非 COUNT(*)，否则 latency 行也被数
+  - 指标记录失败不抛异常（record_metric 内部 try/except），可观测性不能影响主流程
+  - **contextvar 在 Starlette iterate_in_threadpool 下不可靠**：同步生成器的每次 next() 都在 copy_context() 新 context 执行，set 的值在后续 next() 丢失，token.reset() 跨 context 报 ValueError。改用闭包变量显式传 trace_id 给 record_metric，简单可靠
+  - **LLM token 采集用 BaseCallbackHandler 子类**（不能鸭子类型，LangGraph callback_manager 要求 raise_error 等属性）。DeepSeek 流式模式下 token usage 在 message.usage_metadata 而非 llm_output.token_usage，回调需两种途径都试
+  - HIL 多 proposals：DeepSeek 一次可提议多个知识片段，LangGraph 要求 decisions 数量 = action_requests 数量，前端需为每个 proposal 展示卡片逐一收集决策
+  - **调用链需双表设计**：metrics 表存数值（latency/token/count，供看板聚合），trace_events 表存完整入参出参（供调用链回放），两者通过 trace_id 关联。单表混存会导致统计查询被超长文本拖慢
+  - LangChain BaseCallbackHandler 的 on_chat_model_start 收到 messages 是 list[list[BaseMessage]]（嵌套），提取 prompt 文本要处理嵌套结构
+  - LLM/工具的入参出参要截断（2000 字符），否则长 prompt 会撑爆 SQLite，且前端渲染卡顿
+- 经验（5B）：
+  - **成本数据复用 trace_events 表**，不新建 llm_usage 表——token_usage JSON 里加 cost 字段即可，成本天然随 trace_id 关联，用 json_extract 聚合查询
+  - SQLite 的 json_extract 可直接从 JSON 字段提取 cost：`SUM(json_extract(token_usage, '$.cost'))`，无需应用层解析
+  - **预算熔断在 API 入口检查**（ask/stream/resume），超限返 429；recursion_limit 通过 stream/invoke 的 config 传入防死循环，两层防护
+  - DeepSeek 实际返回的 model 名是 `deepseek-v4-flash`（不是配置的 `deepseek-chat`），价格表要兼容别名
+  - 历史数据无 cost 字段不影响新数据——只有 5B 之后的 LLM 调用才记成本，聚合时 NULL 自动忽略
+  - **DeepSeek v4 定价分空闲/高峰 + 缓存命中/未命中**：缓存命中价便宜 30 倍，usage_metadata.input_token_details.cache_read 字段提取命中数。实际调用中 prompt 80%+ 命中缓存，成本比“全未命中”估算低一个数量级
+  - calc_token_cost 用 keyword-only 参数（peak_hours、cache_hit_tokens）保持向后兼容，默认空闲未命中（最保守常用场景）
+- 经验（5D）：
+  - **评估打分以规则为主**（关键词命中+来源正确性+完整性），不依赖 LLM，零成本可重复跑；LLM-as-Judge 为辅提供主观质量趋势
+  - Golden Dataset 存 YAML 可版本管理（进 git），不进数据库——测试集是要 review 和迭代的产物
+  - 来源正确性从 trace_events 的 tool_call input/output 提取 note_id，复用 5A 的调用链数据，无需额外埋点
+  - bad case 收集失败不抛异常（collect_bad_case 内部 try/except），评估闭环不能影响主流程
+  - LLM-as-Judge 的 prompt 要求严格 JSON 输出，但要容错——LLM 可能输出多余文本，用 find('{')..rfind('}') 提取 JSON 块
+  - scheduler 加 weekly_eval 周任务抽样，成本可控（10% 抽样 + 单次 Judge 调用）
+  - **测试集存数据库而非文件**：golden_cases/bad_cases 表支持页面 CRUD，YAML 仅作种子导入（首次 seed）。运行时全部走数据库，避免文件读写并发问题，页面实时增删改查
 
 ---
 
