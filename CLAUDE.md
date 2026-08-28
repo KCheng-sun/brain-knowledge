@@ -290,6 +290,20 @@ ruff check brain/
   - **source_type 通过 state 透传**：IngestionState 加 source_type 字段，_index_node 优先用显式传入的（如 BOOKMARK），否则按 source_path 推断（文件=MARKDOWN，空=CLI）。TypedDict 运行时不强制，旧构造点用 state.get(key, '') 兑底也不会 KeyError
   - **标签云字号按计数权重**：前端 Tags.vue 用 `fontSize = 12 + (count/maxCount)*20` 让高频标签字号大，点击跳转 /search?tag=xxx。Search.vue 加 onMounted 读 route.query.tag 自动填充标签过滤
   - **笔记内容编辑不做**：内容存在 ChromaDB 分块，原地改内容需重建向量（删旧 chunk + 重新分块嵌入），复杂度高。4B 只做标题/标签/关联编辑，内容编辑走重新摄入流程
+- 经验（5C-FR51）：
+  - **优先用 SDK 原生重试，别包装 tenacity**：ChatOpenAI/ChatAnthropic 的 `max_retries` 参数透传给底层 OpenAI/Anthropic SDK，SDK 自带完善的 HTTP 层重试——自动重试 429/5xx/408/409 + 指数退避 + 随机抖动，鉴权失败(401)/参数错误(400)不重试。实测 OpenAI SDK 的 `_should_retry` 方法已按状态码精确分类。应用层再包 tenacity 是重复造轮子，且会导致 SDK 重试 + tenacity 重试的三重重试（浪费配额）
+  - **base.py 保留外层重试是必要的**：SDK 只管 HTTP 层（请求成功就返回），但 LLM 返回了内容、JSON 解析失败是业务层问题，SDK 不会重试。base.py 的外层 for 循环专门处理「解析失败→重新调 LLM 拿新输出」，与 SDK 的网络重试职责不重叠。两层各管各的
+  - **显式传 max_retries 而非用默认**：ChatOpenAI 默认 max_retries=None（透传给 SDK，SDK 默认 2 次），在 `llm.py` 初始化时显式传 `cfg.llm.max_retries=3` 让次数可控可配
+  - **中间件选型原则**：先用原生 SDK 能力，不够再考虑第三方库。LangChain 生态的 ChatModel 已经封装了 provider SDK 的重试/超时/流式，应用层应尽量用配置参数而非包装函数
+- 经验（base.py 重构）：
+  - **结构化输出用 LangChain 的 PydanticOutputParser，别手写**：原 base.py 手写了 `_build_user_prompt_with_schema`（拼格式说明+示例）、`_parse_json`（去 markdown 包裹+正则提取）、`_describe_model`/`_build_example`/`_example_value`/`_type_to_str`（递归构建示例）共约 100 行。LangChain 的 `PydanticOutputParser` 一个类全覆盖：`get_format_instructions()` 生成标准 JSON Schema 格式说明，`parse()` 解析输出为 Pydantic 实例（自动处理 markdown 包裹）
+  - **PydanticOutputParser.parse 不做激进正则提取**：手写 `_parse_json` 用 `re.search(r'\{.*\}')` 能从「前后大段说明文字」里抠出 JSON，但 LangChain parser 要求输入是纯 JSON 或 markdown 包裹，不做正则提取。这不是缺陷而是设计——prompt 已要求 LLM 只输出 JSON，乱输出的 LLM 应交由 base.py 外层重试重新调，而不是激进解析可能错误的 JSON
+  - **重构要同步改测试**：原测试直接调用 `_build_user_prompt_with_schema` 和 `_parse_json`，重构后这些方法删除，测试改为验证 `_parser.get_format_instructions()` 和 `_parser.parse()` 的等价行为。测试用例从「验证手写解析逻辑」转为「验证 LangChain parser 行为」，更贴近实际使用
+- 经验（with_structured_output 最终方案）：
+  - **生成时强制结构化 > 生成后解析**：PydanticOutputParser 是「生成后解析」（LLM 输出文本→parser 解析），仍可能解析失败。`with_structured_output(method="function_calling")` 是「生成时强制」（SDK 用 function calling 让模型在生成时就遵循 schema），invoke 直接返回 Pydantic 实例，不存在解析环节。后者更可靠，base.py 连外层重试循环都省了
+  - **DeepSeek method 实测选择**：用真实 API key 实测，`function_calling` 成功直接返回实例；`json_mode` 失败（要求 prompt 含 "json" 字样，多余约束）。故选 `function_calling`。不要凭文档猜，要真调一次验证
+  - **base.py 三次演进**：手写 `_parse_json`（正则提取+json.loads，约 100 行）→ PydanticOutputParser（get_format_instructions + parse，约 105 行）→ with_structured_output（3 行核心逻辑，约 90 行）。每一步都删掉更多手写代码，最终方案最简洁，职责全交给 SDK
+  - **with_structured_output 后测试要变**：不再有「解析」环节，无法用 mock 文本测试解析鲁棒性。测试改为验证 output_model 配置正确、_structured_method 配置正确、to_tags 能处理 Pydantic 实例。实际的结构化输出正确性靠真实 API 调用保证（集成测试或手动验证）
 
 ---
 

@@ -1472,3 +1472,78 @@ researcher = ResearcherAgent(vector_store, metadata_store, hybrid_searcher)
 - `tests/test_retrieval/test_query_rewriter.py`：mock LLM 响应，验证解析 + 失败降级
 - `tests/test_storage/test_bm25.py`：FTS5/FULLTEXT 双后端检索（用临时 SQLite + MySQL schema 测试）
 - 集成测试：`brain eval` 跑 golden dataset，对比 5F 前后通过率（量化收益）
+
+---
+
+### §17 Phase 5C — 容灾与备份
+
+#### FR51 LLM 调用容灾（引入 tenacity）
+
+**现状问题：**
+
+项目有 6 处 `llm.invoke()` 调用（base/judge/digest/query_rewriter/cli/main/researcher），
+仅 `base.py` 手写了重试循环，其余 5 处裸调用，失败即抛异常。
+手写循环的缺陷：
+1. `except Exception` 全捕获——API key 错误、参数错误等不可恢复错误也重试，浪费配额
+2. 无抖动（jitter）——多客户端同时重试易踩踏
+3. 无异步支持——`time.sleep` 阻塞事件循环
+4. 重复造轮子，每个调用点自己写重试逻辑
+
+**方案：使用 ChatOpenAI/ChatAnthropic 原生 max_retries（不包装 tenacity）**
+
+ChatOpenAI/ChatAnthropic 的 `max_retries` 参数透传给底层 OpenAI/Anthropic SDK，
+SDK 自带完善的 HTTP 层重试：自动重试 429/5xx/408/409 + 指数退避 + 随机抖动，
+鉴权失败(401)/参数错误(400)不重试。应用层不再重复包装 tenacity，避免三重重试。
+
+```python
+# brain/llm.py：初始化时传 max_retries
+return ChatOpenAI(
+    model=cfg.llm.model,
+    ...,
+    max_retries=cfg.llm.max_retries,  # SDK 原生重试（默认 3）
+)
+```
+
+**SDK 原生重试覆盖范围（实测 OpenAI SDK `_should_retry`）：**
+
+| HTTP 状态码 | 重试？ | 理由 |
+|------------|--------|------|
+| 408 | ✅ | 请求超时 |
+| 409 | ✅ | 锁超时 |
+| 429 | ✅ | 限流（退避后配额恢复） |
+| 5xx | ✅ | 服务端临时故障 |
+| 401/403 | ❌ | 鉴权失败，不可恢复 |
+| 400 | ❌ | 参数错误，不可恢复 |
+| `x-should-retry` 响应头 | 遵从 | 服务端显式控制 |
+
+退避策略由 SDK 内部实现（指数退避 + 抖动），无需应用层配置。
+
+**重试职责（最终方案）：**
+
+| 层级 | 处理什么 | 实现方式 |
+|------|---------|---------|
+| SDK 原生 | HTTP 瞬时错误（429/5xx/超时） | `max_retries` 透传 |
+| with_structured_output | 结构化输出 | function calling 在生成时强制 schema，invoke 直接返回 Pydantic 实例 |
+
+base.py 用 `with_structured_output(method="function_calling")`，LLM 在生成时就遵循 schema，
+不存在「解析失败」环节，无需应用层重试。HTTP 错误由 SDK max_retries 重试。
+
+> 演进历程：手写 _parse_json（正则提取）→ PydanticOutputParser（生成后解析）→
+> with_structured_output（生成时强制结构化）。后两者用 LangChain 现成能力，
+> 最终方案彻底消除了「解析」环节。
+
+**改动点：**
+- `brain/llm.py`：`_init_deepseek`/`_init_anthropic` 传 `max_retries=cfg.llm.max_retries`
+- `brain/agents/base.py`：用 `with_structured_output` 替换 PydanticOutputParser + 外层重试循环
+- 其余调用点（judge/digest/query_rewriter/cli）：直接 `llm.invoke()`，SDK 自动重试
+- 无需新增依赖（tenacity 不再使用）
+
+> method 选择：实测 DeepSeek `json_mode` 要求 prompt 含 "json" 字样（多余约束），
+> `function_calling` 无此限制且稳定，故选 function_calling。
+
+**配置：**
+
+```python
+class LLMSettings(BaseSettings):
+    max_retries: int = 3  # SDK 原生重试次数（透传给 OpenAI/Anthropic SDK）
+```

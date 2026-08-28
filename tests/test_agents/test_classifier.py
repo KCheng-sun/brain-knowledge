@@ -1,9 +1,5 @@
 """ClassifierAgent 单元测试 — 用 mock LLM 响应验证输出格式。"""
 
-import json
-
-import pytest
-
 from brain.agents.classifier import ClassificationOutput, ClassifierAgent, TopicItem, TypeItem
 
 
@@ -73,42 +69,43 @@ class TestClassifierPrompt:
         assert "asyncio 是 Python" in prompt
 
     def test_full_prompt_includes_schema(self):
-        """user prompt 包含 JSON 输出格式说明（system_prompt 已分离为单独角色）。"""
+        """run() 用 with_structured_output 绑定 output_model，SDK 层强制结构化。"""
         from brain.prompts import get_prompt
 
         agent = ClassifierAgent()
         # system_prompt 从数据库读取（测试环境回退到默认值）
         sys_prompt = get_prompt("classifier")
-        user_prompt = agent._build_user_prompt_with_schema("测试内容")
         assert "你是一个知识分类专家" in sys_prompt
-        assert "测试内容" in user_prompt
-        assert "topics" in user_prompt.lower()
-        assert "content_type" in user_prompt.lower()
+        # output_model 是 ClassificationOutput，含 topics/content_type 字段
+        fields = agent.output_model.model_fields
+        assert "topics" in fields
+        assert "content_type" in fields
 
 
-class TestJSONParsing:
-    """验证 JSON 解析鲁棒性"""
+class TestStructuredOutput:
+    """验证 with_structured_output 绑定（不实际调用 API）。
 
-    def test_parse_pure_json(self):
-        """纯 JSON 正确解析。"""
-        text = '{"topics": [], "content_type": {"name": "观点/思考", "confidence": 0.99}}'
-        result = ClassifierAgent._parse_json(text)
-        assert result["content_type"]["name"] == "观点/思考"
+    with_structured_output 在 SDK 层用 function calling 强制结构化，
+    invoke 直接返回 Pydantic 实例，不存在「解析」环节，
+    无需测试 JSON 解析鲁棒性（原手写 _parse_json 的场景已不适用）。
+    """
 
-    def test_parse_json_with_markdown(self):
-        """被 ```json``` 包裹的 JSON 正确解析。"""
-        text = """```json
-{"topics": [{"name": "AI", "confidence": 0.9}], "content_type": {"name": "教程/指南", "confidence": 0.8}}
-```"""
-        result = ClassifierAgent._parse_json(text)
-        assert result["topics"][0]["name"] == "AI"
+    def test_output_model_is_classification_output(self):
+        """ClassifierAgent 的 output_model 配置正确。"""
+        agent = ClassifierAgent()
+        assert agent.output_model.__name__ == "ClassificationOutput"
 
-    def test_parse_json_with_surrounding_text(self):
-        """前后有说明文字的 JSON 正确解析。"""
-        text = """好的，这是分析结果：
+    def test_structured_method_is_function_calling(self):
+        """默认用 function_calling（DeepSeek 实测稳定支持）。"""
+        agent = ClassifierAgent()
+        assert agent._structured_method == "function_calling"
 
-{"topics": [{"name": "Docker", "confidence": 0.95}], "content_type": {"name": "实践/代码", "confidence": 0.9}}
-
-希望这个结果对你有帮助。"""
-        result = ClassifierAgent._parse_json(text)
-        assert result["topics"][0]["name"] == "Docker"
+    def test_to_tags_with_valid_output(self):
+        """to_tags 能正确处理 with_structured_output 返回的 Pydantic 实例。"""
+        output = ClassificationOutput(
+            topics=[TopicItem(name="Python", confidence=0.95)],
+            content_type=TypeItem(name="教程/指南", confidence=0.90),
+        )
+        tags = ClassifierAgent.to_tags(output)
+        assert len(tags) == 2
+        assert tags[0].name == "Python"

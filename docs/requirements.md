@@ -2,7 +2,7 @@
 
 > 版本: v0.5.0
 > 最后更新: 2024-08-13
-> 状态: Phase 1-3 已完成，Phase 4/5 进行中
+> 状态: Phase 1-4B 已完成，Phase 4C/5C 进行中
 
 ---
 
@@ -132,7 +132,7 @@
 | FR32 | API lifespan 迁移 | FastAPI `@app.on_event` 废弃装饰器改 `lifespan` 上下文管理器 | P0 ✅ |
 | FR33 | 测试提速 | `bulk_client` fixture 改 module 级复用，500 条笔记只摄入一次（92s→16s） | P1 ✅ |
 
-#### Phase 4B — P1 功能闭环（当前进行中）
+#### Phase 4B — P1 功能闭环 ✅（已完成）
 
 > 补齐需求文档标 P1 但未实现的功能：书签导入、标签浏览、笔记编辑。
 > 全部基于现有架构扩展，不引入新框架。
@@ -176,7 +176,7 @@
 | FR45 | 健康检查 | `/api/health` 探测 LLM/Embedding/SQLite/ChromaDB 连通性 | P0 ✅ |
 | FR46 | 可观测性页面 | 前端 Observability 页：健康状态灯 + 指标看板 + 最近调用链 | P0 ✅ |
 
-#### Phase 5B — 成本治理（当前进行中）
+#### Phase 5B — 成本治理 ✅（已完成）
 
 > 衔接 5A：5A 的 trace_events 已记录每次 LLM 调用的 token_usage（prompt/completion/total），
 > 5B 在此基础上加价格表换算成本 + 配额熔断 + 成本报表，是最低成本增量。
@@ -191,11 +191,11 @@
 
 | FR# | 功能 | 描述 | 优先级 |
 |-----|------|------|--------|
-| FR50 | 数据备份/恢复 | `brain backup` 导出 SQLite+ChromaDB+checkpoints 到 ZIP；`brain restore` 恢复 | P1 |
-| FR51 | LLM 调用容灾 | 指数退避重试 + fallback 模型配置 | P2 |
-| FR52 | 记忆/片段清理 | 知识片段和会话历史 TTL 清理（调度器加任务） | P2 |
+| FR50 | 数据备份/恢复 | `brain backup` 导出 SQLite+ChromaDB+checkpoints 到 ZIP；`brain restore` 恢复 | P1 | ⏸ |
+| FR51 | LLM 调用容灾 | 使用 ChatOpenAI/ChatAnthropic 原生 `max_retries` 重试策略（透传给底层 SDK，自动处理 429/5xx/超时 + 指数退避抖动）；`brain/llm.py` 初始化时传入；base.py 保留外层重试仅处理 JSON 解析失败 | P2 | ✅ |
+| FR52 | 记忆/片段清理 | 知识片段和会话历史 TTL 清理（调度器加任务） | P2 | ⏸ |
 
-#### Phase 5D — 评估闭环（当前进行中）
+#### Phase 5D — 评估闭环 ✅（已完成）
 
 > 为非确定性 LLM 输出装上「回归测试」：改 prompt/换模型后能量化质量变化，
 > bad case 持续沉淀成测试集，LLM-as-Judge 提供主观质量趋势。
@@ -232,7 +232,7 @@
 - judge 提示词含 `{question}/{answer}/{context}` 占位符，用 `is_template=1` 标记，走 `get_prompt_template(key, **kw)` 渲染
 - 其余 5 个提示词为纯文本（`is_template=0`），直接读取使用
 
-#### Phase 5F — RAG 质量增强（当前进行中）
+#### Phase 5F — RAG 质量增强 ✅（已完成）
 
 > 衔接 5A-5E：可观测性/成本/评估/提示词已就绪，本阶段把检索从「纯向量召回」
 > 升级为「BM25 + 向量 + RRF 融合 + Rerank 精排 + 查询改写」的工业级 RAG。

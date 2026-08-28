@@ -61,6 +61,8 @@ class LLMSettings(BaseSettings):
     api_key: str = Field(default="", alias="DEEPSEEK_API_KEY")
     max_tokens: int = 4096
     temperature: float = 0.3
+    # Phase 5C FR51：LLM 调用容灾（透传给 SDK 原生重试，自动处理 429/5xx/超时）
+    max_retries: int = 3              # SDK 重试次数（含首次）
 
 
 class EmbeddingSettings(BaseSettings):
