@@ -27,10 +27,15 @@ _cache: dict[str, str] = {}
 
 
 def _get_store():
-    """懒加载 MetadataStore 单例（避免循环导入）。"""
-    from brain.api.server import _metadata_store
+    """获取已初始化的 MetadataStore 单例（不触发初始化，避免循环导入和测试污染）。
 
-    return _metadata_store
+    只读取 deps 模块级变量当前值——若 API 层尚未 _init() 则返回 None，
+    调用方回退到 prompt_defaults 默认值。这样 prompts 层不会反向触发服务初始化
+    （原实现读 server._metadata_store 也是 None，行为一致）。
+    """
+    from brain.api import deps
+
+    return deps._metadata_store
 
 
 def get_prompt(prompt_key: str) -> str:

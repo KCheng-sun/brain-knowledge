@@ -191,17 +191,22 @@ def _ensure_directories(cfg: AppConfig) -> None:
 
 
 def _setup_file_logging(cfg: AppConfig) -> None:
-    """配置 loguru 滚动文件日志（终端之外持久化，重启不丢）。"""
+    """配置 loguru 文件日志（终端之外持久化，重启不丢）。
+
+    Windows 注意：不用 rotation（按大小轮转）。loguru 的轮转靠 os.rename
+    重命名当前日志文件，但 Windows 不允许重命名“被进程占用的文件”（enqueue 线程
+    长期持有句柄），导致 PermissionError [WinError 32] 刷屏。本地项目日志量小，
+    改用 retention 按天数清理即可，不在运行时重命名文件。
+    """
     from loguru import logger
 
     log_dir = cfg.storage.data_dir / "logs"
     log_dir.mkdir(parents=True, exist_ok=True)
 
-    # 每个文件最多 5MB，保留 3 个滚动文件（人类可读格式）
+    # 人类可读格式日志，保留 7 天
     logger.add(
         log_dir / "brain.log",
-        rotation="5 MB",
-        retention=3,
+        retention="7 days",
         level=cfg.log_level,
         encoding="utf-8",
         enqueue=True,  # 多线程安全
@@ -210,11 +215,10 @@ def _setup_file_logging(cfg: AppConfig) -> None:
     )
 
     # 结构化 JSON 日志（Phase 5A）：便于机器解析和按 trace_id 过滤
-    # 字段含 timestamp/level/trace_id/agent/tool/message
+    # 字段含 timestamp/level/trace_id/agent/tool/message，保留 14 天
     logger.add(
         log_dir / "brain.json.log",
-        rotation="5 MB",
-        retention=7,
+        retention="14 days",
         level=cfg.log_level,
         encoding="utf-8",
         enqueue=True,

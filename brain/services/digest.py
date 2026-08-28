@@ -1,68 +1,16 @@
 """每日摘要服务。
 
-基于 LangChain PromptTemplate + LLM，将昨日/本周的笔记整理为结构化摘要。
+从 prompts 表读取提示词模板（daily_digest/weekly_trend），
+将昨日/本周的笔记整理为结构化摘要。
 """
 
 from datetime import date, timedelta
 
-from langchain_core.prompts import PromptTemplate
 from loguru import logger
 
 from brain.llm import get_chat_model
+from brain.prompts import get_prompt_template
 from brain.storage.metadata import MetadataStore
-
-DAILY_DIGEST_PROMPT = PromptTemplate.from_template("""你是一个个人知识管家。基于用户昨日摄入的笔记，生成一份知识简报。
-
-## 昨日笔记列表
-{notes_section}
-
-## AI 发现的标签
-{tags_section}
-
-## AI 发现的关联
-{connections_section}
-
-请生成以下格式的知识简报（Markdown）：
-
-### 📅 {date_str} 知识简报
-
-**摄入概况**: （一句话总结昨日摄入的内容量和主题方向）
-
-**核心主题**:
-- （列出 1-3 个最突出的主题，每个一句说明）
-
-**值得关注的关联**:
-- （如果有 AI 发现的关联，提取最有趣的 1-2 条）
-
-**回顾建议**: 基于昨日内容，给出一条可执行的回顾/深入学习建议。
-
-保持简洁，总字数控制在 300 字以内。""")
-
-
-WEEKLY_TREND_PROMPT = PromptTemplate.from_template("""你是一个个人知识管家。基于用户本周的笔记摄入，分析知识趋势。
-
-## 本周笔记列表
-{notes_section}
-
-## 标签分布统计
-{tags_stats}
-
-## 关联统计
-总关联数: {connection_count}
-
-请分析：
-
-### 📊 {start_date} ~ {end_date} 知识趋势
-
-**学习主题分布**: （本周你关注了哪些主题领域？）
-
-**趋势洞察**: （你的关注点有什么变化趋势？有没有新出现的兴趣方向？）
-
-**知识盲区**: （哪些相关领域你还没有涉及，值得关注？）
-
-**下周建议**: 基于本周的学习轨迹，给出一条下周的学习方向建议。
-
-总字数控制在 400 字以内。""")
 
 
 class DigestService:
@@ -75,14 +23,14 @@ class DigestService:
         if target_date is None:
             target_date = date.today() - timedelta(days=1)
         return self._generate(target_date=target_date, days_range=1,
-                              prompt_template=DAILY_DIGEST_PROMPT,
+                              prompt_key="daily_digest",
                               title_date=target_date.isoformat())
 
     def weekly_sync(self) -> str:
         today = date.today()
         monday = today - timedelta(days=today.weekday())
         return self._generate(target_date=monday, days_range=7,
-                              prompt_template=WEEKLY_TREND_PROMPT,
+                              prompt_key="weekly_trend",
                               title_date=f"{monday.isoformat()} ~ {today.isoformat()}")
 
     async def daily(self, target_date: date | None = None) -> str:
@@ -98,7 +46,7 @@ class DigestService:
         return self._generate(
             target_date=target_date,
             days_range=1,
-            prompt_template=DAILY_DIGEST_PROMPT,
+            prompt_key="daily_digest",
             title_date=target_date.isoformat(),
         )
 
@@ -115,7 +63,7 @@ class DigestService:
         return self._generate(
             target_date=monday,
             days_range=7,
-            prompt_template=WEEKLY_TREND_PROMPT,
+            prompt_key="weekly_trend",
             title_date=f"{monday.isoformat()} ~ {today.isoformat()}",
         )
 
@@ -123,7 +71,7 @@ class DigestService:
         self,
         target_date: date,
         days_range: int,
-        prompt_template: PromptTemplate,
+        prompt_key: str,
         title_date: str,
     ) -> str:
         """核心生成逻辑。"""
@@ -193,7 +141,8 @@ class DigestService:
         llm = get_chat_model()
 
         if days_range == 1:
-            prompt = prompt_template.format(
+            prompt = get_prompt_template(
+                prompt_key,
                 notes_section=notes_section,
                 tags_section=tags_section,
                 connections_section=conns_section,
@@ -202,7 +151,8 @@ class DigestService:
             response = llm.invoke(prompt)
             return response.content
         else:
-            prompt = prompt_template.format(
+            prompt = get_prompt_template(
+                prompt_key,
                 notes_section=notes_section,
                 tags_stats=tag_stats,
                 connection_count=total_conns // 2,

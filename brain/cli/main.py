@@ -18,6 +18,7 @@ from loguru import logger
 from brain.config import get_config
 from brain.embedding import get_embedding_fn
 from brain.ingestion.pipeline import IngestionPipeline
+from brain.prompts import get_prompt_template
 from brain.storage.metadata import MetadataStore
 from brain.storage.vector_store import VectorStore
 
@@ -325,15 +326,11 @@ def _ask_simple(question: str, vector_store, metadata_store, hybrid_searcher) ->
             )
     context = "\n\n".join(context_parts)
 
-    prompt = f"""你是一个个人知识库助手。基于用户的知识库内容回答问题。
-
-知识库内容:
-{context}
-
-用户问题: {question}
-
-请基于知识库内容回答。引用具体的来源（笔记标题）。
-如果知识库中没有足够信息，请诚实说明。"""
+    prompt = get_prompt_template(
+        "cli_ask",
+        context=context,
+        question=question,
+    )
 
     click.echo("?? 思考中...")
 

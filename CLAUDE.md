@@ -164,6 +164,7 @@ ruff check brain/
 - watchdog 在 Windows 上使用 `ReadDirectoryChangesWatcher`
 - PowerShell 不支持 `&&` 链式操作，用 `; if ($?) { ... }` 替代
 - 虚拟环境的 Python 路径: `.venv\Scripts\python.exe` 而非 `bin/python`
+- **loguru 文件日志不用 rotation（按大小轮转）**：loguru 的轮转靠 `os.rename` 重命名当前日志文件，但 Windows 不允许重命名“被进程占用的文件”（`enqueue=True` 的写入线程长期持有句柄），导致 `PermissionError [WinError 32]` 刷屏。本地项目日志量小，改用 `retention="7 days"` 按天数清理，不在运行时重命名文件，彻底避开文件锁
 
 ### API 调用注意
 - Anthropic API Key 通过环境变量 `ANTHROPIC_API_KEY` 传入
@@ -284,6 +285,7 @@ ruff check brain/
   - **PowerShell Set-Content 默认 GBK 编码会破坏中文**：用 `Get-Content -Raw | Set-Content` 批量替换文本时，默认编码把 UTF-8 中文写成 GBK，导致 SyntaxError。必须用 Python 重写文件（`open(path,'w',encoding='utf-8')`）或 PowerShell 指定 `-Encoding utf8`。教训：涉及中文的文件批量替换优先用 Python 而非 PowerShell
   - **提示词种子要支持增量补充**：_seed_prompts 原本仅空表时写入全部默认值，旧库升级时新增的 query_rewriter 不会被补充。改为「空表写全部 + 非空表补充缺失 key」，让 5F 新增的提示词能自动出现在已初始化的库里
   - **检索链路双调用方统一**：researcher.search_notes 工具和 server /api/search 原本各自调 VectorStore.search，5F 抽出 HybridSearcher 统一入口，两者都注入。CLI 的 _get_search_components 返回三元组，所有解包处同步更新
+  - **所有提示词一律从数据库读取，代码不得硬编码**：5E 外部化了 7 个（classifier/connector/researcher/title_writer/knowledge_extractor/judge/query_rewriter），但 digest.py 的 `DAILY_DIGEST_PROMPT`/`WEEKLY_TREND_PROMPT`（硬编码 PromptTemplate）和 cli/main.py `_ask_simple` 的内联 f-string prompt 被遗漏。补全为 10 条（新增 daily_digest/weekly_trend/cli_ask），全部走 `get_prompt_template`。教训：外部化时要全局搜 `PromptTemplate`/`llm.invoke(prompt)`/`SystemMessage(content=` 等模式，不能只看 BaseAgent 子类——直接 invoke LLM 的调用点（digest/cli/judge/query_rewriter）同样要纳入
 - 经验（4B）：
   - **书签去重的 file_hash 必须与流水线一致**：BookmarkSource 预检查去重用的 file_hash，必须和 ingest_text_sync 内部计算方式完全一致。pipeline 会把 content 包装成 `# {title}\n\n{content}` 再算 hash，所以预检查的 hash 也要基于包装后的文本，否则预检查漏判、重复摄入
   - **ingest_text_sync 的标题包装陷阱**：传 `content=url, title=title` 时，pipeline 内部拼成 `# {title}\n\n{url}` 作为 raw_text。书签源不能自己拼 `# {title}\n\n{url}` 再传（会变成双标题），只传纯 URL 让 pipeline 包装，保证 file_hash 一致
@@ -304,6 +306,20 @@ ruff check brain/
   - **DeepSeek method 实测选择**：用真实 API key 实测，`function_calling` 成功直接返回实例；`json_mode` 失败（要求 prompt 含 "json" 字样，多余约束）。故选 `function_calling`。不要凭文档猜，要真调一次验证
   - **base.py 三次演进**：手写 `_parse_json`（正则提取+json.loads，约 100 行）→ PydanticOutputParser（get_format_instructions + parse，约 105 行）→ with_structured_output（3 行核心逻辑，约 90 行）。每一步都删掉更多手写代码，最终方案最简洁，职责全交给 SDK
   - **with_structured_output 后测试要变**：不再有「解析」环节，无法用 mock 文本测试解析鲁棒性。测试改为验证 output_model 配置正确、_structured_method 配置正确、to_tags 能处理 Pydantic 实例。实际的结构化输出正确性靠真实 API 调用保证（集成测试或手动验证）
+- 经验（API 层按业务域拆包）：
+  - **业务域自包含包 > 单文件大杂烩**：原 `brain/api/server.py` 1195 行 56 个端点混在一起，拆成 `routes/{notes,search,ask,sources,scheduler,observability,eval,prompts,review}/` 每个包含 `router.py`（端点）+ `models.py`（Request/Response）。增删改某业务只动一个包，不牵扯其他
+  - **deps.py 集中管单例 + 访问器**：原全局变量 `_vector_store/_metadata_store/...` 散在 server.py，每个端点手写 `_init()`。拆后 `deps.py` 持有单例 + `get_*()` 访问器自动触发初始化，路由不再写 `_init()`
+  - **兼容垫片用模块级 `__getattr__`/`__setattr__`**：`server.py` 改为垫片 re-export app，但测试 fixture 和 `brain.prompts` 历史上读 `server_module._metadata_store`。用模块级 `__getattr__` 动态代理到 deps，`__setattr__` 重定向赋值到 deps，保证 fixture 重置 `server_module._xxx` 真正改的是 deps 源变量（路由用 deps 访问器读取）。注意 `__setattr__` 要放行非代理名，否则模块正常赋值被拦
+  - **prompts._get_store 只读不初始化**：原 `from brain.api.server import _metadata_store` 读的是 None（未 _init），回退默认值。重构时误改成 `get_metadata_store()`（会触发 `_init()`），导致 test_base.py 的纯文本 Agent 测试（system_prompt 属性读取）反向触发真实服务初始化，污染后续 performance 测试。改为只读 `deps._metadata_store` 当前值，不触发初始化，行为与拆分前一致。教训：业务层读单例要「只读不初始化」，初始化责任留给 API 入口
+  - **测试 fixture 重置改用 `deps.reset_for_test()`**：原 fixture 逐个 `server_module._xxx = None`，拆后改为 `deps_module.reset_for_test()` 一次清零。mock embedding 从 patch `server_module.get_embedding_fn` 改为 patch `deps_module.get_embedding_fn`（deps._init 调用的是自己模块的引用）
+- 经验（HIL 中断消息合并）：
+  - **中断与恢复的答案必须合并成一条消息**：原实现中断时 `add_message` 存第一段答案、resume 的 done 时又 `add_message` 存第二段，数据库里两条 assistant 消息，前端渲染成两条独立气泡。正确做法是中断时存 `status='pending'` 的待续消息、msg_id 暂存到 `sessions.pending_msg_id`，resume 完成时 `update_message` 同一条（合并 content + timeline + 改 status='complete'），始终只有一条消息
+  - **中断时强制标记未完成 tool 为 done**：中断后不会再收到 tool_end 事件，timeline 里 `done=false` 的 tool 会永远停在「进行中」。中断保存时遍历 timeline 把未完成 tool 强制 `done=True`（后端 + 前端两处都要做，因为前端内存 timeline 和后端数据库 timeline 是两套）
+  - **resume 可再次中断**：DeepAgents 多片段场景下 resume 后可能再次 yield interrupt（逐一审批）。resume 的 interrupt 分支同样要合并已流出内容到 pending 消息（status 保持 pending），不能新增消息
+  - **前端复用同一 assistantMsg**：前端 resume 用同一个 `assistantMsg` 调 readStream，token 追加到同一 content，前端天然合并显示。后端只需保证持久化也合并（update 而非 add），前后端一致
+  - **迁移加列要 SQLite + MySQL 双后端同步**：messages 表加 status 列、sessions 表加 pending_msg_id 列，SQLite 的 CREATE TABLE 和 _migrate 的 ALTER TABLE、mysql_schema.py 的 CREATE TABLE 三处都要改。`ADD COLUMN ... NOT NULL DEFAULT 'complete'` 会自动回填旧数据行
+  - **历史消息顺序错乱根因：后端 timeline 只存 tool 不存 thought**：流式打印时前端 tool_start 会把已流出文本归档为 thought 进 timeline，顺序是「文本-工具-文本-工具」。但后端 tool_start 只 append tool 项、不归档 thought，导致持久化的 timeline 是纯工具列表，content 是全部文本拼一起。历史查看时渲染成「工具-工具-文本」。修复：后端 tool_start 也要把当前 answer_parts 归档为 thought 进 timeline 并清空 answer_parts（与前端逻辑一致），done 时 content 只存最后一段文本
+  - **memory 向量用全文而非最后一段**：thought 拆分后 content 只剩最后一段文本，若直接写记忆向量会丢失前面片段的语义。done 时从 timeline 提取所有 thought 拼接 + 最后 content 作为 full_text 写 memory，保证语义检索能命中中间片段
 
 ---
 

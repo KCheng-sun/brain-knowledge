@@ -406,6 +406,66 @@ Commands:
   watch   启动文件监听服务（后台运行）
 ```
 
+### 4.7 API 层 (`brain/api/`)
+
+REST API 后端，FastAPI 实现。**按业务域拆成独立包**，每个包自包含 router + Request/Response 模型，
+达到「增改某个业务的接口和数据模型只需动一个包」的粒度。
+
+```
+brain/api/
+├── __init__.py      # 仅暴露 app
+├── app.py           # FastAPI 实例 + lifespan + CORS + 静态文件挂载 + include_router
+├── server.py        # 兼容垫片：re-export app（uvicorn brain.api.server:app 不破坏）
+├── deps.py          # 服务单例管理：_init() + get_*() 访问器
+└── routes/          # 按业务域拆分的独立包（每个包含 router + models）
+    ├── notes/          # 笔记：增/摄入/内容/编辑/状态/关联/标签
+    │   ├── __init__.py     # re-export router
+    │   ├── router.py       # APIRouter 端点
+    │   └── models.py       # NoteAddRequest/NoteResponse/NoteEditRequest/...
+    ├── search/         # 语义搜索
+    │   ├── __init__.py
+    │   ├── router.py
+    │   └── models.py       # SearchResponse/SearchResultItem
+    ├── ask/            # 深度问答 + 会话 + 片段（HIL）
+    │   ├── __init__.py
+    │   ├── router.py
+    │   └── models.py       # AskRequest/AskResponse/ResumeRequest/SessionItem/...
+    ├── sources/        # 数据源：文件监听 / RSS / 书签导入
+    │   ├── __init__.py
+    │   ├── router.py
+    │   └── models.py       # WatchStatusResponse/RssAddRequest/BookmarkImportResponse
+    ├── scheduler/      # 定时任务 / 摘要报告 / 知识图谱
+    │   ├── __init__.py
+    │   ├── router.py
+    │   └── models.py
+    ├── observability/  # 健康检查 / 指标 / 成本
+    │   ├── __init__.py
+    │   ├── router.py
+    │   └── models.py
+    ├── eval/           # 评估闭环：feedback/scores/bad-cases/golden-cases/runs
+    │   ├── __init__.py
+    │   ├── router.py
+    │   └── models.py       # EvalFeedbackRequest/GoldenCaseRequest
+    ├── prompts/        # 提示词 CRUD + 版本管理
+    │   ├── __init__.py
+    │   ├── router.py
+    │   └── models.py       # PromptUpdateRequest
+    └── review/         # SM-2 复习
+        ├── __init__.py
+        ├── router.py
+        └── models.py       # ReviewRecordRequest
+```
+
+**设计要点：**
+- **业务域自包含**：每个业务一个包，`router.py` 定义端点，`models.py` 定义该域的 Request/Response。
+  增删改某业务的接口和数据模型只动一个包，不牵扯其他包
+- **依赖集中管理**：`deps.py` 持有 `_pipeline/_vector_store/_metadata_store/_hybrid_searcher/_checkpointer/_scheduler/_watcher` 全局单例，
+  `_init()` 懒加载初始化。路由通过 `get_metadata_store()` 等访问器获取，不再每个端点写 `_init()`
+- **消除反向依赖**：原 `brain/prompts.py` 反向 import `brain.api.server._metadata_store`，
+  拆分后改为 `deps.get_metadata_store()`，业务层不再依赖 API 层
+- **兼容垫片**：`server.py` re-export `app`，保证 `uvicorn brain.api.server:app`、`main.py`、
+  测试 fixture（`import brain.api.server as server_module`）不破坏
+
 ---
 
 ## 5. 数据流
@@ -773,6 +833,33 @@ brain review
     ▼
 4. SM-2 算法更新 ease_factor / interval_days / due_date
 ```
+
+**HIL（Human-in-the-Loop）中断与消息合并：**
+
+问答中 Agent 若提议保存知识片段（`propose_knowledge` 工具触发 `interrupt_on`），SSE 流会暂停。
+用户批准/拒绝后通过 `/api/ask/resume` 恢复。难点是「中断前已流出的答案文本」与「恢复后继续生成的文本」
+要合并成**一条** assistant 消息，不能存成两条。
+
+```
+ask/stream
+  ├─ token...（第一段答案）
+  ├─ interrupt → 存入 messages 表（status='pending'），记下 msg_id 到 session.pending_msg_id
+  │            timeline 中未完成 tool 标记为 done（中断后不会再收到 tool_end）
+  │            流结束，等用户决策
+  ▼
+ask/resume
+  ├─ 从 session.pending_msg_id 取出待续消息
+  ├─ token...（第二段答案，累积到同一 answer_parts）
+  ├─ done → update_message(msg_id, content=第一段+第二段, timeline=合并, status='complete')
+  │         清空 session.pending_msg_id
+  └─ 不新增消息
+```
+
+关键点：
+- 中断时**不新增**独立消息，而是存一条 `status='pending'` 的待续消息，msg_id 暂存到 session 表
+- resume 完成时**更新**这条待续消息（追加 content + 合并 timeline），改为 `status='complete'`
+- 中断时保存的 timeline 里未收到 tool_end 的 tool，强制标记 `done=True`（恢复后不会重发 tool_end）
+- session.pending_msg_id 作为「中断态」标记，同时用于检测「上次中断未恢复」（异常退出后残留）
 
 ---
 
@@ -1232,15 +1319,22 @@ CREATE TABLE IF NOT EXISTS prompts (
 );
 ```
 
-**6 个提示词清单：**
+**10 个提示词清单：**
 | key | 来源 | 调用方式 |
-|-----|------|----------|
-| classifier | agents/classifier.py | BaseAgent.system_prompt 类属性 |
-| connector | agents/connector.py | BaseAgent.system_prompt 类属性 |
+|-----|------|--------|
+| classifier | agents/classifier.py | BaseAgent.system_prompt property |
+| connector | agents/connector.py | BaseAgent.system_prompt property |
 | researcher | agents/researcher.py 主 Agent | create_deep_agent(system_prompt=) |
 | title_writer | researcher.py 子智能体 | SubAgent(system_prompt=) |
 | knowledge_extractor | researcher.py 子智能体 | SubAgent(system_prompt=) |
-| judge | eval/judge.py | 字符串 .format(question=,answer=,context=) |
+| judge | eval/judge.py | get_prompt_template(question=,answer=,context=) |
+| query_rewriter | retrieval/query_rewriter.py | get_prompt_template(query=,count=) |
+| daily_digest | services/digest.py | get_prompt_template(notes_section=,...) |
+| weekly_trend | services/digest.py | get_prompt_template(notes_section=,...) |
+| cli_ask | cli/main.py _ask_simple | get_prompt_template(context=,question=) |
+
+> 所有提示词一律从数据库读取，**代码中不得硬编码**。新增提示词只需在
+> `prompt_defaults.py` 的 `DEFAULT_PROMPTS` 加一条，`_seed_prompts` 会自动补充进已初始化的库。
 
 **读取层（新增 brain/prompts.py）：**
 - `get_prompt(key) -> str`：从库读 + 进程内字典缓存，避免每次 Agent 调用都查库
@@ -1254,11 +1348,14 @@ CREATE TABLE IF NOT EXISTS prompts (
 - `classifier.py` / `connector.py`：删 `system_prompt` 类属性，靠基类 property 读
 - `researcher.py`：`_build_agent()` 里 3 处 `system_prompt=` 改读 `get_prompt(key)`（DeepAgents 内部已正确构造 SystemMessage）
 - `eval/judge.py`：`JUDGE_PROMPT` 改调 `get_prompt_template("judge", ...)`；提示词用 `---USER---` 标记 system/user 边界，运行时拆分为两条消息
+- `retrieval/query_rewriter.py`：改调 `get_prompt_template("query_rewriter", query=, count=)`
+- `services/digest.py`：删 `DAILY_DIGEST_PROMPT`/`WEEKLY_TREND_PROMPT` 硬编码 `PromptTemplate`，改调 `get_prompt_template("daily_digest"/"weekly_trend", ...)`
+- `cli/main.py`：`_ask_simple` 的内联 f-string prompt 改调 `get_prompt_template("cli_ask", context=, question=)`
 
 **初始化与种子：**
 - `MetadataStore.initialize()` 后调 `seed_prompts()`
-- 幂等：仅 prompts 表为空时写入 6 条默认值（迁移现有硬编码内容）
-- 提示词初始值 = 当前代码里的 6 段文本
+- 幂等：空表写入全部默认值；已有数据时遍历 `DEFAULT_PROMPTS` 补充缺失的 key（增量升级，如旧库新增 query_rewriter/daily_digest/weekly_trend/cli_ask）
+- 提示词初始值 = `prompt_defaults.py` 的 `DEFAULT_PROMPTS`（10 条）
 
 #### FR56a 提示词管理页面
 

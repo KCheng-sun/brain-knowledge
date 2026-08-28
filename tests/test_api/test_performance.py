@@ -27,9 +27,9 @@ def bulk_client(tmp_path_factory):
 
     性能测试只读不写，5 个测试共享同一份数据，避免重复摄入 2500 条。
     """
-    import brain.config as config_module
+    import brain.api.deps as deps_module
     import brain.api.server as server_module
-
+    import brain.config as config_module
     from brain.config import AppConfig, StorageSettings
 
     tmp_path = tmp_path_factory.mktemp("perf_data")
@@ -43,9 +43,9 @@ def bulk_client(tmp_path_factory):
     )
     # 手动 monkeypatch（session 级 fixture 不能用 function 级的 monkeypatch）
     _orig_config = config_module._config
-    _orig_embed = server_module.get_embedding_fn
+    _orig_embed = deps_module.get_embedding_fn
     config_module._config = cfg
-    server_module.get_embedding_fn = lambda: _mock_embedding
+    deps_module.get_embedding_fn = lambda: _mock_embedding
 
     # mock AI 节点
     from brain.agents.classifier import ClassificationOutput, ClassifierAgent, TypeItem
@@ -58,11 +58,7 @@ def bulk_client(tmp_path_factory):
     )
     ConnectorAgent.run = lambda self, **kwargs: ConnectionOutput(connections=[])
 
-    server_module._pipeline = None
-    server_module._vector_store = None
-    server_module._metadata_store = None
-    server_module._checkpointer = None
-    server_module._watcher = None
+    deps_module.reset_for_test()
 
     with TestClient(server_module.app) as c:
         # 批量摄入 500 条
@@ -75,14 +71,10 @@ def bulk_client(tmp_path_factory):
 
     # 还原所有 patch（session 结束）
     config_module._config = _orig_config
-    server_module.get_embedding_fn = _orig_embed
+    deps_module.get_embedding_fn = _orig_embed
     ClassifierAgent.run = _orig_classifier
     ConnectorAgent.run = _orig_connector
-    server_module._pipeline = None
-    server_module._vector_store = None
-    server_module._metadata_store = None
-    server_module._checkpointer = None
-    server_module._watcher = None
+    deps_module.reset_for_test()
 
 
 class TestPerformance:

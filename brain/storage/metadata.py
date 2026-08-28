@@ -211,7 +211,8 @@ class MetadataStore:
                 id TEXT PRIMARY KEY,
                 title TEXT NOT NULL DEFAULT '新对话',
                 created_at TEXT NOT NULL,
-                updated_at TEXT NOT NULL
+                updated_at TEXT NOT NULL,
+                pending_msg_id INTEGER  -- HIL 中断时暂存待续消息 id（Phase 4C）
             );
 
             CREATE TABLE IF NOT EXISTS messages (
@@ -221,6 +222,7 @@ class MetadataStore:
                 content TEXT NOT NULL,
                 timeline TEXT DEFAULT '[]',      -- JSON: 工具调用轨迹 [{kind, name, args, done}]
                 created_at TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'complete',  -- 'complete' | 'pending'（HIL 中断态）
                 FOREIGN KEY (session_id) REFERENCES sessions(id) ON DELETE CASCADE
             );
 
@@ -453,6 +455,20 @@ class MetadataStore:
                     "SELECT name FROM sqlite_master WHERE type='table' AND name=?", (table,)
                 )
                 return cur.fetchone() is not None
+
+        # messages 表补 status 列（HIL 中断态标记：complete/pending）
+        # MySQL 严格模式不允许 TEXT 列设 DEFAULT，必须用 VARCHAR
+        if has_table("messages") and not has_column("messages", "status"):
+            col_type = "VARCHAR(20)" if self._is_mysql else "TEXT"
+            self._exec(
+                f"ALTER TABLE messages ADD COLUMN status {col_type} NOT NULL DEFAULT 'complete'"
+            )
+            logger.info("迁移: messages 表新增 status 列")
+
+        # sessions 表补 pending_msg_id 列（HIL 中断时暂存待续消息 id）
+        if has_table("sessions") and not has_column("sessions", "pending_msg_id"):
+            self._exec("ALTER TABLE sessions ADD COLUMN pending_msg_id INTEGER")
+            logger.info("迁移: sessions 表新增 pending_msg_id 列")
 
         # eval_scores 补 run_id 列（Phase 5D 评估批次关联）
         if has_table("eval_scores") and not has_column("eval_scores", "run_id"):
@@ -1029,19 +1045,64 @@ class MetadataStore:
         role: str,
         content: str,
         timeline: list | None = None,
+        status: str = "complete",
     ) -> int:
-        """保存一条消息。返回消息 ID。"""
+        """保存一条消息。返回消息 ID。
+
+        Args:
+            status: 'complete'（默认）或 'pending'（HIL 中断时的待续消息）
+        """
         assert self._conn is not None
         import json
 
         timeline_json = json.dumps(timeline or [], ensure_ascii=False)
         cur = self._exec(
-            """INSERT INTO messages (session_id, role, content, timeline, created_at)
-               VALUES (?, ?, ?, ?, ?)""",
-            (session_id, role, content, timeline_json, datetime.now().isoformat()),
+            """INSERT INTO messages (session_id, role, content, timeline, created_at, status)
+               VALUES (?, ?, ?, ?, ?, ?)""",
+            (session_id, role, content, timeline_json, datetime.now().isoformat(), status),
         )
         self._conn.commit()
         return cur.lastrowid
+
+    @_synchronized
+    def update_message(
+        self,
+        msg_id: int,
+        content: str,
+        timeline: list | None = None,
+        status: str = "complete",
+    ) -> bool:
+        """更新一条消息的 content/timeline/status（HIL resume 合并待续消息用）。"""
+        assert self._conn is not None
+        import json
+
+        timeline_json = json.dumps(timeline or [], ensure_ascii=False)
+        cur = self._exec(
+            """UPDATE messages SET content = ?, timeline = ?, status = ?
+               WHERE id = ?""",
+            (content, timeline_json, status, msg_id),
+        )
+        self._conn.commit()
+        return cur.rowcount > 0
+
+    @_synchronized
+    def get_pending_msg_id(self, session_id: str) -> int | None:
+        """获取会话的待续消息 ID（HIL 中断态标记）。None 表示无中断。"""
+        assert self._conn is not None
+        row = self._exec(
+            "SELECT pending_msg_id FROM sessions WHERE id = ?", (session_id,)
+        ).fetchone()
+        return row["pending_msg_id"] if row else None
+
+    @_synchronized
+    def set_pending_msg_id(self, session_id: str, msg_id: int | None) -> None:
+        """设置/清空会话的待续消息 ID（None=清空）。"""
+        assert self._conn is not None
+        self._exec(
+            "UPDATE sessions SET pending_msg_id = ? WHERE id = ?",
+            (msg_id, session_id),
+        )
+        self._conn.commit()
 
     @_synchronized
     def get_messages(self, session_id: str) -> list[dict]:
@@ -1050,7 +1111,7 @@ class MetadataStore:
         import json
 
         rows = self._exec(
-            "SELECT id, role, content, timeline, created_at FROM messages WHERE session_id = ? ORDER BY id",
+            "SELECT id, role, content, timeline, created_at, status FROM messages WHERE session_id = ? ORDER BY id",
             (session_id,),
         ).fetchall()
         result = []
@@ -1066,6 +1127,7 @@ class MetadataStore:
                     "content": r["content"],
                     "timeline": timeline,
                     "created_at": r["created_at"],
+                    "status": r["status"],
                 }
             )
         return result

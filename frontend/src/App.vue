@@ -8,6 +8,7 @@ import {
   EditOutlined,
   InboxOutlined,
   BulbOutlined,
+  TagsOutlined,
   ApartmentOutlined,
   ClockCircleOutlined,
   WifiOutlined,
@@ -34,6 +35,7 @@ const iconMap = {
   add: EditOutlined,
   import: InboxOutlined,
   search: SearchOutlined,
+  tags: TagsOutlined,
   fragments: BulbOutlined,
   graph: ApartmentOutlined,
   review: ClockCircleOutlined,
@@ -102,12 +104,15 @@ async function refreshSessions() {
 }
 
 function newConversation() {
-  router.push("/ask");
-  askRefreshKey.value++;
+  // 先跳路由，等 params 更新后再 bump key 重建 Ask，
+  // 避免 key++ 同步触发重建时 route.params.sessionId 还是旧值（竞态导致要点两次）
+  router.push("/ask").then(() => {
+    askRefreshKey.value++;
+  });
 }
 
 async function selectSession(id) {
-  router.push(`/ask/${id}`);
+  await router.push(`/ask/${id}`);
   askRefreshKey.value++;
 }
 

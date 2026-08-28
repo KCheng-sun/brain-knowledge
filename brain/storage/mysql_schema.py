@@ -98,6 +98,7 @@ MYSQL_DDL = [
   `content` text COLLATE utf8mb4_unicode_ci,
   `timeline` text COLLATE utf8mb4_unicode_ci,
   `created_at` text COLLATE utf8mb4_unicode_ci,
+  `status` varchar(20) COLLATE utf8mb4_unicode_ci NOT NULL DEFAULT 'complete',
   PRIMARY KEY (`id`),
   KEY `idx_messages_session` (`session_id`(255),`id`)
 ) ENGINE=InnoDB AUTO_INCREMENT=74 DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci""",
@@ -200,6 +201,7 @@ MYSQL_DDL = [
   `title` text COLLATE utf8mb4_unicode_ci,
   `created_at` text COLLATE utf8mb4_unicode_ci,
   `updated_at` text COLLATE utf8mb4_unicode_ci,
+  `pending_msg_id` int DEFAULT NULL,
   PRIMARY KEY (`id`),
   KEY `idx_sessions_updated` (`updated_at`(255))
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci""",

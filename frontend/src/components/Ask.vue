@@ -98,6 +98,7 @@ async function loadHistory(sessionId) {
       const msg = {
         role: m.role,
         content: m.content,
+        done: true, // 历史消息已加载完成，点踩按钮可显示
         // 历史消息的 timeline 里 args 是对象，格式化为字符串以便模板显示
         timeline: (m.timeline || []).map((item) => ({
           ...item,
@@ -147,6 +148,7 @@ async function send() {
     timeline: [], // 统一时间线: [{kind: 'thought'|'tool', ...}] 按发生顺序
     status: "",
     question: q, // 保存对应问题（点踩反馈用）
+    done: false, // 流式是否完成（完成前不显示点踩按钮，避免随 token 闪现）
   });
   messages.value.push(assistantMsg);
   scrollToBottom();
@@ -360,11 +362,16 @@ function handleEvent(event, assistantMsg) {
       break;
 
     case "interrupt":
-      // HIL 中断：返回中断信息，由外层 waitForDecision 处理
+      // HIL 中断：中断后不会再收到 tool_end，把未完成 tool 标记为 done
+      for (const item of assistantMsg.timeline) {
+        if (item.kind === "tool" && !item.done) item.done = true;
+      }
+      // 返回中断信息，由外层 waitForDecision 处理
       return { session_id: event.session_id, proposals: event.proposals || [] };
 
     case "done":
       // 回答完成，通知父组件刷新会话列表（标题/时间已更新）
+      assistantMsg.done = true;
       emit("session-updated");
       break;
   }
@@ -474,7 +481,7 @@ function formatArgs(args) {
                 ></div>
 
                 <!-- 点踩按钮（Phase 5D FR54 bad case 回流） -->
-                <div v-if="m.content" style="margin-top: 4px">
+                <div v-if="m.content && m.done" style="margin-top: 4px">
                   <a-button
                     v-if="!m.thumbsDown"
                     size="small"

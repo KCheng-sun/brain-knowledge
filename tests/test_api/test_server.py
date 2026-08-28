@@ -26,6 +26,7 @@ def _mock_embedding(texts: list[str]) -> list[list[float]]:
 @pytest.fixture
 def client(tmp_path, monkeypatch):
     """构造指向临时目录的测试客户端。"""
+    import brain.api.deps as deps_module
     import brain.api.server as server_module
     import brain.config as config_module
 
@@ -44,8 +45,8 @@ def client(tmp_path, monkeypatch):
     cfg.database.host = None
     monkeypatch.setattr(config_module, "_config", cfg)
 
-    # 2. mock embedding 函数
-    monkeypatch.setattr(server_module, "get_embedding_fn", lambda: _mock_embedding)
+    # 2. mock embedding 函数（deps._init 会调用它）
+    monkeypatch.setattr(deps_module, "get_embedding_fn", lambda: _mock_embedding)
 
     # 3. mock 摄入流水线的 AI 节点（classify/connect），避免真实 LLM 调用
     from brain.agents.classifier import ClassificationOutput, ClassifierAgent, TypeItem
@@ -64,23 +65,14 @@ def client(tmp_path, monkeypatch):
         lambda self, **kwargs: ConnectionOutput(connections=[]),
     )
 
-    # 4. 重置服务单例
-    server_module._pipeline = None
-    server_module._vector_store = None
-    server_module._metadata_store = None
-    server_module._hybrid_searcher = None  # Phase 5F：重置混合检索器
-    server_module._checkpointer = None
-    server_module._watcher = None
+    # 4. 重置服务单例（通过 deps.reset_for_test 清零，路由通过 deps 访问器读取）
+    deps_module.reset_for_test()
 
     with TestClient(server_module.app) as c:
         yield c
 
     # 清理
-    server_module._pipeline = None
-    server_module._vector_store = None
-    server_module._metadata_store = None
-    server_module._checkpointer = None
-    server_module._watcher = None
+    deps_module.reset_for_test()
 
 
 class TestNotesAPI:
