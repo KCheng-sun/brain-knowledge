@@ -94,7 +94,7 @@ brain status                         # 知识库统计
        │              │              │
 ┌──────▼──────────────▼──────────────▼───────────┐
 │                 存储层                           │
-│  ChromaDB(笔记/记忆/片段) + SQLite(元数据/会话)  │
+│  PostgreSQL + pgvector（笔记/记忆/片段向量 + 元数据/会话）  │
 └─────────────────────────────────────────────────┘
 ```
 
@@ -103,8 +103,8 @@ brain status                         # 知识库统计
 | 层 | 机制 | 存储 | 说明 |
 |----|------|------|------|
 | 工作记忆 | 最近 10 轮消息进上下文 | `messages` 表 | 会话内短期 |
-| 检索记忆 | 消息向量化 + 语义检索 + 同会话加权 | ChromaDB `conversation_memory` | 跨会话按需取回 |
-| 知识沉淀 | 子智能体提取 → HIL 用户确认 → 向量入库 | `knowledge_fragments` + ChromaDB | 长期结构化记忆 |
+| 检索记忆 | 消息向量化 + 语义检索 + 同会话加权 | pgvector `vec_conversation_memory` | 跨会话按需取回 |
+| 知识沉淀 | 子智能体提取 → HIL 用户确认 → 向量入库 | `knowledge_fragments` + pgvector `vec_fragment_memory` | 长期结构化记忆 |
 
 ## 🎴 SM-2 间隔重复
 
@@ -135,7 +135,7 @@ deep_agents/
 │   ├── api/                # FastAPI 后端
 │   ├── agents/             # DeepAgents（主 Agent + 子智能体 + 中间件）
 │   ├── ingestion/          # 摄入（流水线/监听/RSS/解析/分块）
-│   ├── storage/            # ChromaDB + SQLite
+│   ├── storage/            # PostgreSQL + pgvector
 │   ├── services/           # 摘要/复习(SM-2)/调度器
 │   ├── cli/                # Click CLI
 │   ├── llm.py              # LLM 统一入口（provider 可切换）

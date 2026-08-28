@@ -31,8 +31,8 @@ def _get_pipeline() -> IngestionPipeline:
     """懒加载摄入流水线（包含 vector_store 和 metadata_store 的初始化）。"""
     cfg = get_config()
     embedding_fn = get_embedding_fn()
-    vector_store = VectorStore(persist_dir=cfg.storage.chroma_dir, embedding_fn=embedding_fn)
-    metadata_store = MetadataStore(db_path=cfg.storage.db_path)
+    vector_store = VectorStore(dsn=cfg.database.dsn, embedding_fn=embedding_fn)
+    metadata_store = MetadataStore(dsn=cfg.database.dsn)
     # MetadataStore 是同步实现，直接初始化（无需事件循环包装）
     if not hasattr(_get_pipeline, "_metadata_initialized"):
         metadata_store.initialize()
@@ -51,9 +51,9 @@ def _get_search_components():
     """懒加载搜索组件（含 Phase 5F 混合检索器）。"""
     cfg = get_config()
     embedding_fn = get_embedding_fn()
-    vector_store = VectorStore(persist_dir=cfg.storage.chroma_dir, embedding_fn=embedding_fn)
+    vector_store = VectorStore(dsn=cfg.database.dsn, embedding_fn=embedding_fn)
 
-    metadata_store = MetadataStore(db_path=cfg.storage.db_path)
+    metadata_store = MetadataStore(dsn=cfg.database.dsn)
     # MetadataStore 是同步实现，直接初始化
     if not hasattr(_get_search_components, "_md_initialized"):
         metadata_store.initialize()
@@ -119,10 +119,10 @@ def cli(ctx, verbose: bool, dry_run: bool):
     else:
         logger.remove()
         logger.add(lambda msg: click.echo(msg, err=True), level="INFO", format="{message}")
-        # 抑制 ChromaDB / sentence-transformers 的内部日志
+        # 抑制 sentence-transformers / httpx 的内部日志
         import logging as std_logging
 
-        for name in ["chromadb", "sentence_transformers", "transformers", "httpx", "urllib3"]:
+        for name in ["sentence_transformers", "transformers", "httpx", "urllib3"]:
             std_logging.getLogger(name).setLevel(std_logging.WARNING)
 
     if dry_run:
@@ -282,7 +282,7 @@ def ask(question: str, simple: bool):
     默认使用 DeepAgents 多步推理（多次搜索 + 关联追踪）。
     示例:
       brain ask "我关于 Agent 架构的思考有哪些关键结论？"
-      brain ask -s "ChromaDB 参数"    # 简单 RAG 模式
+      brain ask -s "RAG 参数"    # 简单 RAG 模式
     """
     vector_store, metadata_store, hybrid_searcher = _get_search_components()
 
@@ -700,8 +700,8 @@ def metrics(hours: int, traces: int):
 
     cfg = get_config()
     embedding_fn = get_embedding_fn()
-    vector_store = VectorStore(persist_dir=cfg.storage.chroma_dir, embedding_fn=embedding_fn)
-    metadata_store = MetadataStore(db_path=cfg.storage.db_path)
+    vector_store = VectorStore(dsn=cfg.database.dsn, embedding_fn=embedding_fn)
+    metadata_store = MetadataStore(dsn=cfg.database.dsn)
     metadata_store.initialize()
 
     # 健康检查
@@ -759,7 +759,7 @@ def cost(hours: int, days: int):
     from brain.config import get_config
 
     cfg = get_config()
-    ms = MetadataStore(db_path=cfg.storage.db_path)
+    ms = MetadataStore(dsn=cfg.database.dsn)
     ms.initialize()
 
     summary = ms.get_cost_summary()
@@ -830,8 +830,8 @@ def eval_cmd(dataset: str | None, limit: int | None, verbose: bool):
     from brain.storage.vector_store import VectorStore
 
     cfg = get_config()
-    vs = VectorStore(persist_dir=cfg.storage.chroma_dir, embedding_fn=get_embedding_fn())
-    ms = MetadataStore(db_path=cfg.storage.db_path)
+    vs = VectorStore(dsn=cfg.database.dsn, embedding_fn=get_embedding_fn())
+    ms = MetadataStore(dsn=cfg.database.dsn)
     ms.initialize()
 
     runner = EvalRunner(vs, ms)
@@ -884,7 +884,7 @@ def budget(reset: bool, reset_month: bool, set_limit: int | None):
     from brain.storage.metadata import MetadataStore
 
     cfg = get_config()
-    store = MetadataStore(cfg.storage.db_path)
+    store = MetadataStore(cfg.database.dsn)
     store.initialize()
 
     if reset or reset_month:
@@ -1078,7 +1078,7 @@ def main():
     try:
         cli()
     finally:
-        # ChromaDB / sentence-transformers 的非 daemon 线程会阻止进程退出，
+        # sentence-transformers 的非 daemon 线程会阻止进程退出，
         # 用 os._exit 强制退出（CLI 命令执行完后不涉及数据丢失风险）
         os._exit(0)
 

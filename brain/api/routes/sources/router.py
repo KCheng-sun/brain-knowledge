@@ -14,7 +14,7 @@
 import tempfile
 from pathlib import Path
 
-from fastapi import APIRouter, File, HTTPException, UploadFile
+from fastapi import APIRouter, File, HTTPException, Query, UploadFile
 from loguru import logger
 
 from brain.api.deps import get_metadata_store, get_pipeline, get_watcher, set_watcher
@@ -120,20 +120,32 @@ def rss_list():
 
 @router.post("/rss", response_model=RssFetchResponse)
 def rss_add_and_fetch(req: RssAddRequest):
-    """添加订阅源并立即拉取一次。"""
+    """添加订阅源并立即拉取一次。
+
+    源已添加但拉取失败时返回 422（带 errors），前端可提示用户稍后重试拉取。
+    """
     from brain.ingestion.sources.rss import RssSource
 
     pipeline = get_pipeline()
     ms = get_metadata_store()
     source = RssSource(pipeline, ms)
     feed_id = source.add_feed(req.url)
-    new_count = source.fetch_feed(feed_id)
 
-    return RssFetchResponse(
-        feeds_checked=1,
-        new_entries=new_count,
-        errors=[],
-    )
+    try:
+        new_count = source.fetch_feed(feed_id)
+        return RssFetchResponse(
+            feeds_checked=1,
+            new_entries=new_count,
+            errors=[],
+        )
+    except ValueError as e:
+        # 源已添加成功，但拉取失败（网络/解析问题）——返回 422 带错误详情
+        from fastapi import HTTPException
+
+        raise HTTPException(
+            status_code=422,
+            detail=f"订阅源已添加，但首次拉取失败: {e}",
+        ) from None
 
 
 @router.post("/rss/fetch", response_model=RssFetchResponse)
@@ -144,6 +156,42 @@ def rss_fetch_all():
     source = RssSource(get_pipeline(), get_metadata_store())
     summary = source.fetch_all()
     return RssFetchResponse(**summary)
+
+
+@router.post("/rss/{feed_id}/fetch", response_model=RssFetchResponse)
+def rss_fetch_one(feed_id: int):
+    """拉取单个订阅源的新文章。
+
+    拉取失败（网络/解析问题）时返回 422 带错误详情。
+    """
+    from brain.ingestion.sources.rss import RssSource
+
+    ms = get_metadata_store()
+    if ms.get_rss_feed(feed_id) is None:
+        raise HTTPException(status_code=404, detail="订阅源不存在")
+
+    source = RssSource(get_pipeline(), ms)
+    try:
+        new_count = source.fetch_feed(feed_id)
+        return RssFetchResponse(
+            feeds_checked=1,
+            new_entries=new_count,
+            errors=[],
+        )
+    except ValueError as e:
+        raise HTTPException(
+            status_code=422,
+            detail=f"拉取失败: {e}",
+        ) from None
+
+
+@router.get("/rss/{feed_id}/entries")
+def rss_entries(feed_id: int, limit: int = Query(50, ge=1, le=200)):
+    """列出某订阅源的条目（含正文，按发布时间倒序）。"""
+    ms = get_metadata_store()
+    if ms.get_rss_feed(feed_id) is None:
+        raise HTTPException(status_code=404, detail="订阅源不存在")
+    return ms.list_rss_entries(feed_id, limit=limit)
 
 
 @router.delete("/rss/{feed_id}")

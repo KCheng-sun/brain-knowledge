@@ -1,6 +1,5 @@
 """VectorStore 单元测试。"""
 
-import pytest
 
 from brain.models import Chunk
 

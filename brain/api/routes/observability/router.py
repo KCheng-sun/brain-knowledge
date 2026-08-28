@@ -20,7 +20,7 @@ router = APIRouter(prefix="/api", tags=["observability"])
 
 @router.get("/health")
 def get_health():
-    """健康检查——探测 LLM/Embedding/SQLite/ChromaDB 连通性。
+    """健康检查——探测 LLM/Embedding/PostgreSQL/pgvector 连通性。
 
     LLM 探测默认跳过（避免烧配额），仅 dry_run 时真调。
     Embedding 探测用空字符串，不消耗有意义配额。

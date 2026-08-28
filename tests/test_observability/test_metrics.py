@@ -603,13 +603,13 @@ class TestHealthCheck:
         """所有组件正常时应返回 healthy。"""
         # embedding_fn 用一个返回固定向量的 mock
         def mock_embed(texts):
-            return [[0.1] * 384 for _ in texts]
+            return [[0.1] * 1024 for _ in texts]
 
         result = check_health(metadata_store, vector_store, mock_embed)
 
         assert result["status"] == "healthy"
-        assert result["components"]["sqlite"] == "ok"
-        assert result["components"]["chromadb"] == "ok"
+        assert result["components"]["postgres"] == "ok"
+        assert result["components"]["vector"] == "ok"
         assert result["components"]["embedding"] == "ok"
         assert "timestamp" in result
 
@@ -620,17 +620,17 @@ class TestHealthCheck:
         assert result["components"]["embedding"] == "skipped"
         assert result["status"] == "healthy"  # skipped 不算 degraded
 
-    def test_check_health_sqlite_error(self, vector_store):
-        """SQLite 故障时应返回 degraded/unhealthy。"""
+    def test_check_health_db_error(self, vector_store):
+        """PostgreSQL 故障时应返回 degraded/unhealthy。"""
         class BrokenStore:
             def count_notes(self):
                 raise RuntimeError("DB down")
 
         def mock_embed(texts):
-            return [[0.1] * 384 for _ in texts]
+            return [[0.1] * 1024 for _ in texts]
 
         result = check_health(BrokenStore(), vector_store, mock_embed)
 
-        assert "error" in result["components"]["sqlite"]
-        # sqlite error + chromadb ok = 1 个 error => degraded
+        assert "error" in result["components"]["postgres"]
+        # postgres error + vector ok = 1 个 error => degraded
         assert result["status"] in ("degraded", "unhealthy")

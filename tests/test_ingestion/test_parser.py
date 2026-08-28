@@ -1,8 +1,6 @@
 """DocumentParser 单元测试。"""
 
-from pathlib import Path
 
-from brain.ingestion.parser import DocumentParser
 
 
 class TestDocumentParser:

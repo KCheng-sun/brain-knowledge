@@ -58,7 +58,7 @@
 ┌──────────────────────────▼──────────────────────────────────┐
 │                    存储层 (Storage)                           │
 │  ┌──────────────┐ ┌──────────────┐ ┌──────────────────────┐ │
-│  │ ChromaDB     │ │ SQLite       │ │ NetworkX Graph       │ │
+│  │ pgvector     │ │ PostgreSQL   │ │ NetworkX Graph       │ │
 │  │ 向量存储     │ │ 元数据/标签  │ │ 知识图谱（轻量）     │ │
 │  │ 语义检索     │ │ CRUD 操作    │ │ 关联关系             │ │
 │  └──────────────┘ └──────────────┘ └──────────────────────┘ │
@@ -85,16 +85,30 @@
 | **流程控制** | LangGraph | 有状态的图流水线、Checkpoint 持久化、Human-in-the-Loop |
 | **多 Agent** | DeepAgents | 层次化 Agent 调度、深度推理、可插拔 Agent 定义 |
 | **LLM** | Claude API (claude-fable-5) | 最强推理能力，适合深度分类/关联/问答 |
-| **Embedding** | sentence-transformers (all-MiniLM-L6-v2) | 本地运行、轻量、384 维、中文友好 |
+| **Embedding** | sentence-transformers (BGE-large-zh) | 本地运行、1024 维、中文优化 |
 
 ### 3.2 存储
 
 | 组件 | 选型 | 用途 | Phase |
 |------|------|------|-------|
-| **向量数据库** | ChromaDB | 语义检索 | P0 |
-| **关系型** | SQLite | 笔记元数据、标签、摄入日志 | P0 |
+| **关系型数据库** | PostgreSQL 17 | 笔记元数据、标签、摄入日志、会话、指标等全部业务数据 | P0 |
+| **向量检索** | pgvector（PostgreSQL 扩展） | 语义检索（笔记分块/对话记忆/知识片段向量） | P0 |
+| **检查点** | PostgresSaver（LangGraph） | HIL 中断恢复、会话状态持久化 | P0 |
 | **图存储** | NetworkX | 知识图谱关联（内存图，JSON 持久化） | P1 |
 | **文件系统** | 本地目录 `data/notes/` | Markdown 笔记原始文件 | P0 |
+
+> **统一存储**：业务元数据 + 向量检索 + Checkpoint 全部存在一个 PostgreSQL 库（brain），
+> 便于备份（`pg_dump brain`）和事务一致。表名按层级加前缀区分（见 4.1）。
+
+#### 表命名约定（三层）
+
+| 层级 | 表名前缀 | 示例 | 创建者 |
+|------|---------|------|--------|
+| 业务元数据 | 无（主体） | `notes`、`sessions`、`messages` | MetadataStore |
+| 向量检索 | `vec_` | `vec_note_chunks`、`vec_conversation_memory` | VectorStore |
+| 检查点 | `checkpoint_` | `checkpoints`、`checkpoint_blobs` | LangGraph PostgresSaver |
+
+所有表和关键字段均带 `COMMENT ON` 注释，数据库可直接查看用途。
 
 ### 3.3 工具库
 
@@ -119,44 +133,45 @@
 
 ```python
 class VectorStore:
-    """ChromaDB 封装"""
-    collection: chromadb.Collection
-    embedding_fn: Callable  # sentence-transformers
+    """pgvector 封装——向量检索层"""
+    # 三张表（vec_ 前缀）：
+    #   vec_note_chunks        笔记分块向量
+    #   vec_conversation_memory 对话消息向量（第二层记忆）
+    #   vec_fragment_memory     知识片段向量（第三层记忆）
+    embedding_fn: Callable  # BGE-large-zh, 1024 维
 
-    async def add(notes: list[NoteChunk]) -> list[str]
-        # 将分块嵌入后存入 Chroma
+    def add(chunks: list[Chunk]) -> list[str]
+        # 将分块嵌入后存入 pgvector
 
-    async def search(query: str, top_k: int = 10) -> list[SearchResult]
+    def search(query: str, top_k: int = 10) -> list[SearchResult]
         # 语义搜索，返回带相似度分数的结果
 
-    async def delete(note_ids: list[str]) -> None
-        # 按 ID 删除向量
-
-    async def get_by_ids(ids: list[str]) -> list[NoteChunk]
+    def delete_by_note(note_id: str) -> None
+        # 按笔记 ID 删除全部分块向量
 ```
 
 #### 4.1.2 MetadataStore (`metadata.py`)
 
 ```python
 class MetadataStore:
-    """SQLite 元数据管理"""
+    """PostgreSQL 元数据管理——业务层（19 张表，无前缀）"""
     
-    async def create_note(meta: NoteMetadata) -> str
-    async def get_note(note_id: str) -> NoteMetadata | None
+    def create_note(meta: NoteMetadata) -> str
+    def get_note(note_id: str) -> NoteMetadata | None
     async def update_note(note_id: str, updates: dict) -> None
-    async def delete_note(note_id: str) -> None
-    async def list_notes(
+    def delete_note(note_id: str) -> None
+    def list_notes(
         tags: list[str] = None,
         date_from: datetime = None,
         date_to: datetime = None,
         limit: int = 50
     ) -> list[NoteMetadata]
-    async def add_tags(note_id: str, tags: list[Tag]) -> None
-    async def add_connection(conn: Connection) -> None
-    async def get_connections(note_id: str) -> list[Connection]
+    def add_tags(note_id: str, tags: list[Tag]) -> None
+    def add_connection(conn: Connection) -> None
+    def get_connections(note_id: str) -> list[Connection]
 ```
 
-**SQLite Schema:**
+**PostgreSQL Schema（核心表，完整定义见 `metadata.py:_create_tables`）：**
 
 ```sql
 -- 笔记元数据表
@@ -177,7 +192,7 @@ CREATE TABLE notes (
 
 -- 标签表
 CREATE TABLE tags (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    id SERIAL PRIMARY KEY,
     name TEXT NOT NULL UNIQUE,
     category TEXT NOT NULL,       -- 'topic' | 'type' | 'language' | 'difficulty'
     is_ai_generated BOOLEAN DEFAULT 0
@@ -193,7 +208,7 @@ CREATE TABLE note_tags (
 
 -- 关联表
 CREATE TABLE connections (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    id SERIAL PRIMARY KEY,
     source_note_id TEXT NOT NULL,
     target_note_id TEXT NOT NULL,
     relation_type TEXT NOT NULL,  -- 'related' | 'extends' | 'contradicts' | 'references'
@@ -205,7 +220,7 @@ CREATE TABLE connections (
 
 -- 摄入日志表
 CREATE TABLE ingestion_log (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    id SERIAL PRIMARY KEY,
     note_id TEXT NOT NULL,
     event TEXT NOT NULL,          -- 'parsed' | 'chunked' | 'embedded' | 'classified' | 'connected'
     status TEXT NOT NULL,         -- 'success' | 'error'
@@ -299,7 +314,7 @@ def build_ingestion_pipeline() -> StateGraph:
     graph.add_node("embed", embed_node)         # 嵌入 + 存入 Chroma
     graph.add_node("classify", classify_node)   # DeepAgents 分类
     graph.add_node("connect", connect_node)     # DeepAgents 关联发现
-    graph.add_node("index", index_node)         # 写入 SQLite 元数据
+    graph.add_node("index", index_node)         # 写入 PostgreSQL 元数据
     
     # 定义流程
     graph.set_entry_point("parse")
@@ -313,7 +328,7 @@ def build_ingestion_pipeline() -> StateGraph:
     # 错误处理: 每个节点出错时记录错误到 state.errors，继续执行
     # classify 和 connect 可以并行执行（无依赖关系时）
     
-    return graph.compile(checkpointer=SqliteSaver)
+    return graph.compile(checkpointer=PostgresSaver)
 ```
 
 **错误处理策略**：非关键节点失败不阻塞流水线。解析失败→直接终止；分块失败→终止；嵌入失败→终止；分类失败→跳过，记录错误；关联发现失败→跳过，记录错误。
@@ -492,22 +507,22 @@ brain/api/
        │
        ▼
 ┌──────────────────┐
-│ 4. 嵌入 + 向量存储│  sentence-transformers → ChromaDB
+│ 4. 嵌入 + 向量存储│  BGE-large-zh → pgvector
 └──────┬───────────┘  (LangChain: HuggingFaceEmbeddings + Chroma)
        │
        ▼
 ┌──────────────────┐
 │ 5. 分类          │  DeepAgents → 多维标签
-└──────┬───────────┘  写入 SQLite note_tags
+└──────┬───────────┘  写入 PostgreSQL note_tags
        │
        ▼
 ┌──────────────────┐
-│ 6. 关联发现      │  DeepAgents → 发现关联 → 写入 SQLite connections
+│ 6. 关联发现      │  DeepAgents → 发现关联 → 写入 PostgreSQL connections
 └──────┬───────────┘  同时更新 NetworkX 图
        │
        ▼
 ┌──────────────────┐
-│ 7. 元数据索引    │  写入 SQLite notes 表
+│ 7. 元数据索引    │  写入 PostgreSQL notes 表
 └──────┬───────────┘
        │
        ▼
@@ -527,7 +542,7 @@ brain/api/
        ├─ 搜索型 ──────────┐
        │                    ▼
        │            ┌──────────────┐
-       │            │ 混合检索     │  ChromaDB 向量 + SQLite 关键词
+       │            │ 混合检索     │  pgvector 向量 + pg_trgm 关键词
        │            │ → 排名 → 返回│
        │            └──────────────┘
        │
@@ -557,8 +572,14 @@ brain/api/
 storage:
   data_dir: "~/.brain/data"
   notes_dir: "~/.brain/notes"       # 被监听的 Markdown 文件夹
-  chroma_dir: "~/.brain/data/chroma"
-  db_path: "~/.brain/data/metadata.db"
+
+# 数据库（PostgreSQL）
+database:
+  host: localhost
+  port: 5432
+  user: postgres
+  password: ""
+  database: brain                  # 业务+向量+检查点统一存此库
 
 # LLM 配置
 llm:
@@ -635,8 +656,8 @@ deep_agents/                        # 项目根目录
 │   │   └── pipeline.py             # LangGraph 摄入流水线
 │   ├── storage/
 │   │   ├── __init__.py
-│   │   ├── vector_store.py         # ChromaDB 封装
-│   │   ├── metadata.py             # SQLite 封装
+│   │   ├── vector_store.py         # pgvector 封装
+│   │   ├── metadata.py             # PostgreSQL 元数据封装
 │   │   └── graph_store.py          # NetworkX 图存储 (P2)
 │   ├── agents/
 │   │   ├── __init__.py
@@ -691,7 +712,7 @@ CLI 层       | 捕获所有异常 → 友好的错误信息 + 日志路径提�
 
 | 层级 | 测试类型 | 覆盖目标 |
 |------|----------|----------|
-| 存储层 | 单元测试 | SQLite CRUD、ChromaDB 读写（用临时目录） |
+| 存储层 | 单元测试 | PostgreSQL CRUD、pgvector 读写（用独立 schema 隔离） |
 | 接入层 | 单元测试 | Markdown 解析、分块逻辑 |
 | 流水线 | 集成测试 | 端到端摄入流程（用测试 LLM/Embedding mock） |
 | Agent | 单元测试 | Mock LLM 响应，验证 Agent 输出格式 |
@@ -720,7 +741,7 @@ CLI 层       | 捕获所有异常 → 友好的错误信息 + 日志路径提�
 - [x] Agent 基类：`brain/agents/base.py` — DeepAgents 配置 + 通用执行器
 - [x] 分类 Agent：`brain/agents/classifier.py` — 分析笔记生成多维标签
 - [x] 关联 Agent：`brain/agents/connector.py` — 向量粗筛 + DeepAgents 深度分析
-- [x] 流水线扩展：`classify` 和 `connect` 节点，执行后写入 SQLite
+- [x] 流水线扩展：`classify` 和 `connect` 节点，执行后写入 PostgreSQL
 - [x] CLI 扩展：`search --tag` 按标签过滤、`brain connections` 查看关联
 - [x] 测试：Agent 输出格式验证（mock LLM 响应）
 
@@ -736,7 +757,7 @@ DeepAgents 结构化 Prompt:
    { topics: [{name, confidence}], type: {name, confidence}, difficulty: {name, confidence} }"
     │
     ▼
-解析 JSON → Tag 列表 → 写入 SQLite note_tags
+解析 JSON → Tag 列表 → 写入 PostgreSQL note_tags
 ```
 
 **关联 Agent 流程：**
@@ -744,7 +765,7 @@ DeepAgents 结构化 Prompt:
 新笔记 note_id
     │
     ▼
-1. ChromaDB 向量搜索 → Top 20 候选笔记
+1. pgvector 向量搜索 → Top 20 候选笔记
     │
     ▼
 2. DeepAgents 深度分析 Prompt:
@@ -754,7 +775,7 @@ DeepAgents 结构化 Prompt:
 3. 输出 [{target_note_id, relation_type, strength, description}]
     │
     ▼
-4. 写入 SQLite connections
+4. 写入 PostgreSQL connections
 ```
 
 **流水线变化：**
@@ -785,7 +806,7 @@ classify 和 connect 在 embed 后串行执行（实际实现中为顺序节点�
 brain digest
     │
     ▼
-1. 收集昨日摄入的笔记（SQLite）
+1. 收集昨日摄入的笔记（PostgreSQL）
     │
     ▼
 2. 收集昨日的 AI 标签 + AI 关联
@@ -947,7 +968,7 @@ brain bookmarks ./bookmarks.json
 #### FR36 笔记编辑
 
 **设计思路：** 暴露已有 `update_note`，新增标签增删和关联删除。**内容编辑走重新摄入**
-（内容存在 ChromaDB 分块，原地改内容需重建向量，复杂度高，本期不做）。
+（内容存在 pgvector 分块，原地改内容需重建向量，复杂度高，本期不做）。
 
 **新增存储方法：**
 - `MetadataStore.remove_tag_from_note(note_id, tag_name)`：按标签名删除关联（需先查 tag_id）
@@ -988,13 +1009,13 @@ ResearcherAgent 显式子问题分解环节。当前多次搜索但非显式分�
 - [x] FR42 全链路 Trace ID：每次问答生成 trace_id，贯穿 LLM/工具/日志，写入 messages 表
 - [x] FR43 结构化 JSON 日志：loguru 增加 JSON sink，带 trace_id/agent/tool 字段
 - [x] FR44 核心指标采集：问答延迟/工具调用次数/Token 消耗/摄入耗时写入 metrics 表
-- [x] FR45 健康检查：/api/health 探测 LLM/Embedding/SQLite/ChromaDB 连通性
+- [x] FR45 健康检查：/api/health 探测 LLM/Embedding/PostgreSQL/pgvector 连通性
 - [x] FR46 可观测性页面：前端 Observability 页（健康状态/指标看板/最近调用链）
 
 ### 14.2 Phase 5A 核心设计
 
 **设计原则：本地优先，轻量实现**
-- 不引入 Prometheus/ELK/Jaeger，指标存 SQLite、日志存本地文件、Trace 存 messages 表
+- 不引入 Prometheus/ELK/Jaeger，指标存 PostgreSQL、日志存本地文件、Trace 存 messages 表
 - trace_id 用 UUID4 短格式，与现有 note_id 风格一致
 - 指标表只追加不修改，符合审计日志原则
 
@@ -1021,7 +1042,7 @@ ResearcherAgent 显式子问题分解环节。当前多次搜索但非显式分�
 **metrics 表设计（核心指标采集）：**
 ```sql
 CREATE TABLE IF NOT EXISTS metrics (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    id SERIAL PRIMARY KEY,
     trace_id TEXT,              -- 关联问答会话
     metric_type TEXT NOT NULL,  -- 'ask'|'ingest'|'tool_call'|'llm_call'
     metric_name TEXT NOT NULL,  -- 'latency_ms'|'token_count'|'count'
@@ -1036,7 +1057,7 @@ CREATE INDEX IF NOT EXISTS idx_metrics_trace ON metrics(trace_id);
 **trace_events 表设计（完整调用链回放）：**
 ```sql
 CREATE TABLE IF NOT EXISTS trace_events (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    id SERIAL PRIMARY KEY,
     trace_id TEXT NOT NULL,
     seq INTEGER NOT NULL,          -- 同一 trace 内递增序号
     event_type TEXT NOT NULL,     -- 'llm_start'|'llm_end'|'tool_start'|'tool_end'
@@ -1062,8 +1083,8 @@ GET /api/health
 {
   "status": "healthy"|"degraded"|"unhealthy",
   "components": {
-    "sqlite": "ok"|"error",
-    "chromadb": "ok"|"error",
+    "postgres": "ok"|"error",
+    "vector": "ok"|"error",
     "embedding": "ok"|"error",
     "llm": "ok"|"skipped"|"error"
   },
@@ -1073,7 +1094,7 @@ GET /api/health
 LLM/Embedding 探测用最小调用（dry-run 或 1 token），避免消耗配额。
 
 **可观测性页面（前端 Observability.vue）：**
-- 健康状态卡片：四组件状态灯（SQLite/ChromaDB/Embedding/LLM）
+- 健康状态卡片：四组件状态灯（PostgreSQL/pgvector/Embedding/LLM）
 - 指标看板：今日问答数、平均延迟、工具调用总数、Token 消耗（折线图/数字卡片）
 - 最近调用链：最近 20 条 ask 记录，点击展开看完整调用链回放（LLM 请求响应文本 + 工具入参出参）和数值指标
 
@@ -1231,7 +1252,7 @@ score = 0.5*keyword + 0.3*source + 0.2*complete
 **bad_cases 存数据库（bad_cases 表），支持页面查看/删除/转 golden：**
 ```sql
 CREATE TABLE IF NOT EXISTS bad_cases (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    id SERIAL PRIMARY KEY,
     trace_id TEXT,
     question TEXT,
     answer TEXT,
@@ -1257,7 +1278,7 @@ CREATE TABLE IF NOT EXISTS bad_cases (
 **eval_scores 表：**
 ```sql
 CREATE TABLE IF NOT EXISTS eval_scores (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    id SERIAL PRIMARY KEY,
     trace_id TEXT,
     question TEXT,
     answer TEXT,
@@ -1279,7 +1300,7 @@ CREATE TABLE IF NOT EXISTS eval_scores (
 **eval_runs 表：记录每次评估批次（离线评估 + Judge 抽样）**
 ```sql
 CREATE TABLE IF NOT EXISTS eval_runs (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    id SERIAL PRIMARY KEY,
     run_type TEXT NOT NULL,     -- 'offline' | 'judge'
     total INTEGER,              -- 用例数 / 抽样数
     passed INTEGER,             -- 通过数（离线评估）
@@ -1425,29 +1446,30 @@ researcher.search_notes 工具  ──┐
 
 **BM25 索引设计（双后端）：**
 
-索引对象：笔记标题 + content_preview（SQLite 已有字段，不双写 chunk 全文）。
+索引对象：笔记标题 + content_preview（PostgreSQL 已有字段，不双写 chunk 全文）。
 理由：BM25 价值在精确关键词命中，标题和前 200 字预览已覆盖主要关键词；
-chunk 全文只在 ChromaDB，双写会引入数据一致性问题。
+chunk 全文只在 pgvector，双写会引入数据一致性问题。
 
 ```sql
--- SQLite: FTS5 虚拟表（contentless，映射到 notes 表现有列）
-CREATE VIRTUAL TABLE IF NOT EXISTS notes_fts USING fts5(
-    note_id UNINDEXED,
-    title,
-    content_preview,
-    content='notes',
-    contentless_delete='1'
-);
--- 触发器同步：notes 插入/更新/删除时维护 FTS
+-- PostgreSQL: pg_trgm GIN 索引（直接挂在 notes 表，写入即同步，支持中文 ILIKE）
+CREATE EXTENSION IF NOT EXISTS pg_trgm;
+CREATE INDEX IF NOT EXISTS idx_notes_title_trgm
+    ON notes USING gin (title gin_trgm_ops);
+CREATE INDEX IF NOT EXISTS idx_notes_preview_trgm
+    ON notes USING gin (content_preview gin_trgm_ops);
 
--- MySQL: FULLTEXT 索引（直接加在 notes 表）
-ALTER TABLE notes ADD FULLTEXT INDEX ft_notes_text (title, content_preview);
--- 查询：MATCH(title, content_preview) AGAINST(? IN NATURAL LANGUAGE MODE)
+-- 查询：ILIKE 模糊匹配 + similarity() 排序（中文友好，CJK 按 trigram 切分）
+SELECT id, title, content_preview,
+       similarity(title || ' ' || content_preview, :query) AS score
+FROM notes
+WHERE status = 'active'
+  AND (title ILIKE '%' || :query || '%'
+       OR content_preview ILIKE '%' || :query || '%')
+ORDER BY score DESC
+LIMIT :top_k;
 ```
 
-`_exec` 语法翻译层新增两条规则（复用现有机制）：
-- `MATCH(...) AGAINST(... IN NATURAL LANGUAGE MODE)` 在 SQLite 不存在 → SQLite 路径用 FTS5 的 `MATCH notes_fts(?)`
-- 统一封装在 `MetadataStore.bm25_search(query, top_k)` 内，调用方无感知后端差异
+统一封装在 `MetadataStore.bm25_search(query, top_k)` 内，调用方无感知后端实现。
 
 **RRF 融合公式：**
 
@@ -1567,7 +1589,7 @@ researcher = ResearcherAgent(vector_store, metadata_store, hybrid_searcher)
 - `tests/test_retrieval/test_hybrid_search.py`：RRF 融合逻辑（mock 两路结果验证排名）、降级路径（BM25 失败仅向量）
 - `tests/test_retrieval/test_reranker.py`：mock SiliconFlow API 响应，验证重排 + 失败降级
 - `tests/test_retrieval/test_query_rewriter.py`：mock LLM 响应，验证解析 + 失败降级
-- `tests/test_storage/test_bm25.py`：FTS5/FULLTEXT 双后端检索（用临时 SQLite + MySQL schema 测试）
+- `tests/test_storage/test_bm25.py`：pg_trgm 关键词检索（用独立 schema 隔离测试）
 - 集成测试：`brain eval` 跑 golden dataset，对比 5F 前后通过率（量化收益）
 
 ---

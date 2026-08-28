@@ -13,14 +13,15 @@ dependencies = [
     "langchain-community>=0.3.0",
     "langgraph>=0.2.0",
     "langchain-openai>=0.3.0",
-    "chromadb>=0.5.0",
+    "psycopg[binary]>=3.2.0",
+    "langgraph-checkpoint-postgres>=3.0.0",
     "sentence-transformers>=3.0.0",
     "click>=8.1.0",
     "pydantic>=2.0.0",
     "pydantic-settings>=2.0.0",
     "pyyaml>=6.0",
     "python-dotenv>=1.0.0",
-    "aiosqlite>=0.20.0",
+    "trafilatura>=1.12.0",  # RSS 条目正文抓取
     "watchdog>=4.0.0",
     "markdown>=3.5.0",
     "loguru>=0.7.0",
@@ -49,7 +50,7 @@ select = [
 ]
 ignore = [
     "E501",  # line too long (handled by formatter)
-    "UP042",  # (str, Enum) 是刻意为之——保证 JSON/SQLite 序列化行为稳定
+    "UP042",  # (str, Enum) 是刻意为之——保证 JSON/数据库序列化行为稳定
     "B008",   # FastAPI 的 File/Query 依赖注入是标准模式
 ]
 

@@ -159,7 +159,7 @@ const themeConfig = {
       headerHeight: 56,
       headerColor: "rgba(0, 0, 0, 0.88)",
       siderBg: "#ffffff",
-      bodyBg: "#f5f5f5",
+      bodyBg: "#ffffff",
       triggerBg: "#ffffff",
     },
   },
@@ -225,8 +225,13 @@ const themeConfig = {
             </template>
             <template #renderItem="{ item }">
               <a-tooltip :title="item.title" placement="right">
-                <a-list-item style="padding: 4px 8px; border-radius: 6px; cursor: pointer"
-                  :style="{ background: route.params.sessionId === item.id && isAsk ? 'var(--ant-color-primary-bg)' : 'transparent' }"
+                <a-list-item
+                  style="padding: 6px 10px; border-radius: 6px; cursor: pointer; transition: all 0.2s; position: relative;"
+                  :style="{
+                    background: route.params.sessionId === item.id && isAsk ? 'var(--ant-color-primary-bg)' : 'transparent',
+                    fontWeight: route.params.sessionId === item.id && isAsk ? 600 : 400,
+                  }"
+                  :class="{ 'session-active': route.params.sessionId === item.id && isAsk }"
                   @click="selectSession(item.id)"
                 >
                   <div style="display: flex; align-items: center; gap: 4px; width: 100%">
@@ -258,7 +263,7 @@ const themeConfig = {
       </a-layout-sider>
 
       <!-- 主内容区 -->
-      <a-layout-content :style="{ padding: 0, overflow: isAsk ? 'hidden' : 'auto', display: 'flex', flexDirection: 'column' }">
+      <a-layout-content :style="{ padding: 0, overflow: isAsk ? 'hidden' : 'auto', display: 'flex', flexDirection: 'column', background: '#ffffff' }">
         <!-- 问答页 -->
         <Ask
           v-if="isAsk"
@@ -287,4 +292,42 @@ const themeConfig = {
 
 <style>
 body { margin: 0; }
+
+/* 侧边栏右侧边框 */
+.ant-layout-sider {
+  border-right: 1px solid #e8e8e8 !important;
+  box-shadow: none;
+}
+
+/* 头部底边框 */
+.ant-layout-header {
+  border-bottom: 1px solid #e8e8e8 !important;
+}
+
+/* 内容区纯白 */
+.ant-layout-content {
+  background: #ffffff !important;
+}
+
+/* 会话列表项 */
+.ant-layout-sider .ant-list-item {
+  transition: background 0.2s;
+}
+.ant-layout-sider .ant-list-item:hover {
+  background: rgba(0, 0, 0, 0.04) !important;
+}
+/* 选中状态：左侧高亮条 */
+.ant-layout-sider .ant-list-item.session-active {
+  background: var(--ant-color-primary-bg) !important;
+}
+.ant-layout-sider .ant-list-item.session-active::before {
+  content: '';
+  position: absolute;
+  left: 0;
+  top: 4px;
+  bottom: 4px;
+  width: 3px;
+  border-radius: 0 2px 2px 0;
+  background: var(--ant-color-primary);
+}
 </style>

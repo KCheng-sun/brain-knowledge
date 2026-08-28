@@ -104,7 +104,7 @@ onMounted(refresh);
   flex-wrap: wrap;
   gap: 12px 16px;
   padding: 24px;
-  background: #fafafa;
+  background: #fafbff;
   border-radius: 8px;
   align-items: center;
 }

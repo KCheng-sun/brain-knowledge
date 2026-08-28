@@ -46,6 +46,19 @@ async function fetchAll() {
   }
 }
 
+async function fetchOne(id) {
+  loading.value = true;
+  try {
+    const { data } = await axios.post(`/api/rss/${id}/fetch`);
+    antMessage.success(`拉取完成，新增 ${data.new_entries} 条`);
+    await refresh();
+  } catch (e) {
+    antMessage.error(`拉取失败: ${e.response?.data?.detail || e.message}`);
+  } finally {
+    loading.value = false;
+  }
+}
+
 function onRemove(id) {
   Modal.confirm({
     title: "删除订阅源",
@@ -65,9 +78,9 @@ onMounted(refresh);
 
 const columns = [
   { title: "订阅源", key: "title", ellipsis: true },
-  { title: "文章数", key: "entry_count", width: 100 },
+  { title: "文章数", dataIndex: "entry_count", key: "entry_count", width: 100 },
   { title: "上次拉取", key: "last_fetched", width: 130 },
-  { title: "操作", key: "action", width: 80 },
+  { title: "操作", key: "action", width: 120 },
 ];
 </script>
 
@@ -112,7 +125,10 @@ const columns = [
           {{ record.last_fetched_at ? record.last_fetched_at.slice(0, 10) : "从未" }}
         </template>
         <template v-else-if="column.key === 'action'">
-          <a-button type="text" danger size="small" :icon="h(DeleteOutlined)" @click="onRemove(record.id)" />
+          <a-space size="small">
+            <a-button type="text" size="small" :icon="h(ReloadOutlined)" :loading="loading" @click="fetchOne(record.id)" />
+            <a-button type="text" danger size="small" :icon="h(DeleteOutlined)" @click="onRemove(record.id)" />
+          </a-space>
         </template>
       </template>
     </a-table>

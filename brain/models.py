@@ -54,7 +54,7 @@ class RelationType(str, Enum):
 
 
 class NoteMetadata(BaseModel):
-    """笔记元数据，对应 SQLite notes 表"""
+    """笔记元数据，对应 PostgreSQL notes 表"""
 
     id: str = Field(default_factory=lambda: _new_uuid())
     title: str
@@ -78,7 +78,7 @@ class Chunk(BaseModel):
     index: int  # 分块在笔记中的序号（从 0 开始）
     content: str
     token_count: int = 0
-    metadata: dict = Field(default_factory=dict)  # 透传给 ChromaDB 的元数据
+    metadata: dict = Field(default_factory=dict)  # 透传给向量库的元数据
 
 
 class ParsedDocument(BaseModel):

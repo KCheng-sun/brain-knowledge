@@ -15,7 +15,7 @@ def _mock_embedding(texts: list[str]) -> list[list[float]]:
     result = []
     for text in texts:
         h = hashlib.sha256(text.encode()).digest()
-        vec = [(h[i % len(h)] / 255.0) * 2 - 1 for i in range(384)]
+        vec = [(h[i % len(h)] / 255.0) * 2 - 1 for i in range(1024)]
         norm = sum(v * v for v in vec) ** 0.5
         result.append([v / norm for v in vec])
     return result
@@ -27,24 +27,40 @@ def bulk_client(tmp_path_factory):
 
     性能测试只读不写，5 个测试共享同一份数据，避免重复摄入 2500 条。
     """
+    import uuid as _uuid
+
+    import psycopg as _psycopg
+
     import brain.api.deps as deps_module
     import brain.api.server as server_module
     import brain.config as config_module
-    from brain.config import AppConfig, StorageSettings
+    from brain.config import AppConfig, DatabaseSettings, StorageSettings
 
     tmp_path = tmp_path_factory.mktemp("perf_data")
     (tmp_path / "data").mkdir(parents=True, exist_ok=True)
+    test_schema = f"perf_{_uuid.uuid4().hex[:8]}"
     cfg = AppConfig()
     cfg.storage = StorageSettings(
         data_dir=tmp_path / "data",
         notes_dir=tmp_path / "notes",
-        chroma_dir=tmp_path / "chroma",
-        db_path=tmp_path / "metadata.db",
     )
-    # 手动 monkeypatch（session 级 fixture 不能用 function 级的 monkeypatch）
-    _orig_config = config_module._config
-    _orig_embed = deps_module.get_embedding_fn
+    cfg.database = DatabaseSettings(
+        host="localhost", port=5432, user="postgres",
+        password="12345678", database="brain",
+    )
     config_module._config = cfg
+
+    # 创建测试 schema，monkeypatch dsn 加 search_path
+    _orig_dsn = cfg.database.dsn
+    _setup = _psycopg.connect(_orig_dsn, autocommit=True)
+    _setup.execute(f"CREATE SCHEMA IF NOT EXISTS {test_schema}")
+    _setup.close()
+    def _test_dsn(self):
+        return f"{_orig_dsn} options='-c search_path={test_schema},public'"
+    DatabaseSettings.dsn = property(_test_dsn)
+
+    # 手动 monkeypatch（session 级 fixture 不能用 function 级的 monkeypatch）
+    _orig_embed = deps_module.get_embedding_fn
     deps_module.get_embedding_fn = lambda: _mock_embedding
 
     # mock AI 节点
@@ -70,11 +86,18 @@ def bulk_client(tmp_path_factory):
         yield c
 
     # 还原所有 patch（session 结束）
-    config_module._config = _orig_config
+    DatabaseSettings.dsn = property(lambda self: (
+        f"host={self.host} port={self.port} dbname={self.database} "
+        f"user={self.user} password={self.password}"
+    ))
     deps_module.get_embedding_fn = _orig_embed
     ClassifierAgent.run = _orig_classifier
     ConnectorAgent.run = _orig_connector
     deps_module.reset_for_test()
+    # 删除测试 schema
+    _cleanup = _psycopg.connect(_orig_dsn, autocommit=True)
+    _cleanup.execute(f"DROP SCHEMA IF EXISTS {test_schema} CASCADE")
+    _cleanup.close()
 
 
 class TestPerformance:

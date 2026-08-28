@@ -33,22 +33,26 @@ class StorageSettings(BaseSettings):
 
     data_dir: Path = _PROJECT_ROOT / "data"
     notes_dir: Path = _PROJECT_ROOT / "data" / "notes"
-    chroma_dir: Path = _PROJECT_ROOT / "data" / "chroma"
-    db_path: Path = _PROJECT_ROOT / "data" / "metadata.db"
 
 
 class DatabaseSettings(BaseSettings):
-    """关系型数据库配置（Phase 5D：支持 MySQL）。"""
+    """PostgreSQL 数据库配置（业务数据 + 向量 + Checkpoint 统一存储）。"""
 
     model_config = SettingsConfigDict(env_prefix="BRAIN_DB_")
 
-    # None=用 SQLite（db_path），指定则用 MySQL
-    host: str | None = None
-    port: int = 3306
-    user: str = "root"
+    host: str = "localhost"
+    port: int = 5432
+    user: str = "postgres"
     password: str = ""
-    database: str = "brain"
-    charset: str = "utf8mb4"
+    database: str = "postgres"
+
+    @property
+    def dsn(self) -> str:
+        """psycopg 连接串。"""
+        return (
+            f"host={self.host} port={self.port} dbname={self.database} "
+            f"user={self.user} password={self.password}"
+        )
 
 
 class LLMSettings(BaseSettings):
@@ -108,7 +112,7 @@ class CostSettings(BaseSettings):
     daily_token_limit: int = 500_000      # 日 token 配额
     monthly_token_limit: int = 5_000_000  # 月 token 配额
     daily_cost_limit: float = 10.0        # 日成本上限（¥）
-    recursion_limit: int = 25             # Agent 最大递归步数（防死循环）
+    recursion_limit: int = 50             # Agent 最大递归步数（DeepAgents 嵌套主+子智能体+HIL 需要更多步）
 
 
 class RetrievalSettings(BaseSettings):
@@ -186,8 +190,6 @@ def _ensure_directories(cfg: AppConfig) -> None:
     """确保数据目录存在。"""
     cfg.storage.data_dir.mkdir(parents=True, exist_ok=True)
     cfg.storage.notes_dir.mkdir(parents=True, exist_ok=True)
-    cfg.storage.chroma_dir.mkdir(parents=True, exist_ok=True)
-    cfg.storage.db_path.parent.mkdir(parents=True, exist_ok=True)
 
 
 def _setup_file_logging(cfg: AppConfig) -> None:

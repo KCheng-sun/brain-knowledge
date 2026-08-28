@@ -3,7 +3,6 @@
 collector 现在写入数据库，不再写 YAML。
 """
 
-import pytest
 
 from brain.eval.collector import collect_bad_case
 

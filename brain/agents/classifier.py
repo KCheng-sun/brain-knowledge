@@ -1,7 +1,7 @@
 """分类 Agent — 深度分析笔记内容，生成多维标签。
 
 使用 BaseAgent 框架，通过结构化 Prompt 让 LLM 输出分类结果，
-经 Pydantic 验证后转为 Tag 列表存入 SQLite。
+经 Pydantic 验证后转为 Tag 列表存入 PostgreSQL。
 """
 
 from pydantic import BaseModel, Field

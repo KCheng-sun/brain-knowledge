@@ -2,11 +2,11 @@
 
 提供：
   - trace_id 的生成与上下文透传（contextvars）
-  - 健康检查（探测 LLM/Embedding/SQLite/ChromaDB 连通性）
+  - 健康检查（探测 LLM/Embedding/PostgreSQL/pgvector 连通性）
   - 指标记录的统一入口（薄封装 MetadataStore.record_metric）
 
 设计原则：本地优先，轻量实现。
-不引入 Prometheus/ELK，指标存 SQLite，日志用 loguru JSON sink。
+不引入 Prometheus/ELK，指标存 PostgreSQL，日志用 loguru JSON sink。
 """
 
 import contextvars
@@ -185,36 +185,36 @@ def check_health(metadata_store, vector_store, embedding_fn=None) -> dict:
     """检查各组件健康状态。
 
     LLM/Embedding 探测用最小调用，避免消耗配额：
-      - SQLite: 一次 SELECT
-      - ChromaDB: count()
+      - PostgreSQL: 一次 SELECT（业务表）
+      - pgvector: count()（向量表）
       - Embedding: 对空字符串做 1 次 embedding（如有 fn）
       - LLM: 跳过（dry_run 时探测，否则标记 skipped 避免烧钱）
 
     Returns:
         {
             "status": "healthy" | "degraded" | "unhealthy",
-            "components": {sqlite, chromadb, embedding, llm},
+            "components": {postgres, vector, embedding, llm},
             "timestamp": str
         }
     """
     components: dict[str, str] = {}
     now = datetime.now().isoformat()
 
-    # SQLite
+    # PostgreSQL（业务元数据）
     try:
         metadata_store.count_notes()
-        components["sqlite"] = "ok"
+        components["postgres"] = "ok"
     except Exception as e:
-        components["sqlite"] = f"error: {e}"
-        logger.warning(f"健康检查 SQLite 失败: {e}")
+        components["postgres"] = f"error: {e}"
+        logger.warning(f"健康检查 PostgreSQL 失败: {e}")
 
-    # ChromaDB
+    # pgvector（向量存储）
     try:
         vector_store.count()
-        components["chromadb"] = "ok"
+        components["vector"] = "ok"
     except Exception as e:
-        components["chromadb"] = f"error: {e}"
-        logger.warning(f"健康检查 ChromaDB 失败: {e}")
+        components["vector"] = f"error: {e}"
+        logger.warning(f"健康检查 pgvector 失败: {e}")
 
     # Embedding（探测用空字符串，不消耗有意义配额）
     if embedding_fn is None:

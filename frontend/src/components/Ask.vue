@@ -137,6 +137,8 @@ async function send() {
   if (!q || loading.value) return;
 
   messages.value.push({ role: "user", content: q });
+  // nextTick 后清空：避免 a-textarea auto-size 基于旧值重算高度时写回
+  await nextTick();
   question.value = "";
   loading.value = true;
   statusMsg.value = "";
@@ -257,11 +259,10 @@ function waitForDecision(interruptInfo, assistantMsg) {
     });
     assistantMsg.timeline.push(...proposalItems);
 
-    // 保存决策回调供模板按钮调用（每点一个按钮记录一条决策，全部决策完才恢复）
-    assistantMsg._decide = async (decision) => {
-      // 找到第一个未决策的卡片并标记
-      const item = assistantMsg.timeline.find((t) => t.kind === "proposal" && !t.decided);
-      if (item) {
+    // 保存决策回调供模板按钮调用（传入具体的 proposal item，避免多卡片时错位）
+    assistantMsg._decide = async (item, decision) => {
+      // 标记被点击的那张卡片
+      if (item && !item.decided) {
         item.decided = true;
         item.decision = decision.type;
       }
@@ -326,10 +327,9 @@ function handleEvent(event, assistantMsg) {
       const name = event.name;
       // 跳过空 name 的碎片事件
       if (!name) break;
-      // 把工具调用前已流出的文本归档为「思考片段」，
-      // 这样中间推理和最终答案不会混在一起
+      // 把工具调用前已流出的文本归档为「正文片段」进 timeline，保持交错顺序
       if (assistantMsg.content.trim()) {
-        assistantMsg.timeline.push({ kind: "thought", content: assistantMsg.content });
+        assistantMsg.timeline.push({ kind: "text", content: assistantMsg.content });
         assistantMsg.content = "";
       }
       const argsPreview = formatArgs(event.args);
@@ -362,7 +362,11 @@ function handleEvent(event, assistantMsg) {
       break;
 
     case "interrupt":
-      // HIL 中断：中断后不会再收到 tool_end，把未完成 tool 标记为 done
+      // HIL 中断：先把已流出的文本归档为正文片段（保持顺序），再标记未完成工具为 done
+      if (assistantMsg.content.trim()) {
+        assistantMsg.timeline.push({ kind: "text", content: assistantMsg.content });
+        assistantMsg.content = "";
+      }
       for (const item of assistantMsg.timeline) {
         if (item.kind === "tool" && !item.done) item.done = true;
       }
@@ -370,6 +374,11 @@ function handleEvent(event, assistantMsg) {
       return { session_id: event.session_id, proposals: event.proposals || [] };
 
     case "done":
+      // 最后一段文本（工具调用之后的）也归档为正文片段进 timeline
+      if (assistantMsg.content.trim()) {
+        assistantMsg.timeline.push({ kind: "text", content: assistantMsg.content });
+        assistantMsg.content = "";
+      }
       // 回答完成，通知父组件刷新会话列表（标题/时间已更新）
       assistantMsg.done = true;
       emit("session-updated");
@@ -426,25 +435,26 @@ function formatArgs(args) {
               <!-- 用户消息内容 -->
               <div v-if="m.role === 'user'" class="user-bubble">{{ m.content }}</div>
 
-              <!-- assistant 消息：统一时间线 -->
+              <!-- assistant 消息：按流式顺序交错渲染（文本-工具-文本-...） -->
               <div v-else class="assistant-block">
-                <div class="assistant-bubble">
-                <a-timeline v-if="(m.timeline || []).length">
-                  <a-timeline-item
-                    v-for="(tl, k) in m.timeline || []"
+                <div class="assistant-bubble" v-if="(m.timeline || []).length || m.content">
+                  <div
+                    v-for="(tl, k) in (m.timeline || [])"
                     :key="'tl' + k"
-                    :color="tl.kind === 'tool' ? 'blue' : tl.kind === 'proposal' ? 'gold' : 'gray'"
+                    :class="tl.kind === 'text' || tl.kind === 'thought' ? 'text-segment' : 'tool-segment'"
                   >
-                    <!-- 思考片段 -->
+                    <!-- 正文片段 -->
                     <div
-                      v-if="tl.kind === 'thought'"
-                      class="thought-text"
+                      v-if="tl.kind === 'text' || tl.kind === 'thought'"
                       v-html="renderMarkdown(tl.content)"
                     ></div>
 
-                    <!-- 工具调用 -->
-                    <a-tag v-else-if="tl.kind === 'tool'" :color="tl.done ? 'success' : 'processing'">
-                      {{ tl.done ? '✓' : '⟳' }} {{ tl.name }}
+                    <!-- 工具调用（task = 子智能体委派，用紫色区分） -->
+                    <a-tag
+                      v-else-if="tl.kind === 'tool'"
+                      :color="tl.name === 'task' ? 'purple' : (tl.done ? 'success' : 'processing')"
+                    >
+                      {{ tl.done ? '✓' : '⟳' }} {{ tl.name === 'task' ? '🤖 子智能体' : tl.name }}
                       <span v-if="tl.args" style="color: rgba(0,0,0,0.45)"> {{ tl.args }}</span>
                     </a-tag>
 
@@ -453,7 +463,7 @@ function formatArgs(args) {
                       v-else-if="tl.kind === 'proposal'"
                       size="small"
                       :bordered="!tl.decided"
-                      :style="{ maxWidth: 480 }"
+                      :style="{ maxWidth: 480, marginTop: 4 }"
                     >
                       <template #title>
                         <a-space>
@@ -466,22 +476,22 @@ function formatArgs(args) {
                       <a-typography-title :level="5" style="margin: 0 0 8px">{{ tl.title }}</a-typography-title>
                       <a-typography-paragraph style="margin: 0" type="secondary">{{ tl.content }}</a-typography-paragraph>
                       <a-space v-if="!tl.decided" style="margin-top: 12px">
-                        <a-button type="primary" size="small" @click="m._decide({ type: 'approve' })">保存</a-button>
-                        <a-button danger size="small" @click="m._decide({ type: 'reject', message: '用户选择不保存' })">拒绝</a-button>
+                        <a-button type="primary" size="small" @click="m._decide(tl, { type: 'approve' })">保存</a-button>
+                        <a-button danger size="small" @click="m._decide(tl, { type: 'reject', message: '用户选择不保存' })">拒绝</a-button>
                       </a-space>
                     </a-card>
-                  </a-timeline-item>
-                </a-timeline>
+                  </div>
 
-                <!-- 最终答案 -->
-                <div
-                  v-if="m.content"
-                  class="answer-text"
-                  v-html="renderMarkdown(m.content)"
-                ></div>
+                  <!-- 流式进行中的未归档文本（tool_start 后还没 done 的最后一段） -->
+                  <div
+                    v-if="m.content"
+                    class="text-segment"
+                    v-html="renderMarkdown(m.content)"
+                  ></div>
+                </div>
 
                 <!-- 点踩按钮（Phase 5D FR54 bad case 回流） -->
-                <div v-if="m.content && m.done" style="margin-top: 4px">
+                <div v-if="(m.timeline || []).some(t => t.kind === 'text') && m.done" style="margin-top: 4px">
                   <a-button
                     v-if="!m.thumbsDown"
                     size="small"
@@ -489,7 +499,6 @@ function formatArgs(args) {
                     title="这个回答不好，反馈给开发"
                   >👎 这个回答不好</a-button>
                   <a-tag v-else color="default">已反馈 ✓</a-tag>
-                </div>
                 </div>
 
                 <!-- 思考中 -->
@@ -548,6 +557,25 @@ function formatArgs(args) {
   scroll-behavior: smooth;
 }
 
+/* 滚动条：隐藏边框，只保留细滚动条 */
+.chat-box::-webkit-scrollbar {
+  width: 6px;
+}
+.chat-box::-webkit-scrollbar-track {
+  background: transparent;
+}
+.chat-box::-webkit-scrollbar-thumb {
+  background: rgba(0, 0, 0, 0.15);
+  border-radius: 3px;
+}
+.chat-box::-webkit-scrollbar-thumb:hover {
+  background: rgba(0, 0, 0, 0.25);
+}
+.chat-box {
+  scrollbar-width: thin;
+  scrollbar-color: rgba(0, 0, 0, 0.15) transparent;
+}
+
 /* ============ 欢迎页 ============ */
 .welcome {
   display: flex;
@@ -572,9 +600,9 @@ function formatArgs(args) {
 
 /* 思考片段：markdown 渲染区 */
 .thought-text {
-  font-size: 13px;
-  line-height: 1.5;
-  color: rgba(0, 0, 0, 0.45);
+  font-size: 15px;
+  line-height: 1.75;
+  color: rgba(0, 0, 0, 0.88);
 }
 
 /* 消息行：左右对齐 */
@@ -591,10 +619,11 @@ function formatArgs(args) {
 
 /* 用户消息气泡 */
 .user-bubble {
-  padding: 8px 14px;
-  background: rgba(0, 0, 0, 0.04);
-  border-radius: 8px;
-  width: 80%;
+  padding: 10px 14px;
+  background: #e6f0ff;
+  border-radius: 12px;
+  max-width: 80%;
+  width: fit-content;
 }
 
 /* assistant 区块 */
@@ -604,9 +633,9 @@ function formatArgs(args) {
 
 /* 整体气泡：包含工具链 + 答案 + 反馈 */
 .assistant-bubble {
-  padding: 8px 14px;
-  background: rgba(0, 0, 0, 0.04);
-  border-radius: 8px;
+  padding: 12px 16px;
+  background: #f7f8fa;
+  border-radius: 12px;
 }
 
 /* 最终答案：markdown 渲染区 */
@@ -647,6 +676,26 @@ function formatArgs(args) {
 
 /* 可点击的笔记引用标签 */
 .answer-text :deep(.ref-link),
+/* 正文片段（timeline 中工具调用之间的文本） */
+.text-segment {
+  font-size: 15px;
+  line-height: 1.75;
+  color: rgba(0, 0, 0, 0.88);
+  margin: 8px 0;
+}
+.text-segment :deep(p:first-child) {
+  margin-top: 0;
+}
+.text-segment :deep(p:last-child) {
+  margin-bottom: 0;
+}
+
+/* 工具调用片段：上下留间距，和正文区分 */
+.tool-segment {
+  margin: 8px 0;
+}
+
+.text-segment :deep(.ref-link),
 .thought-text :deep(.ref-link) {
   color: var(--ant-color-primary);
   cursor: pointer;

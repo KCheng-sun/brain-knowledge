@@ -139,13 +139,18 @@ def ask_question_stream(req: AskRequest):
                 if event["type"] == "token":
                     answer_parts.append(event["content"])
                 elif event["type"] == "interrupt":
-                    # HIL 中断：保存已流出的答案为「待续消息」（status=pending），
-                    # msg_id 暂存到 session 表，resume 完成时更新同一条消息（合并内容）
-                    answer = "".join(answer_parts)
+                    # HIL 中断：把已流出的文本归档为正文片段进 timeline（保持顺序）
+                    partial = "".join(answer_parts)
+                    if partial.strip():
+                        timeline.append({"kind": "text", "content": partial})
+                        answer_parts = []
                     # 中断后不会再收到 tool_end，把未完成 tool 强制标记为 done
                     for item in timeline:
                         if item.get("kind") == "tool" and not item.get("done"):
                             item["done"] = True
+                    answer = "\n\n".join(
+                        t["content"] for t in timeline if t.get("kind") == "text"
+                    )
                     if answer or timeline:
                         msg_id = ms.add_message(
                             session_id, "assistant", answer, timeline=timeline, status="pending"
@@ -166,11 +171,10 @@ def ask_question_stream(req: AskRequest):
                     yield f"data: {json.dumps({'type': 'interrupt', 'session_id': session_id, 'proposals': proposals}, ensure_ascii=False)}\n\n"
                     return  # 流结束，等待 /api/ask/resume 恢复
                 elif event["type"] == "tool_start" and event.get("name"):
-                    # 把工具调用前已流出的文本归档为「思考片段」进 timeline，
-                    # 保持与前端一致的交错顺序（文本-工具-文本-工具-...）
+                    # 工具调用前的文本作为「正文片段」按顺序存入 timeline（保持文本-工具-文本交错）
                     partial = "".join(answer_parts)
                     if partial.strip():
-                        timeline.append({"kind": "thought", "content": partial})
+                        timeline.append({"kind": "text", "content": partial})
                         answer_parts = []  # 清空，下一段文本重新累积
                     timeline.append(
                         {"kind": "tool", "name": event["name"], "args": event.get("args", {}), "done": False}
@@ -188,19 +192,21 @@ def ask_question_stream(req: AskRequest):
                             item["done"] = True
                             break
                 elif event["type"] == "done":
-                    # 保存 assistant 消息（同时写入记忆向量）
-                    answer = "".join(answer_parts)
-                    # memory 向量用全文（thought 片段 + 最后一段），保证语义完整
-                    full_text = " \n".join(
-                        [t["content"] for t in timeline if t.get("kind") == "thought"] + ([answer] if answer else [])
+                    # 最后一段文本（工具调用之后的）
+                    final_part = "".join(answer_parts)
+                    if final_part.strip():
+                        timeline.append({"kind": "text", "content": final_part})
+                    # content = 所有正文片段拼接（供搜索/记忆用）
+                    answer = "\n\n".join(
+                        t["content"] for t in timeline if t.get("kind") == "text"
                     )
                     if answer or timeline:
                         assistant_msg_id = ms.add_message(
                             session_id, "assistant", answer, timeline=timeline
                         )
-                        if full_text:
+                        if answer:
                             vs.add_memory(
-                                assistant_msg_id, session_id, "assistant", full_text
+                                assistant_msg_id, session_id, "assistant", answer
                             )
                         ms.touch_session(session_id)
                     # 记录问答 latency 和计数（Phase 5A）
@@ -223,6 +229,24 @@ def ask_question_stream(req: AskRequest):
                 answer="".join(answer_parts), reason=reason,
                 extra={"error": str(e)[:200]},
             )
+            # 即使出错也要保存已生成的部分内容（否则用户看到的回答不会进历史）
+            partial = "".join(answer_parts)
+            if partial.strip():
+                timeline.append({"kind": "text", "content": partial})
+            if any(t.get("kind") == "text" for t in timeline) or timeline:
+                content = "\n\n".join(
+                    t["content"] for t in timeline if t.get("kind") == "text"
+                )
+                if content:
+                    content += f"\n\n[中断: {reason}]"
+                else:
+                    content = f"[中断: {reason}]"
+                msg_id = ms.add_message(
+                    session_id, "assistant", content, timeline=timeline
+                )
+                if content:
+                    vs.add_memory(msg_id, session_id, "assistant", content)
+                ms.touch_session(session_id)
             yield f"data: {json.dumps({'type': 'error', 'message': f'问答失败: {e}'}, ensure_ascii=False)}\n\n"
 
         # 流正常结束时清理 trace_id 上下文
@@ -285,14 +309,20 @@ def ask_question_resume(req: ResumeRequest):
                 answer_parts.append(event["content"])
             elif event["type"] == "interrupt":
                 # resume 后再次中断（多片段逐一审批）：合并已流出的内容到待续消息
-                answer = "".join(answer_parts)
+                partial = "".join(answer_parts)
+                if partial.strip():
+                    timeline.append({"kind": "text", "content": partial})
+                    answer_parts = []
                 for item in timeline:
                     if item.get("kind") == "tool" and not item.get("done"):
                         item["done"] = True
+                answer = "\n\n".join(
+                    t["content"] for t in timeline if t.get("kind") == "text"
+                )
                 if pending_id is not None:
                     ms.update_message(
                         pending_id,
-                        prev_content + answer,
+                        prev_content + ("\n\n" + answer if answer else ""),
                         timeline=prev_timeline + timeline,
                         status="pending",
                     )
@@ -307,10 +337,10 @@ def ask_question_resume(req: ResumeRequest):
                 yield f"data: {json.dumps({'type': 'interrupt', 'session_id': req.session_id, 'proposals': proposals}, ensure_ascii=False)}\n\n"
                 return
             elif event["type"] == "tool_start" and event.get("name"):
-                # 同 stream：工具前的文本归档为 thought，保持交错顺序
+                # 同 stream：工具前的文本归档为正文片段，保持交错顺序
                 partial = "".join(answer_parts)
                 if partial.strip():
-                    timeline.append({"kind": "thought", "content": partial})
+                    timeline.append({"kind": "text", "content": partial})
                     answer_parts = []
                 timeline.append(
                     {"kind": "tool", "name": event["name"], "args": event.get("args", {}), "done": False}
@@ -326,15 +356,16 @@ def ask_question_resume(req: ResumeRequest):
                         item["done"] = True
                         break
             elif event["type"] == "done":
-                answer = "".join(answer_parts)
+                # 最后一段文本归档
+                final_part = "".join(answer_parts)
+                if final_part.strip():
+                    timeline.append({"kind": "text", "content": final_part})
                 # 合并中断前的内容 + resume 后的内容，更新同一条待续消息
-                full_answer = prev_content + answer
-                merged_timeline = prev_timeline + timeline
-                # memory 向量用全文（中断前 thought + resume thought + 最后文本）
-                full_text = " \n".join(
-                    [t["content"] for t in merged_timeline if t.get("kind") == "thought"]
-                    + ([full_answer] if full_answer else [])
+                resume_answer = "\n\n".join(
+                    t["content"] for t in timeline if t.get("kind") == "text"
                 )
+                full_answer = (prev_content + "\n\n" + resume_answer) if resume_answer else prev_content
+                merged_timeline = prev_timeline + timeline
                 if pending_id is not None and (full_answer or merged_timeline):
                     # 更新待续消息（合并内容 + 标记完成）
                     ms.update_message(
@@ -342,15 +373,15 @@ def ask_question_resume(req: ResumeRequest):
                     )
                     ms.set_pending_msg_id(req.session_id, None)
                     # 写入记忆向量（完整答案）
-                    if full_text:
-                        vs.add_memory(pending_id, req.session_id, "assistant", full_text)
+                    if full_answer:
+                        vs.add_memory(pending_id, req.session_id, "assistant", full_answer)
                     ms.touch_session(req.session_id)
-                elif answer:
+                elif resume_answer:
                     # 无待续消息（异常情况）：退回新增一条
                     assistant_msg_id = ms.add_message(
-                        req.session_id, "assistant", answer, timeline=timeline
+                        req.session_id, "assistant", resume_answer, timeline=timeline
                     )
-                    vs.add_memory(assistant_msg_id, req.session_id, "assistant", answer)
+                    vs.add_memory(assistant_msg_id, req.session_id, "assistant", resume_answer)
                     ms.touch_session(req.session_id)
                 elapsed_ms = round((_time.perf_counter() - _t0) * 1000, 1)
                 record_metric(ms, "ask", "latency_ms", elapsed_ms,
@@ -432,7 +463,7 @@ def list_fragments(limit: int = Query(50, ge=1, le=200)):
 
 @router.delete("/fragments/{fragment_id}")
 def delete_fragment(fragment_id: int):
-    """删除知识片段（SQLite + 向量同步删除）。"""
+    """删除知识片段（PostgreSQL + 向量同步删除）。"""
     ms = get_metadata_store()
     vs = get_vector_store()
     ok = ms.delete_knowledge_fragment(fragment_id)

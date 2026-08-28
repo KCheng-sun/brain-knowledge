@@ -25,7 +25,7 @@ _pipeline: IngestionPipeline | None = None
 _vector_store: VectorStore | None = None
 _metadata_store: MetadataStore | None = None
 _hybrid_searcher: HybridSearcher | None = None  # Phase 5F 混合检索器
-_checkpointer = None  # LangGraph SqliteSaver——HIL 中断恢复用
+_checkpointer = None  # LangGraph PostgresSaver——HIL 中断恢复用
 _scheduler = None  # TaskScheduler——定时任务调度
 _watcher = None  # FileWatcher——文件监听（可经 API 启停）
 
@@ -38,8 +38,8 @@ def _init() -> None:
         return
     cfg = get_config()
     embedding_fn = get_embedding_fn()
-    _vector_store = VectorStore(persist_dir=cfg.storage.chroma_dir, embedding_fn=embedding_fn)
-    _metadata_store = MetadataStore(db_path=cfg.storage.db_path)
+    _vector_store = VectorStore(dsn=cfg.database.dsn, embedding_fn=embedding_fn)
+    _metadata_store = MetadataStore(dsn=cfg.database.dsn)
     _metadata_store.initialize()
     _pipeline = IngestionPipeline(
         vector_store=_vector_store,
@@ -51,13 +51,12 @@ def _init() -> None:
     _hybrid_searcher = build_hybrid_searcher(_vector_store, _metadata_store)
 
     # HIL 中断恢复所需的 checkpointer（thread_id = session_id）
-    import sqlite3
+    import psycopg
+    from langgraph.checkpoint.postgres import PostgresSaver
 
-    from langgraph.checkpoint.sqlite import SqliteSaver
-
-    checkpoint_path = cfg.storage.data_dir / "checkpoints.db"
-    conn = sqlite3.connect(str(checkpoint_path), check_same_thread=False)
-    _checkpointer = SqliteSaver(conn)
+    _checkpoint_conn = psycopg.connect(cfg.database.dsn, autocommit=True)
+    _checkpointer = PostgresSaver(_checkpoint_conn)
+    _checkpointer.setup()  # 首次建表（幂等）
 
     # 定时任务调度器
     from brain.services.scheduler import build_default_scheduler

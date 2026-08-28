@@ -13,11 +13,11 @@ from fastapi.testclient import TestClient
 
 
 def _mock_embedding(texts: list[str]) -> list[list[float]]:
-    """确定性 mock embedding（384 维）。"""
+    """确定性 mock embedding（1024 维，与 BGE-large-zh 一致）。"""
     result = []
     for text in texts:
         h = hashlib.sha256(text.encode()).digest()
-        vec = [(h[i % len(h)] / 255.0) * 2 - 1 for i in range(384)]
+        vec = [(h[i % len(h)] / 255.0) * 2 - 1 for i in range(1024)]
         norm = sum(v * v for v in vec) ** 0.5
         result.append([v / norm for v in vec])
     return result
@@ -26,24 +26,44 @@ def _mock_embedding(texts: list[str]) -> list[list[float]]:
 @pytest.fixture
 def client(tmp_path, monkeypatch):
     """构造指向临时目录的测试客户端。"""
+    import uuid as _uuid
+
     import brain.api.deps as deps_module
     import brain.api.server as server_module
     import brain.config as config_module
 
-    # 1. 重定向配置到临时目录（checkpoints.db 需要 data 目录存在）
-    from brain.config import AppConfig, StorageSettings
+    # 1. 用独立 schema 隔离测试（每个测试一个临时 schema，测完删除）
+    from brain.config import AppConfig, DatabaseSettings, StorageSettings
 
     (tmp_path / "data").mkdir(parents=True, exist_ok=True)
+    test_schema = f"test_{_uuid.uuid4().hex[:8]}"
     cfg = AppConfig()
     cfg.storage = StorageSettings(
         data_dir=tmp_path / "data",
         notes_dir=tmp_path / "notes",
-        chroma_dir=tmp_path / "chroma",
-        db_path=tmp_path / "metadata.db",
     )
-    # 强制 SQLite 隔离：忽略 .env 里的 BRAIN_DB_HOST，避免测试连真实 MySQL 污染数据
-    cfg.database.host = None
+    # 连同一个 Postgres，但用独立 schema 隔离数据
+    cfg.database = DatabaseSettings(
+        host="localhost", port=5432, user="postgres",
+        password="12345678", database="brain",
+    )
     monkeypatch.setattr(config_module, "_config", cfg)
+
+    # 创建测试 schema（连接初始化时 MetadataStore/VectorStore 会在此 schema 建表）
+    import psycopg as _psycopg
+    _setup_conn = _psycopg.connect(cfg.database.dsn, autocommit=True)
+    _setup_conn.execute(f"CREATE SCHEMA IF NOT EXISTS {test_schema}")
+    _setup_conn.execute(f"SET search_path TO {test_schema}")
+    _setup_conn.close()
+    # 通过连接参数指定 search_path（每个新连接都生效）
+    # psycopg 的 dsn 不支持 options，用 connection_factory 太复杂
+    # 改为 monkeypatch dsn 加 options 参数
+    _orig_dsn = cfg.database.dsn
+    # Postgres 支持 options=-c search_path=test_xxx
+    _orig_dsn_prop = DatabaseSettings.dsn.fget
+    def _test_dsn(self):
+        return f"{_orig_dsn} options='-c search_path={test_schema},public'"
+    monkeypatch.setattr(DatabaseSettings, "dsn", property(_test_dsn))
 
     # 2. mock embedding 函数（deps._init 会调用它）
     monkeypatch.setattr(deps_module, "get_embedding_fn", lambda: _mock_embedding)
@@ -71,8 +91,11 @@ def client(tmp_path, monkeypatch):
     with TestClient(server_module.app) as c:
         yield c
 
-    # 清理
+    # 清理：重置单例 + 删除测试 schema
     deps_module.reset_for_test()
+    _cleanup_conn = _psycopg.connect(_orig_dsn, autocommit=True)
+    _cleanup_conn.execute(f"DROP SCHEMA IF EXISTS {test_schema} CASCADE")
+    _cleanup_conn.close()
 
 
 class TestNotesAPI:

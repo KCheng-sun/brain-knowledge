@@ -11,15 +11,16 @@
 
 - **项目根目录**: `D:\projects\deep_agents`
 - **主包名**: `brain`
-- **Python 版本**: 3.11+
+- **Python 版本**: 3.13+
 - **平台**: Windows 11 (PowerShell 5.1)
+- **数据库**: PostgreSQL 17 + pgvector（业务数据 + 向量 + Checkpoint 统一存储）
 
 ---
 
 ## 架构概要
 
 ```
-CLI (Click) → Services → Agents (DeepAgents) → Pipeline (LangGraph) → Storage (ChromaDB + SQLite)
+CLI (Click) → Services → Agents (DeepAgents) → Pipeline (LangGraph) → Storage (PostgreSQL + pgvector)
                               ↓
                         LLM (Claude API)
                         Embedding (sentence-transformers, local)
@@ -30,6 +31,9 @@ CLI (Click) → Services → Agents (DeepAgents) → Pipeline (LangGraph) → St
 - **LangGraph**: 有状态流水线（摄入/查询）、Checkpoint 持久化
 - **DeepAgents**: 多 Agent 深度推理（分类/关联/摘要/问答）
 - **Claude API**: 核心推理引擎
+
+PostgreSQL 统一存储：业务元数据（MetadataStore）+ 向量检索（pgvector，VectorStore）
++ HIL Checkpoint（PostgresSaver）全在一个库，备份/事务一致。
 
 ---
 
@@ -81,9 +85,11 @@ pip install -r requirements.txt
 ```
 langchain
 langgraph
+langgraph-checkpoint-postgres
 deepagents
-chromadb
-sentence-transformers
+psycopg[binary]        # PostgreSQL 驱动
+pgvector               # PostgreSQL 向量扩展
+fastapi
 click
 loguru
 pydantic
@@ -91,8 +97,9 @@ pydantic-settings
 pyyaml
 watchdog
 markdown
-feedparser        # P2
-networkx          # P2
+feedparser
+networkx
+tiktoken
 ```
 
 ### 开发工具
@@ -131,7 +138,7 @@ ruff check brain/
 
 ### 数据模型约定
 - 所有 ID 使用 UUID4 字符串
-- 时间戳统一使用 ISO 8601 格式字符串（SQLite 兼容）
+- 时间戳统一使用 ISO 8601 格式字符串（PostgreSQL 兼容）
 - 置信度/强度使用 0.0 ~ 1.0 的 float
 
 ---
@@ -160,7 +167,6 @@ ruff check brain/
 
 ### 平台注意（Windows）
 - 文件路径使用 `pathlib.Path`，不要硬编码 `/` 或 `\`
-- ChromaDB 在 Windows 上需要 `chromadb` 的 SQLite 绑定正常
 - watchdog 在 Windows 上使用 `ReadDirectoryChangesWatcher`
 - PowerShell 不支持 `&&` 链式操作，用 `; if ($?) { ... }` 替代
 - 虚拟环境的 Python 路径: `.venv\Scripts\python.exe` 而非 `bin/python`
@@ -172,8 +178,9 @@ ruff check brain/
 - 开发阶段注意 API 调用成本，避免不必要的重复调用
 
 ### 数据安全
-- `data/` 目录包含用户的真实笔记，已加入 `.gitignore`
-- 测试时使用临时目录 (`tempfile.TemporaryDirectory`)，不操作真实数据
+- `data/` 目录包含日志，已加入 `.gitignore`
+- 数据库（PostgreSQL brain 库）是唯一数据源，定期备份 `pg_dump brain`
+- 测试用独立 schema 隔离（每个测试创建 `test_<uuid>` schema，测完 DROP），不污染主数据
 - 删除操作实现软删除（`status='deleted'`），保留原始数据
 
 ---
@@ -187,7 +194,7 @@ ruff check brain/
 - 经验：
   - `pip install -e .` 需要 `[tool.setuptools.packages.find]` 排除 `data/` 目录
   - ChromaDB + sentence-transformers 非 daemon 线程导致进程不退，用 `os._exit(0)` 解决
-  - HuggingFace 被墙，设置 `HF_ENDPOINT=https://hf-mirror.com` 或写入 `.env`
+  - HuggingFace 被墙，设置 `HF_ENDPOINT=https://hf-mirror.com` 或写入 `.env`（已过时：embedding 已切 SiliconFlow API，不再用本地模型，此配置已清理）
   - LLM 调用统一走 `brain/llm.py`，不直接调原生 SDK
   - 数据路径用 `Path(__file__).resolve().parent.parent` 动态定位项目根目录
 
@@ -231,7 +238,7 @@ ruff check brain/
 - 5D：评估闭环（离线测试集 + Bad Case 回流 + LLM-as-Judge）
 - 5E：提示词外部化（prompts/*.yaml + 配置集中化）
 - 5F：RAG 增强（BM25+Rerank+查询改写）
-- 约束：本地优先，不引入 K8s/Redis/Kafka，指标存 SQLite、日志存本地文件
+- 约束：本地优先，不引入 K8s/Redis/Kafka，指标存 PostgreSQL、日志存本地文件
 - 经验（5A）：
   - contextvars 透传 trace_id 比 threading.local 更适合异步生成器场景
   - FastAPI StreamingResponse 的生成器在独立上下文执行，trace_id 需在生成器内部 set
@@ -301,7 +308,22 @@ ruff check brain/
   - **结构化输出用 LangChain 的 PydanticOutputParser，别手写**：原 base.py 手写了 `_build_user_prompt_with_schema`（拼格式说明+示例）、`_parse_json`（去 markdown 包裹+正则提取）、`_describe_model`/`_build_example`/`_example_value`/`_type_to_str`（递归构建示例）共约 100 行。LangChain 的 `PydanticOutputParser` 一个类全覆盖：`get_format_instructions()` 生成标准 JSON Schema 格式说明，`parse()` 解析输出为 Pydantic 实例（自动处理 markdown 包裹）
   - **PydanticOutputParser.parse 不做激进正则提取**：手写 `_parse_json` 用 `re.search(r'\{.*\}')` 能从「前后大段说明文字」里抠出 JSON，但 LangChain parser 要求输入是纯 JSON 或 markdown 包裹，不做正则提取。这不是缺陷而是设计——prompt 已要求 LLM 只输出 JSON，乱输出的 LLM 应交由 base.py 外层重试重新调，而不是激进解析可能错误的 JSON
   - **重构要同步改测试**：原测试直接调用 `_build_user_prompt_with_schema` 和 `_parse_json`，重构后这些方法删除，测试改为验证 `_parser.get_format_instructions()` 和 `_parser.parse()` 的等价行为。测试用例从「验证手写解析逻辑」转为「验证 LangChain parser 行为」，更贴近实际使用
-- 经验（with_structured_output 最终方案）：
+- 经验（PostgreSQL 迁移）：
+  - **MySQL + ChromaDB → PostgreSQL + pgvector 一次性迁移**：业务元数据 + 向量检索 + LangGraph Checkpoint 全部迁进一个 PostgreSQL 库，去掉 ChromaDB/SQLite/MySQL 三个独立存储。VectorStore 接口不变只换实现（调用方零改动），MetadataStore 从双后端简化为单后端
+  - **psycopg 3 用 dict_row 兼容旧代码**：原来 sqlite3.Row / pymysql DictCursor 返回 dict（`r["col"]` 访问），psycopg 默认返回 tuple。设 `row_factory=dict_row` 后行为一致，业务代码无需改
+  - **JSONB 列 vs TEXT 列**：Postgres 的 `->>` / `->` 操作符只支持 JSONB/JSON 类型，TEXT 不行。存 JSON 的列（timeline/token_usage/details）必须用 JSONB。psycopg 读 JSONB 列时自动解析为 Python dict/list，不能再 `json.loads`——加 `_parse_json` 辅助方法兼容（JSONB 已是对象直接返回，TEXT 字符串才 json.loads）
+  - **AUTOINCREMENT → SERIAL**：SQLite 用 `INTEGER PRIMARY KEY AUTOINCREMENT`，Postgres 用 `SERIAL PRIMARY KEY`（底层是序列）
+  - **INSERT OR IGNORE/REPLACE → ON CONFLICT**：Postgres 不支持 SQLite 的 `INSERT OR IGNORE`/`INSERT OR REPLACE`，要用 `INSERT ... ON CONFLICT (cols) DO NOTHING/UPDATE SET`。冲突列必须是唯一约束/PK
+  - **cur.lastrowid → RETURNING id + fetchone**：psycopg 3 的 cursor 没有 `lastrowid` 属性，要在 INSERT 末尾加 `RETURNING id`，用 `cur.fetchone()["id"]` 取回。共 12 处，批量改时要在 SQL 字符串结束引号前插入（RETURNING 必须在 ON CONFLICT 之后，即 SQL 最后）
+  - **psycopg 字面量 % 转义**：`to_char(col, '%H')` 的 `%H` 会被 psycopg 当占位符报错。和原 pymysql 一样要把字面量 `%` 转义成 `%%`（占位符 `%s` 保留）。`_exec` 里先 `?`→`%s`，再转义 `%`→`%%`，最后恢复 `%s`
+  - **strftime 格式串 ≠ to_char 格式串**：SQLite `strftime('%H', col)` 的 `%H` 不能直接给 Postgres `to_char`（要用 `'HH24'`）。格式串要单独转换，或直接改源码用 Postgres 原生写法。实际只有一处 SQL 用了 strftime，直接改成 `to_char(created_at::timestamp, 'HH24')`
+  - **pg_trgm 替代 FTS5**：BM25 关键词检索从 SQLite FTS5 表改成 pg_trgm GIN 索引 + ILIKE。pg_trgm 索引直接挂 notes 表（写入即同步，无需 `_sync_fts_note`），`_like_query` 用 `similarity()` 排序。中文兼容性好（trigram 按 3 字符切分，CJK 友好）
+  - **测试用独立 schema 隔离**：每个测试创建 `test_<uuid>` schema，dsn 的 `search_path=test_xxx,public`（含 public 才能找到 vector/jsonb 等扩展类型），测完 DROP SCHEMA CASCADE。比临时 SQLite 文件更快、更干净，多测试并行不干扰
+  - **PostgresSaver 不能用 from_conn_string 直接拿**：`PostgresSaver.from_conn_string()` 返回 contextmanager，不能直接 `.setup()`。要手动建连接 `PostgresSaver(psycopg.connect(dsn, autocommit=True))` 后再 setup
+  - **表名三层前缀约定区分存储层级**：业务元数据（MetadataStore，19 张）无前缀（notes/sessions/messages，是主体）；向量检索（VectorStore，3 张）`vec_` 前缀（vec_note_chunks/vec_conversation_memory/vec_fragment_memory）；检查点（PostgresSaver，4 张）`checkpoint_` 前缀（LangGraph 自动建）。光看表名一眼区分用途，不用查注释。改名时只改 VectorStore（业务表是主体不动，checkpoint 表是第三方的不动）
+  - **向量表改名要兼容已初始化的库**：`_migrate_table_names` 用 `to_regclass()` 探测旧表是否存在，旧表存在且新表不存在时 `ALTER TABLE RENAME`。关键顺序：迁移必须在 `CREATE TABLE IF NOT EXISTS vec_xxx` 之前——否则新表已建（空），条件不满足跳过迁移。已有数据的旧库要先 DROP 空新表再 RENAME
+  - **PostgreSQL COMMENT ON 是幂等的**：`COMMENT ON TABLE/COLUMN` 重复执行只更新不报错，适合在 `_create_tables` 末尾统一加注释。注释失败用 try/except 兜底（注释不能阻塞建表）。表注释说明层级和用途，列注释说明枚举值/单位/关联表，数据库可直接 `\d+ tablename` 查看
+  - **测试 schema 残留是 teardown 连接未关**：VectorStore fixture 的 yield 后直接 DROP SCHEMA，但 VectorStore 的 psycopg 连接还开着（持有 schema 引用），DROP 可能因锁失败留下垃圾。修复：yield 后先 `vs._conn.close()` 再 DROP。曾累积 70 个 test_ schema 残留，根因即此
   - **生成时强制结构化 > 生成后解析**：PydanticOutputParser 是「生成后解析」（LLM 输出文本→parser 解析），仍可能解析失败。`with_structured_output(method="function_calling")` 是「生成时强制」（SDK 用 function calling 让模型在生成时就遵循 schema），invoke 直接返回 Pydantic 实例，不存在解析环节。后者更可靠，base.py 连外层重试循环都省了
   - **DeepSeek method 实测选择**：用真实 API key 实测，`function_calling` 成功直接返回实例；`json_mode` 失败（要求 prompt 含 "json" 字样，多余约束）。故选 `function_calling`。不要凭文档猜，要真调一次验证
   - **base.py 三次演进**：手写 `_parse_json`（正则提取+json.loads，约 100 行）→ PydanticOutputParser（get_format_instructions + parse，约 105 行）→ with_structured_output（3 行核心逻辑，约 90 行）。每一步都删掉更多手写代码，最终方案最简洁，职责全交给 SDK

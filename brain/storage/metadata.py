@@ -1,13 +1,12 @@
-"""元数据存储（同步，支持 SQLite 和 MySQL）。
+"""元数据存储（同步，PostgreSQL）。
 
-管理笔记元数据、标签、关联关系、摄入日志的 CRUD 操作。
-根据 config.database.host 自动选择后端：None=SQLite，指定=MySQL。
+管理笔记元数据、标签、关联关系、摄入日志等全部业务数据的 CRUD 操作。
 所有方法为同步调用，通过实例锁保证多线程安全。
 """
 
+import re
 import threading
 from datetime import date, datetime, timedelta
-from pathlib import Path
 
 from loguru import logger
 
@@ -33,48 +32,27 @@ def _synchronized(method):
 
 
 class MetadataStore:
-    """元数据管理—支持 SQLite 和 MySQL，通过实例锁保证多线程安全。"""
+    """元数据管理——PostgreSQL 单后端，通过实例锁保证多线程安全。"""
 
-    def __init__(self, db_path: Path | None = None):
-        self._db_path = str(db_path) if db_path else None
+    def __init__(self, dsn: str | None = None):
+        self._dsn = dsn
         self._conn = None
         self._lock = threading.RLock()  # 可重入锁：允许同一线程多次获取（update_prompt 调 get_prompt）
-        self._is_mysql = False
 
     # ---- 生命周期 ----
 
     @_synchronized
     def initialize(self) -> None:
-        from brain.config import get_config
+        import psycopg
+        from psycopg.rows import dict_row
 
-        cfg = get_config()
-        db_cfg = cfg.database
-
-        if db_cfg.host:
-            import pymysql
-            from pymysql.cursors import DictCursor
-
-            self._is_mysql = True
-            self._conn = pymysql.connect(
-                host=db_cfg.host, port=db_cfg.port,
-                user=db_cfg.user, password=db_cfg.password,
-                database=db_cfg.database, charset=db_cfg.charset,
-                cursorclass=DictCursor, autocommit=True,
-            )
-            logger.info(f"MetadataStore 已连接 MySQL: {db_cfg.host}:{db_cfg.port}/{db_cfg.database}")
-        else:
-            import sqlite3
-
-            if not self._db_path:
-                self._db_path = str(cfg.storage.db_path)
-            self._is_mysql = False
-            self._conn = sqlite3.connect(self._db_path, check_same_thread=False)
-            self._conn.row_factory = sqlite3.Row
-            self._conn.execute("PRAGMA journal_mode=WAL")
-            self._conn.execute("PRAGMA foreign_keys=ON")
-            self._conn.execute("PRAGMA busy_timeout=5000")
-            logger.info(f"MetadataStore 已连接 SQLite: {self._db_path}")
-
+        if not self._dsn:
+            from brain.config import get_config
+            self._dsn = get_config().database.dsn
+        # autocommit=True：每条语句自动提交，读操作始终看最新数据
+        # dict_row：返回 dict（兼容旧的 r["col"] 访问风格）
+        self._conn = psycopg.connect(self._dsn, autocommit=True, row_factory=dict_row)
+        logger.info("MetadataStore 已连接 PostgreSQL")
         self._create_tables()
 
     @_synchronized
@@ -86,40 +64,26 @@ class MetadataStore:
     def _exec(self, sql: str, params=None):
         """执行 SQL，返回 cursor（调用方可 .fetchone()/.fetchall()）。
 
-        自动处理 SQLite/MySQL 占位符和语法差异：
-        - ? → %s（MySQL）
-        - INSERT OR REPLACE → REPLACE INTO（MySQL）
-        - INSERT OR IGNORE → INSERT IGNORE（MySQL）
-        - ON CONFLICT(...) DO UPDATE SET → ON DUPLICATE KEY UPDATE（excluded.col → VALUES(col)，兼容直接赋值和累加两种写法）
-        - json_extract(col, '$.k') → CAST(JSON_UNQUOTE(JSON_EXTRACT(...)) AS DOUBLE)（返回 float，与 SQLite 一致）
+        psycopg 用 %s 占位符，业务代码用 ?，这里统一翻译。
+        ON CONFLICT ... DO UPDATE SET ... excluded.col 是 Postgres 原生语法，无需翻译。
+        json_extract(col, '$.k') → (col ->> 'k')::numeric（Postgres JSONB 访问）。
         """
         assert self._conn is not None
-        if self._is_mysql:
-            import re as _re
-
-            sql = sql.replace("INSERT OR REPLACE INTO", "REPLACE INTO")
-            sql = sql.replace("INSERT OR IGNORE INTO", "INSERT IGNORE INTO")
-            m = _re.search(r"ON CONFLICT\(([^)]+)\) DO UPDATE SET\s+(.+)", sql, _re.DOTALL)
-            if m:
-                # excluded.col → VALUES(col)（兼容直接赋值和累加两种写法）
-                set_clause = _re.sub(r"excluded\.(\w+)", r"VALUES(\1)", m.group(2))
-                sql = sql[: m.start()] + "ON DUPLICATE KEY UPDATE " + set_clause
-            sql = _re.sub(
-                r"json_extract\((\w+),\s*'\$\.(\w+)'\)",
-                r"CAST(JSON_UNQUOTE(JSON_EXTRACT(\1, '$.\2')) AS DOUBLE)",
-                sql,
-            )
-            # SQLite strftime('fmt', col) → MySQL DATE_FORMAT(col, 'fmt')
-            sql = _re.sub(r"strftime\(([^,]+),\s*([^)]+)\)", r"DATE_FORMAT(\2, \1)", sql)
-            # 先转换 ? → %s 占位符
-            sql = sql.replace("?", "%s")
-            # 转义字面量 %（DATE_FORMAT 的 %H、LIKE 的 % 等），
-            # 避免 pymysql 的 % 格式化误判；%s 占位符保留
-            sql = sql.replace("%s", "\x00\x00")
-            sql = sql.replace("%", "%%")
-            sql = sql.replace("\x00\x00", "%s")
+        # JSONB 列访问（Postgres 原生）
+        sql = re.sub(
+            r"json_extract\((\w+),\s*'\$\.(\w+)'\)",
+            r"(\1 ->> '\2')::numeric",
+            sql,
+        )
+        # 时间格式化 → Postgres to_char
+        sql = re.sub(r"strftime\(([^,]+),\s*([^)]+)\)", r"to_char(\2, \1)", sql)
+        # ? → %s（psycopg 占位符）
+        sql = sql.replace("?", "%s")
+        # 转义字面量 %（to_char 的 %H、LIKE 的 % 等），避免 psycopg 误当占位符；%s 保留
+        sql = sql.replace("%s", "\x00\x00")
+        sql = sql.replace("%", "%%")
+        sql = sql.replace("\x00\x00", "%s")
         cur = self._conn.cursor()
-        # MySQL: 无参数时不传 args，避免 SQL 中的字面量 % 被误当格式占位符
         if params:
             cur.execute(sql, params)
         else:
@@ -127,30 +91,30 @@ class MetadataStore:
         return cur
 
     def _executescript(self, script: str) -> None:
-        """执行多语句脚本（兼容 SQLite executescript 和 MySQL 逐条执行）。"""
+        """执行多语句脚本（psycopg 单次 execute 支持多语句，无需手动分割）。"""
         assert self._conn is not None
-        if self._is_mysql:
-            cur = self._conn.cursor()
-            for stmt in script.split(";"):
-                stmt = stmt.strip()
-                if stmt:
-                    cur.execute(stmt)
-            cur.close()
-        else:
-            self._conn.executescript(script)
+        cur = self._conn.cursor()
+        cur.execute(script)
+        cur.close()
+
+    @staticmethod
+    def _parse_json(value):
+        """解析 JSON 列值，兼容 JSONB（psycopg 已解析为对象）和 TEXT（需 json.loads）。"""
+        if value is None:
+            return None
+        if isinstance(value, (dict, list)):
+            return value  # JSONB 已被 psycopg 自动解析
+        if isinstance(value, str):
+            import json
+            try:
+                return json.loads(value)
+            except json.JSONDecodeError:
+                return None
+        return value
 
     def _create_tables(self) -> None:
         assert self._conn is not None
-        if self._is_mysql:
-            from brain.storage.mysql_schema import MYSQL_DDL
-
-            cur = self._conn.cursor()
-            for ddl in MYSQL_DDL:
-                cur.execute(ddl)
-            cur.close()
-            self._conn.commit()
-            self._migrate()
-            return
+        # PostgreSQL DDL
         self._executescript("""
             CREATE TABLE IF NOT EXISTS notes (
                 id TEXT PRIMARY KEY,
@@ -168,7 +132,7 @@ class MetadataStore:
             );
 
             CREATE TABLE IF NOT EXISTS tags (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                id SERIAL PRIMARY KEY,
                 name TEXT NOT NULL UNIQUE,
                 category TEXT NOT NULL,
                 is_ai_generated INTEGER DEFAULT 0
@@ -184,7 +148,7 @@ class MetadataStore:
             );
 
             CREATE TABLE IF NOT EXISTS connections (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                id SERIAL PRIMARY KEY,
                 source_note_id TEXT NOT NULL,
                 target_note_id TEXT NOT NULL,
                 relation_type TEXT NOT NULL,
@@ -197,7 +161,7 @@ class MetadataStore:
             );
 
             CREATE TABLE IF NOT EXISTS ingestion_log (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                id SERIAL PRIMARY KEY,
                 note_id TEXT NOT NULL,
                 event TEXT NOT NULL,
                 status TEXT NOT NULL,
@@ -216,18 +180,18 @@ class MetadataStore:
             );
 
             CREATE TABLE IF NOT EXISTS messages (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                id SERIAL PRIMARY KEY,
                 session_id TEXT NOT NULL,
                 role TEXT NOT NULL,              -- 'user' | 'assistant'
                 content TEXT NOT NULL,
-                timeline TEXT DEFAULT '[]',      -- JSON: 工具调用轨迹 [{kind, name, args, done}]
+                timeline JSONB DEFAULT '[]',     -- JSON: 工具调用轨迹 [{kind, name, args, done}]
                 created_at TEXT NOT NULL,
                 status TEXT NOT NULL DEFAULT 'complete',  -- 'complete' | 'pending'（HIL 中断态）
                 FOREIGN KEY (session_id) REFERENCES sessions(id) ON DELETE CASCADE
             );
 
             CREATE TABLE IF NOT EXISTS knowledge_fragments (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                id SERIAL PRIMARY KEY,
                 session_id TEXT,
                 title TEXT NOT NULL,
                 content TEXT NOT NULL,
@@ -247,7 +211,7 @@ class MetadataStore:
             );
 
             CREATE TABLE IF NOT EXISTS digest_reports (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                id SERIAL PRIMARY KEY,
                 report_type TEXT NOT NULL,       -- 'daily' | 'weekly'
                 report_date TEXT NOT NULL,       -- 报告日期（daily: 昨日日期; weekly: 周一日期）
                 content TEXT NOT NULL,
@@ -256,7 +220,7 @@ class MetadataStore:
             );
 
             CREATE TABLE IF NOT EXISTS rss_feeds (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                id SERIAL PRIMARY KEY,
                 url TEXT NOT NULL UNIQUE,
                 title TEXT DEFAULT '',
                 created_at TEXT NOT NULL,
@@ -265,13 +229,14 @@ class MetadataStore:
             );
 
             CREATE TABLE IF NOT EXISTS rss_entries (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                id SERIAL PRIMARY KEY,
                 feed_id INTEGER NOT NULL,
                 entry_id TEXT NOT NULL,          -- feed 条目的唯一 ID（去重）
                 title TEXT NOT NULL,
                 link TEXT DEFAULT '',
                 note_id TEXT DEFAULT '',         -- 摄入后生成的笔记 ID
                 published_at TEXT DEFAULT '',
+                content TEXT DEFAULT '',         -- 条目正文（feed content 或抓取的全文）
                 UNIQUE(feed_id, entry_id),
                 FOREIGN KEY (feed_id) REFERENCES rss_feeds(id) ON DELETE CASCADE
             );
@@ -285,7 +250,7 @@ class MetadataStore:
             CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id, id);
 
             CREATE TABLE IF NOT EXISTS metrics (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                id SERIAL PRIMARY KEY,
                 trace_id TEXT,
                 metric_type TEXT NOT NULL,
                 metric_name TEXT NOT NULL,
@@ -313,14 +278,14 @@ class MetadataStore:
         self._executescript(
             """
             CREATE TABLE IF NOT EXISTS trace_events (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                id SERIAL PRIMARY KEY,
                 trace_id TEXT NOT NULL,
                 seq INTEGER NOT NULL,
                 event_type TEXT NOT NULL,
                 name TEXT,
                 input TEXT,
                 output TEXT,
-                token_usage TEXT,
+                token_usage JSONB,
                 latency_ms REAL,
                 run_id TEXT,
                 created_at TEXT NOT NULL
@@ -330,7 +295,7 @@ class MetadataStore:
 
             -- 评估分数表（Phase 5D FR55）：LLM-as-Judge 打分
             CREATE TABLE IF NOT EXISTS eval_scores (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                id SERIAL PRIMARY KEY,
                 trace_id TEXT,
                 question TEXT,
                 answer TEXT,
@@ -344,14 +309,14 @@ class MetadataStore:
 
             -- 评估批次历史表（Phase 5D：离线评估 + Judge 抽样的运行记录）
             CREATE TABLE IF NOT EXISTS eval_runs (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                id SERIAL PRIMARY KEY,
                 run_type TEXT NOT NULL,     -- 'offline' | 'judge'
                 total INTEGER,
                 passed INTEGER,
                 pass_rate REAL,
                 avg_score REAL,
                 duration_ms REAL,
-                details TEXT,               -- JSON 摘要
+                details JSONB,              -- JSON 摘要
                 created_at TEXT NOT NULL
             );
             CREATE INDEX IF NOT EXISTS idx_eval_runs_created ON eval_runs(created_at);
@@ -373,7 +338,7 @@ class MetadataStore:
                 updated_at TEXT NOT NULL
             );
             CREATE TABLE IF NOT EXISTS bad_cases (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                id SERIAL PRIMARY KEY,
                 trace_id TEXT,
                 question TEXT,
                 answer TEXT,
@@ -396,7 +361,7 @@ class MetadataStore:
 
             -- 提示词历史版本（每次更新前归档旧内容）
             CREATE TABLE IF NOT EXISTS prompt_versions (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                id SERIAL PRIMARY KEY,
                 prompt_key TEXT NOT NULL,
                 version INTEGER NOT NULL,
                 content TEXT NOT NULL,
@@ -407,61 +372,171 @@ class MetadataStore:
         )
         self._conn.commit()
 
-        # BM25 全文索引（Phase 5F FR58）：索引笔记标题+预览，补充向量检索的关键词命中能力
-        # SQLite 用 FTS5 表（独立存一份索引数据，由 _sync_fts_note 维护同步）
+        # BM25 关键词检索（Phase 5F FR58）：索引笔记标题+预览，补充向量检索的关键词命中能力
+        # Postgres 用 pg_trgm GIN 索引加速 ILIKE（兼容中文，保证召回）
         self._executescript(
             """
-            CREATE VIRTUAL TABLE IF NOT EXISTS notes_fts USING fts5(
-                note_id UNINDEXED,
-                title,
-                content_preview
-            );
+            CREATE EXTENSION IF NOT EXISTS pg_trgm;
+            CREATE INDEX IF NOT EXISTS idx_notes_title_trgm ON notes USING gin (title gin_trgm_ops);
+            CREATE INDEX IF NOT EXISTS idx_notes_preview_trgm ON notes USING gin (content_preview gin_trgm_ops);
             """
         )
         self._conn.commit()
 
+        # 表与列注释（幂等）
+        self._apply_business_comments()
+
         # 数据库迁移：补充旧表缺失的列/表（CREATE TABLE IF NOT EXISTS 不会改已有表）
         self._migrate()
+
+    def _apply_business_comments(self) -> None:
+        """为业务元数据表和关键列添加注释（幂等）。
+
+        这些表是系统的核心业务数据层（无表名前缀），与向量层（vec_ 前缀）、
+        检查点层（checkpoint_ 前缀）区分。
+        """
+        statements = [
+            # ---- notes: 笔记元数据 ----
+            "COMMENT ON TABLE notes IS '业务层-笔记元数据：摄入的每条知识（Markdown/书签/RSS/CLI）的元信息'",
+            "COMMENT ON COLUMN notes.id IS '笔记唯一 ID（UUID4）'",
+            "COMMENT ON COLUMN notes.title IS '笔记标题'",
+            "COMMENT ON COLUMN notes.source_type IS '来源类型：MARKDOWN / BOOKMARK / RSS / CLI'",
+            "COMMENT ON COLUMN notes.source_path IS '原始文件路径或 URL'",
+            "COMMENT ON COLUMN notes.file_hash IS '原始内容哈希（去重用）'",
+            "COMMENT ON COLUMN notes.content_preview IS '内容预览（前 200 字，供 BM25 关键词检索）'",
+            "COMMENT ON COLUMN notes.content_length IS '内容总长度（字符数）'",
+            "COMMENT ON COLUMN notes.chunk_count IS '分块数量（对应 vec_note_chunks）'",
+            "COMMENT ON COLUMN notes.status IS '状态：active / deleted（软删除）'",
+            "COMMENT ON COLUMN notes.created_at IS '创建时间（ISO 8601）'",
+            "COMMENT ON COLUMN notes.updated_at IS '最后更新时间（ISO 8601）'",
+            "COMMENT ON COLUMN notes.ingested_at IS '摄入完成时间（ISO 8601）'",
+            # ---- tags: 标签 ----
+            "COMMENT ON TABLE tags IS '业务层-标签：笔记的分类标签，可 AI 自动或手动生成'",
+            "COMMENT ON COLUMN tags.id IS '标签自增 ID'",
+            "COMMENT ON COLUMN tags.name IS '标签名（唯一）'",
+            "COMMENT ON COLUMN tags.category IS '标签分类：topic / type / source 等'",
+            "COMMENT ON COLUMN tags.is_ai_generated IS '是否 AI 生成（0/1）'",
+            # ---- note_tags: 笔记-标签关联 ----
+            "COMMENT ON TABLE note_tags IS '业务层-笔记标签关联：多对多关系，带分类置信度'",
+            "COMMENT ON COLUMN note_tags.note_id IS '笔记 ID'",
+            "COMMENT ON COLUMN note_tags.tag_id IS '标签 ID'",
+            "COMMENT ON COLUMN note_tags.confidence IS '分类置信度（0.0-1.0，AI 生成时填充）'",
+            # ---- connections: 知识关联 ----
+            "COMMENT ON TABLE connections IS '业务层-知识关联：笔记间的语义关联，构建知识图谱的边'",
+            "COMMENT ON COLUMN connections.id IS '关联自增 ID'",
+            "COMMENT ON COLUMN connections.source_note_id IS '源笔记 ID'",
+            "COMMENT ON COLUMN connections.target_note_id IS '目标笔记 ID'",
+            "COMMENT ON COLUMN connections.relation_type IS '关联类型：related / depends_on / extends 等'",
+            "COMMENT ON COLUMN connections.strength IS '关联强度（0.0-1.0）'",
+            "COMMENT ON COLUMN connections.description IS '关联描述（AI 生成）'",
+            "COMMENT ON COLUMN connections.is_ai_generated IS '是否 AI 生成（0/1）'",
+            # ---- sessions: 对话会话 ----
+            "COMMENT ON TABLE sessions IS '业务层-对话会话：用户与 AI 的问答会话'",
+            "COMMENT ON COLUMN sessions.id IS '会话唯一 ID（UUID4，等于 LangGraph thread_id）'",
+            "COMMENT ON COLUMN sessions.title IS '会话标题'",
+            "COMMENT ON COLUMN sessions.pending_msg_id IS 'HIL 中断时暂存的待续消息 ID（关联 messages.id）'",
+            # ---- messages: 对话消息 ----
+            "COMMENT ON TABLE messages IS '业务层-对话消息：会话内的单条消息（user/assistant）'",
+            "COMMENT ON COLUMN messages.session_id IS '所属会话 ID'",
+            "COMMENT ON COLUMN messages.role IS '消息角色：user / assistant'",
+            "COMMENT ON COLUMN messages.content IS '消息内容'",
+            "COMMENT ON COLUMN messages.timeline IS '工具调用轨迹（JSONB：[{kind,name,args,done}]）'",
+            "COMMENT ON COLUMN messages.status IS '消息状态：complete / pending（HIL 中断态）'",
+            # ---- knowledge_fragments: 知识片段 ----
+            "COMMENT ON TABLE knowledge_fragments IS '业务层-知识片段：HIL 沉淀的精炼知识（用户确认后写入，喂给向量层）'",
+            "COMMENT ON COLUMN knowledge_fragments.session_id IS '来源会话 ID'",
+            "COMMENT ON COLUMN knowledge_fragments.status IS '审核状态：approved / rejected'",
+            # ---- ingestion_log: 摄入日志 ----
+            "COMMENT ON TABLE ingestion_log IS '业务层-摄入日志：记录每条笔记摄入流水线各阶段的事件和耗时'",
+            "COMMENT ON COLUMN ingestion_log.event IS '事件：parse / chunk / embed / index / classify / connect'",
+            "COMMENT ON COLUMN ingestion_log.status IS '状态：success / error'",
+            "COMMENT ON COLUMN ingestion_log.duration_ms IS '阶段耗时（毫秒）'",
+            # ---- reviews: 复习调度 ----
+            "COMMENT ON TABLE reviews IS '业务层-复习调度：SM-2 间隔重复算法的复习记录'",
+            "COMMENT ON COLUMN reviews.ease_factor IS 'SM-2 熟练度系数（下限 1.3）'",
+            "COMMENT ON COLUMN reviews.interval_days IS '当前复习间隔（天）'",
+            "COMMENT ON COLUMN reviews.due_date IS '下次复习日期（ISO）'",
+            "COMMENT ON COLUMN reviews.review_count IS '已复习次数'",
+            "COMMENT ON COLUMN reviews.last_quality IS '上次评分（0-5）'",
+            # ---- digest_reports: 生成报告 ----
+            "COMMENT ON TABLE digest_reports IS '业务层-生成报告：每日/每周知识摘要报告'",
+            "COMMENT ON COLUMN digest_reports.report_type IS '报告类型：daily / weekly'",
+            # ---- rss_feeds / rss_entries: RSS 订阅 ----
+            "COMMENT ON TABLE rss_feeds IS '业务层-RSS 订阅源'",
+            "COMMENT ON COLUMN rss_feeds.entry_count IS '已拉取条目数'",
+            "COMMENT ON TABLE rss_entries IS '业务层-RSS 条目：订阅源的每篇文章'",
+            "COMMENT ON COLUMN rss_entries.entry_id IS 'feed 内条目唯一 ID（去重用）'",
+            "COMMENT ON COLUMN rss_entries.note_id IS '摄入后生成的笔记 ID（未摄入为空）'",
+            "COMMENT ON COLUMN rss_entries.content IS '条目正文（feed content 字段或抓取网页的全文）'",
+            # ---- metrics: 指标记录 ----
+            "COMMENT ON TABLE metrics IS '可观测层-指标记录：数值型指标（latency/token/count），供看板聚合'",
+            "COMMENT ON COLUMN metrics.metric_type IS '指标类型：ingest / ask / connect 等'",
+            "COMMENT ON COLUMN metrics.metric_name IS '指标名：count / latency_ms / tokens'",
+            # ---- usage_counters: 用量计数器 ----
+            "COMMENT ON TABLE usage_counters IS '可观测层-用量计数器：预算账本（today/month/total），可重置不破坏审计数据'",
+            "COMMENT ON COLUMN usage_counters.period_type IS '周期类型：today / month / total'",
+            "COMMENT ON COLUMN usage_counters.period_key IS '周期键：日期串（today/month）或 all（total），跨期轮转'",
+            "COMMENT ON COLUMN usage_counters.tokens IS '累计 token 数'",
+            "COMMENT ON COLUMN usage_counters.cost IS '累计成本（元）'",
+            "COMMENT ON COLUMN usage_counters.calls IS '累计调用次数'",
+            # ---- trace_events: 调用链 ----
+            "COMMENT ON TABLE trace_events IS '可观测层-调用链事件：LLM/工具的入参出参全量记录，供调用链回放（与 metrics 通过 trace_id 关联）'",
+            "COMMENT ON COLUMN trace_events.trace_id IS '调用链 ID（关联 metrics.trace_id）'",
+            "COMMENT ON COLUMN trace_events.seq IS '事件序号（同一 trace 内递增）'",
+            "COMMENT ON COLUMN trace_events.event_type IS '事件类型：llm_start / llm_end / tool_start / tool_end'",
+            "COMMENT ON COLUMN trace_events.token_usage IS 'token 用量明细（JSONB：含 cost）'",
+            "COMMENT ON COLUMN trace_events.run_id IS '关联的评估批次 ID（eval_runs.id）'",
+            # ---- eval_scores / eval_runs: 评估 ----
+            "COMMENT ON TABLE eval_scores IS '评估层-LLM-as-Judge 打分：单条问答的质量评分'",
+            "COMMENT ON COLUMN eval_scores.run_id IS '关联评估批次（eval_runs.id）'",
+            "COMMENT ON TABLE eval_runs IS '评估层-评估批次：离线评估 + Judge 抽样的运行记录'",
+            "COMMENT ON COLUMN eval_runs.run_type IS '批次类型：offline / judge'",
+            "COMMENT ON COLUMN eval_runs.details IS '批次摘要（JSONB）'",
+            # ---- golden_cases / bad_cases: 测试集 ----
+            "COMMENT ON TABLE golden_cases IS '评估层-黄金测试集：离线评估的标准问答（可页面 CRUD）'",
+            "COMMENT ON COLUMN golden_cases.expected_keywords IS '期望命中的关键词（JSON 数组字符串）'",
+            "COMMENT ON COLUMN golden_cases.expected_sources IS '期望命中的笔记来源 ID（JSON 数组字符串）'",
+            "COMMENT ON COLUMN golden_cases.min_score IS '最低合格分（0.0-1.0）'",
+            "COMMENT ON TABLE bad_cases IS '评估层-坏案例：用户反馈“回答不好”的回流样本'",
+            # ---- prompts / prompt_versions: 提示词 ----
+            "COMMENT ON TABLE prompts IS '配置层-提示词：AI 提示词外部化存储（页面 CRUD，即时生效）'",
+            "COMMENT ON COLUMN prompts.prompt_key IS '提示词唯一键（如 classifier / connector）'",
+            "COMMENT ON COLUMN prompts.is_template IS '是否含占位符模板（1=需 str.format 渲染）'",
+            "COMMENT ON TABLE prompt_versions IS '配置层-提示词历史版本：每次更新前归档旧内容，支持回滚'",
+        ]
+        for stmt in statements:
+            try:
+                self._conn.cursor().execute(stmt)
+            except Exception:
+                pass  # 注释失败不阻塞建表流程
+        self._conn.commit()
 
     def _migrate(self) -> None:
         """增量迁移：为旧数据库补充新增的列和表。"""
         assert self._conn is not None
 
         def has_column(table: str, column: str) -> bool:
-            if self._is_mysql:
-                cur = self._exec(
-                    "SELECT COUNT(*) as cnt FROM information_schema.columns "
-                    "WHERE table_schema=DATABASE() AND table_name=%s AND column_name=%s",
-                    (table, column),
-                )
-                row = cur.fetchone()
-                return (row["cnt"] if row else 0) > 0
-            else:
-                cur = self._conn.execute(f"PRAGMA table_info({table})")
-                cols = [r[1] for r in cur.fetchall()]
-                return column in cols
+            cur = self._exec(
+                "SELECT COUNT(*) AS cnt FROM information_schema.columns "
+                "WHERE table_schema = current_schema() AND table_name=%s AND column_name=%s",
+                (table, column),
+            )
+            row = cur.fetchone()
+            return (row["cnt"] if row else 0) > 0
 
         def has_table(table: str) -> bool:
-            if self._is_mysql:
-                cur = self._exec(
-                    "SELECT COUNT(*) as cnt FROM information_schema.tables "
-                    "WHERE table_schema=DATABASE() AND table_name=%s",
-                    (table,),
-                )
-                row = cur.fetchone()
-                return (row["cnt"] if row else 0) > 0
-            else:
-                cur = self._exec(
-                    "SELECT name FROM sqlite_master WHERE type='table' AND name=?", (table,)
-                )
-                return cur.fetchone() is not None
+            cur = self._exec(
+                "SELECT COUNT(*) AS cnt FROM information_schema.tables "
+                "WHERE table_schema = current_schema() AND table_name=%s",
+                (table,),
+            )
+            row = cur.fetchone()
+            return (row["cnt"] if row else 0) > 0
 
         # messages 表补 status 列（HIL 中断态标记：complete/pending）
-        # MySQL 严格模式不允许 TEXT 列设 DEFAULT，必须用 VARCHAR
         if has_table("messages") and not has_column("messages", "status"):
-            col_type = "VARCHAR(20)" if self._is_mysql else "TEXT"
             self._exec(
-                f"ALTER TABLE messages ADD COLUMN status {col_type} NOT NULL DEFAULT 'complete'"
+                "ALTER TABLE messages ADD COLUMN status TEXT NOT NULL DEFAULT 'complete'"
             )
             logger.info("迁移: messages 表新增 status 列")
 
@@ -475,19 +550,24 @@ class MetadataStore:
             self._exec("ALTER TABLE eval_scores ADD COLUMN run_id INTEGER")
             logger.info("迁移: eval_scores 表新增 run_id 列")
 
+        # rss_entries 表补 content 列（存条目正文）
+        if has_table("rss_entries") and not has_column("rss_entries", "content"):
+            self._exec("ALTER TABLE rss_entries ADD COLUMN content TEXT DEFAULT ''")
+            logger.info("迁移: rss_entries 表新增 content 列")
+
         # eval_runs 表（旧库可能没有）
         if not has_table("eval_runs"):
             self._executescript(
                 """
                 CREATE TABLE IF NOT EXISTS eval_runs (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    id SERIAL PRIMARY KEY,
                     run_type TEXT NOT NULL,
                     total INTEGER,
                     passed INTEGER,
                     pass_rate REAL,
                     avg_score REAL,
                     duration_ms REAL,
-                    details TEXT,
+                    details JSONB,
                     created_at TEXT NOT NULL
                 );
                 CREATE INDEX IF NOT EXISTS idx_eval_runs_created ON eval_runs(created_at);
@@ -507,86 +587,41 @@ class MetadataStore:
         self._conn.commit()
 
     def _init_bm25_index(self) -> None:
-        """初始化 BM25 全文索引（Phase 5F FR58）。
+        """初始化 BM25 关键词检索索引（Phase 5F FR58）。
 
-        - MySQL: 幂等添加 FULLTEXT 索引（检查 information_schema）
-        - SQLite: 回填 FTS5 表（旧库升级时 notes 已有数据但 FTS 为空）
+        Postgres 用 pg_trgm GIN 索引加速 ILIKE（在 _create_tables 已创建），
+        此方法保留为空操作（索引随表创建，无需额外回填）。
         """
-        if self._is_mysql:
-            # 检查是否已有名为 ft_notes_text 的 FULLTEXT 索引
-            cur = self._exec(
-                "SELECT COUNT(*) as cnt FROM information_schema.statistics "
-                "WHERE table_schema=DATABASE() AND table_name=%s "
-                "AND index_type='FULLTEXT'",
-                ("notes",),
-            )
-            row = cur.fetchone()
-            if row and row["cnt"] == 0:
-                try:
-                    self._exec(
-                        "ALTER TABLE notes ADD FULLTEXT INDEX ft_notes_text (title, content_preview)"
-                    )
-                    logger.info("迁移: notes 表新增 FULLTEXT 索引 ft_notes_text")
-                except Exception as e:
-                    logger.warning(f"添加 FULLTEXT 索引失败（可能已存在）: {e}")
-        else:
-            # SQLite FTS5 contentless 表：回填旧数据（notes 已有但 FTS 未同步）
-            row = self._exec("SELECT COUNT(*) as cnt FROM notes_fts").fetchone()
-            if row and row["cnt"] == 0:
-                self._exec(
-                    "INSERT INTO notes_fts(note_id, title, content_preview) "
-                    "SELECT id, title, content_preview FROM notes WHERE status = 'active'"
-                )
-                synced = self._exec("SELECT COUNT(*) as cnt FROM notes_fts").fetchone()
-                logger.info(f"迁移: notes_fts 回填 {synced['cnt'] if synced else 0} 条笔记")
 
     def _sync_fts_note(
         self, note_id: str, title: str, content_preview: str,
         insert: bool = True, delete_only: bool = False,
     ) -> None:
-        """同步单条笔记到 BM25 索引（Phase 5F）。
+        """同步单条笔记到 BM25 索引。
 
-        - insert=True: 先删后插（幂等 upsert）
-        - insert=False: 仅更新（先删后插，用于 update_note）
-        - delete_only=True: 仅删除（硬删除时）
-
-        MySQL: notes 表本身有 FULLTEXT 索引，无需同步外部表，此方法为空操作。
+        Postgres 的 pg_trgm 索引直接挂在 notes 表，写入即同步，此方法为空操作。
+        保留签名以兼容调用方（add_note/update_note/delete_note）。
         """
-        if self._is_mysql:
-            return  # FULLTEXT 索引直接挂在 notes 表，写入即同步
-        # SQLite FTS5 contentless 表
-        self._exec("DELETE FROM notes_fts WHERE note_id = ?", (note_id,))
-        if not delete_only and insert:
-            self._exec(
-                "INSERT INTO notes_fts(note_id, title, content_preview) VALUES (?, ?, ?)",
-                (note_id, title or "", content_preview or ""),
-            )
 
     @_synchronized
     def bm25_search(self, query: str, top_k: int = 20) -> list[dict]:
-        """BM25 关键词检索（Phase 5F FR58）。
+        """关键词检索（Phase 5F FR58）。
 
-        索引笔记标题 + content_preview，返回 note_id + bm25_score + title + preview。
-        双后端兼容：SQLite 走 FTS5，MySQL 走 MATCH...AGAINST。
-
-        中文兼容：FTS5 unicode61 分词器对 CJK 按字切分，短语查询可能不命中，
-        故 FTS 结果为空时用 LIKE 兜底（保证中文召回，牺牲排序精度）。
+        索引笔记标题 + content_preview，返回 note_id + score + title + preview。
+        Postgres 用 ILIKE + pg_trgm GIN 索引（兼容中文，按相似度排序）。
 
         Args:
             query: 搜索查询（自然语言或关键词）
             top_k: 返回结果数
 
         Returns:
-            [{note_id, score, title, content_preview}, ...]，按 bm25 分降序
+            [{note_id, score, title, content_preview}, ...]，按相似度降序
         """
         assert self._conn is not None
         if not query.strip():
             return []
         try:
-            rows = self._fts_query(query, top_k)
-            # FTS 未命中时用 LIKE 兜底（中文短语场景）
-            if not rows:
-                rows = self._like_query(query, top_k)
+            rows = self._like_query(query, top_k)
             return [
                 {
                     "note_id": r["id"],
@@ -600,51 +635,23 @@ class MetadataStore:
             logger.warning(f"BM25 检索失败（降级为空结果）: {e}")
             return []
 
-    def _fts_query(self, query: str, top_k: int) -> list:
-        """FTS5 / FULLTEXT 查询（带 BM25 排序分）。"""
-        if self._is_mysql:
-            return self._exec(
-                """SELECT id, title, content_preview,
-                          MATCH(title, content_preview) AGAINST(%s IN NATURAL LANGUAGE MODE) as score
-                   FROM notes
-                   WHERE status = 'active'
-                     AND MATCH(title, content_preview) AGAINST(%s IN NATURAL LANGUAGE MODE)
-                   ORDER BY score DESC
-                   LIMIT %s""",
-                (query, query, top_k),
-            ).fetchall()
-        # SQLite FTS5：bm25() 返回负值（越小越相关），取负转为“越大越相关”
-        return self._exec(
-            """SELECT n.id, n.title, n.content_preview,
-                      -bm25(notes_fts) as score
-               FROM notes_fts f
-               JOIN notes n ON n.id = f.note_id
-               WHERE notes_fts MATCH ? AND n.status = 'active'
-               ORDER BY score DESC
-               LIMIT ?""",
-            (query, top_k),
-        ).fetchall()
-
     def _like_query(self, query: str, top_k: int) -> list:
-        """LIKE 模糊查询兜底（中文短语场景，无 BM25 排序分）。"""
+        """ILIKE 模糊查询（pg_trgm GIN 索引加速，兼容中文短语）。
+
+        similarity() 给出 0-1 的相似度分用于排序。
+        """
         pattern = f"%{query}%"
-        if self._is_mysql:
-            return self._exec(
-                """SELECT id, title, content_preview, 1.0 as score
-                   FROM notes
-                   WHERE status = 'active'
-                     AND (title LIKE %s OR content_preview LIKE %s)
-                   LIMIT %s""",
-                (pattern, pattern, top_k),
-            ).fetchall()
         return self._exec(
-            """SELECT id, title, content_preview, 1.0 as score
+            """SELECT id, title, content_preview,
+                      similarity(title || ' ' || content_preview, %s) as score
                FROM notes
                WHERE status = 'active'
-                 AND (title LIKE ? OR content_preview LIKE ?)
-               LIMIT ?""",
-            (pattern, pattern, top_k),
+                 AND (title ILIKE %s OR content_preview ILIKE %s)
+               ORDER BY score DESC
+               LIMIT %s""",
+            (query, pattern, pattern, top_k),
         ).fetchall()
+
 
     def _backfill_usage_counters(self) -> None:
         """从 trace_events 历史数据回填 usage_counters 计数器。
@@ -698,9 +705,15 @@ class MetadataStore:
             ("total", "all", total_tokens, total_cost),
         ]:
             self._exec(
-                """INSERT OR REPLACE INTO usage_counters
+                """INSERT INTO usage_counters
                    (period_type, period_key, tokens, cost, calls, updated_at)
-                   VALUES (?, ?, ?, ?, 0, ?)""",
+                   VALUES (?, ?, ?, ?, 0, ?)
+                   ON CONFLICT (period_type) DO UPDATE SET
+                       period_key = EXCLUDED.period_key,
+                       tokens = EXCLUDED.tokens,
+                       cost = EXCLUDED.cost,
+                       calls = EXCLUDED.calls,
+                       updated_at = EXCLUDED.updated_at""",
                 (pt, pk, t, round(c, 6), now_iso),
             )
         logger.info(
@@ -725,9 +738,10 @@ class MetadataStore:
         if is_empty:
             for key, name, desc, content, is_template in DEFAULT_PROMPTS:
                 self._exec(
-                    """INSERT OR IGNORE INTO prompts
+                    """INSERT INTO prompts
                        (prompt_key, name, description, content, is_template, enabled, version, updated_at)
-                       VALUES (?, ?, ?, ?, ?, 1, 1, ?)""",
+                       VALUES (?, ?, ?, ?, ?, 1, 1, ?)
+                       ON CONFLICT (prompt_key) DO NOTHING""",
                     (key, name, desc, content, is_template, now_iso),
                 )
             logger.info(f"播种提示词: {len(DEFAULT_PROMPTS)} 条默认值")
@@ -740,9 +754,10 @@ class MetadataStore:
                 ).fetchone()
                 if existing is None:
                     self._exec(
-                        """INSERT OR IGNORE INTO prompts
+                        """INSERT INTO prompts
                            (prompt_key, name, description, content, is_template, enabled, version, updated_at)
-                           VALUES (?, ?, ?, ?, ?, 1, 1, ?)""",
+                           VALUES (?, ?, ?, ?, ?, 1, 1, ?)
+                           ON CONFLICT (prompt_key) DO NOTHING""",
                         (key, name, desc, content, is_template, now_iso),
                     )
                     added += 1
@@ -851,17 +866,18 @@ class MetadataStore:
         if row:
             return row["id"]
         cur = self._exec(
-            "INSERT INTO tags (name, category, is_ai_generated) VALUES (?, ?, ?)",
+            "INSERT INTO tags (name, category, is_ai_generated) VALUES (?, ?, ?) RETURNING id",
             (name, category.value, int(is_ai)),
         )
         self._conn.commit()
-        return cur.lastrowid
+        return cur.fetchone()["id"]
 
     @_synchronized
     def add_tag_to_note(self, note_id: str, tag_id: int, confidence: float | None = None) -> None:
         assert self._conn is not None
         self._exec(
-            "INSERT OR REPLACE INTO note_tags (note_id, tag_id, confidence) VALUES (?, ?, ?)",
+            """INSERT INTO note_tags (note_id, tag_id, confidence) VALUES (?, ?, ?)
+                   ON CONFLICT (note_id, tag_id) DO UPDATE SET confidence = EXCLUDED.confidence""",
             (note_id, tag_id, confidence),
         )
         self._conn.commit()
@@ -918,12 +934,12 @@ class MetadataStore:
             """INSERT INTO connections
                (source_note_id, target_note_id, relation_type, strength,
                 description, created_at, is_ai_generated)
-               VALUES (?, ?, ?, ?, ?, ?, ?)""",
+               VALUES (?, ?, ?, ?, ?, ?, ?) RETURNING id""",
             (conn.source_note_id, conn.target_note_id, conn.relation_type.value,
              conn.strength, conn.description, conn.created_at, int(conn.is_ai_generated)),
         )
         self._conn.commit()
-        return cur.lastrowid
+        return cur.fetchone()["id"]
 
     @_synchronized
     def get_connections(self, note_id: str) -> list[Connection]:
@@ -1058,11 +1074,11 @@ class MetadataStore:
         timeline_json = json.dumps(timeline or [], ensure_ascii=False)
         cur = self._exec(
             """INSERT INTO messages (session_id, role, content, timeline, created_at, status)
-               VALUES (?, ?, ?, ?, ?, ?)""",
+               VALUES (?, ?, ?, ?, ?, ?) RETURNING id""",
             (session_id, role, content, timeline_json, datetime.now().isoformat(), status),
         )
         self._conn.commit()
-        return cur.lastrowid
+        return cur.fetchone()["id"]
 
     @_synchronized
     def update_message(
@@ -1116,10 +1132,17 @@ class MetadataStore:
         ).fetchall()
         result = []
         for r in rows:
-            try:
-                timeline = json.loads(r["timeline"] or "[]")
-            except json.JSONDecodeError:
+            # timeline 是 JSONB，psycopg 自动解析为 list；旧数据可能为 None/字符串
+            tl = r["timeline"]
+            if tl is None:
                 timeline = []
+            elif isinstance(tl, str):
+                try:
+                    timeline = json.loads(tl)
+                except json.JSONDecodeError:
+                    timeline = []
+            else:
+                timeline = tl  # 已是 list
             result.append(
                 {
                     "id": r["id"],
@@ -1156,12 +1179,12 @@ class MetadataStore:
         assert self._conn is not None
         cur = self._exec(
             """INSERT INTO knowledge_fragments (session_id, title, content, status, created_at)
-               VALUES (?, ?, ?, ?, ?)""",
+               VALUES (?, ?, ?, ?, ?) RETURNING id""",
             (session_id, title, content, status, datetime.now().isoformat()),
         )
         self._conn.commit()
         logger.info(f"MetadataStore: 知识片段已保存 — {title}")
-        return cur.lastrowid
+        return cur.fetchone()["id"]
 
     @_synchronized
     def list_knowledge_fragments(self, limit: int = 50) -> list[dict]:
@@ -1242,11 +1265,11 @@ class MetadataStore:
                VALUES (?, ?, ?, ?)
                ON CONFLICT(report_type, report_date) DO UPDATE SET
                  content = excluded.content,
-                 created_at = excluded.created_at""",
+                 created_at = excluded.created_at RETURNING id""",
             (report_type, report_date, content, datetime.now().isoformat()),
         )
         self._conn.commit()
-        return cur.lastrowid
+        return cur.fetchone()["id"]
 
     @_synchronized
     def get_digest_report(self, report_type: str, report_date: str) -> dict | None:
@@ -1327,7 +1350,7 @@ class MetadataStore:
         """从未进入复习系统的笔记（首次复习候选）。"""
         assert self._conn is not None
         rows = self._exec(
-            """SELECT n.id, n.title, n.ingested_at, n.content_preview
+            """SELECT n.id AS note_id, n.title, n.ingested_at, n.content_preview
                FROM notes n
                LEFT JOIN reviews r ON r.note_id = n.id
                WHERE n.status = 'active' AND r.note_id IS NULL
@@ -1472,11 +1495,11 @@ class MetadataStore:
         """添加 RSS 源。返回 feed_id。"""
         assert self._conn is not None
         cur = self._exec(
-            "INSERT INTO rss_feeds (url, created_at) VALUES (?, ?)",
+            "INSERT INTO rss_feeds (url, created_at) VALUES (?, ?) RETURNING id",
             (url, datetime.now().isoformat()),
         )
         self._conn.commit()
-        return cur.lastrowid
+        return cur.fetchone()["id"]
 
     @_synchronized
     def list_rss_feeds(self) -> list[dict]:
@@ -1532,6 +1555,26 @@ class MetadataStore:
         return row is not None
 
     @_synchronized
+    def get_rss_entry_content(self, feed_id: int, entry_id: str) -> str | None:
+        """取已存条目的 content（用于判断是否需要回填正文）。不存在返回 None。"""
+        assert self._conn is not None
+        row = self._exec(
+            "SELECT content FROM rss_entries WHERE feed_id = ? AND entry_id = ?",
+            (feed_id, entry_id),
+        ).fetchone()
+        return row["content"] if row else None
+
+    @_synchronized
+    def update_rss_entry_content(self, feed_id: int, entry_id: str, content: str) -> None:
+        """回填条目正文（已存在但 content 为空时补充）。"""
+        assert self._conn is not None
+        self._exec(
+            "UPDATE rss_entries SET content = ? WHERE feed_id = ? AND entry_id = ?",
+            (content, feed_id, entry_id),
+        )
+        self._conn.commit()
+
+    @_synchronized
     def add_rss_entry(
         self,
         feed_id: int,
@@ -1540,16 +1583,30 @@ class MetadataStore:
         link: str,
         published: str,
         note_id: str = "",
+        content: str = "",
     ) -> int:
-        """记录一条已处理的 feed 条目。"""
+        """记录一条已处理的 feed 条目（含正文）。"""
         assert self._conn is not None
         cur = self._exec(
-            """INSERT OR IGNORE INTO rss_entries (feed_id, entry_id, title, link, note_id, published_at)
-               VALUES (?, ?, ?, ?, ?, ?)""",
-            (feed_id, entry_id, title, link, note_id, published),
+            """INSERT INTO rss_entries (feed_id, entry_id, title, link, note_id, published_at, content)
+               VALUES (?, ?, ?, ?, ?, ?, ?)
+               ON CONFLICT (feed_id, entry_id) DO NOTHING RETURNING id""",
+            (feed_id, entry_id, title, link, note_id, published, content),
         )
         self._conn.commit()
-        return cur.lastrowid
+        return cur.fetchone()["id"]
+
+    @_synchronized
+    def list_rss_entries(self, feed_id: int, limit: int = 50) -> list[dict]:
+        """列出某订阅源的条目（含正文，按发布时间倒序）。"""
+        assert self._conn is not None
+        rows = self._exec(
+            """SELECT id, entry_id, title, link, note_id, published_at, content
+               FROM rss_entries WHERE feed_id = ?
+               ORDER BY published_at DESC NULLS LAST, id DESC LIMIT ?""",
+            (feed_id, limit),
+        ).fetchall()
+        return [dict(r) for r in rows]
 
     # ---- Metrics（可观测性指标采集，Phase 5A） ----
 
@@ -1577,11 +1634,11 @@ class MetadataStore:
         meta_json = json.dumps(metadata, ensure_ascii=False) if metadata else None
         cur = self._exec(
             """INSERT INTO metrics (trace_id, metric_type, metric_name, value, metadata, created_at)
-               VALUES (?, ?, ?, ?, ?, ?)""",
+               VALUES (?, ?, ?, ?, ?, ?) RETURNING id""",
             (trace_id, metric_type, metric_name, value, meta_json, datetime.now().isoformat()),
         )
         self._conn.commit()
-        return cur.lastrowid
+        return cur.fetchone()["id"]
 
     @_synchronized
     def get_metrics_summary(self, hours: int = 24) -> dict:
@@ -1634,7 +1691,7 @@ class MetadataStore:
 
         # 按小时分布（最近 24 小时的问答数和 token）
         hourly_rows = self._exec(
-            """SELECT strftime('%H', created_at) as hour,
+            """SELECT to_char(created_at::timestamp, 'HH24') as hour,
                       SUM(CASE WHEN metric_type='ask' AND metric_name='count' THEN 1 ELSE 0 END) as ask_cnt,
                       SUM(CASE WHEN metric_type='llm_call' AND metric_name='token_count' THEN value ELSE 0 END) as token_total
                FROM metrics WHERE created_at >= ?
@@ -1702,7 +1759,7 @@ class MetadataStore:
         result = []
         for r in rows:
             try:
-                meta = json.loads(r["metadata"]) if r["metadata"] else {}
+                meta = self._parse_json(r["metadata"]) if r["metadata"] else {}
             except json.JSONDecodeError:
                 meta = {}
             result.append({
@@ -1755,7 +1812,7 @@ class MetadataStore:
         cur = self._exec(
             """INSERT INTO trace_events
                (trace_id, seq, event_type, name, input, output, token_usage, latency_ms, run_id, created_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id""",
             (trace_id, seq, event_type, name, input_data, output, token_json, latency_ms,
              run_id, now_iso),
         )
@@ -1763,7 +1820,7 @@ class MetadataStore:
         if event_type == "llm_end" and token_usage and token_usage.get("total", 0) > 0:
             self._increment_usage_counters(token_usage, now_iso)
         self._conn.commit()
-        return cur.lastrowid
+        return cur.fetchone()["id"]
 
     def _increment_usage_counters(self, token_usage: dict, now_iso: str) -> None:
         """累加用量到 today/month/total 三个周期计数器。
@@ -1785,10 +1842,10 @@ class MetadataStore:
                 """INSERT INTO usage_counters (period_type, period_key, tokens, cost, calls, updated_at)
                    VALUES (?, ?, ?, ?, 1, ?)
                    ON CONFLICT(period_type, period_key) DO UPDATE SET
-                     tokens = tokens + excluded.tokens,
-                     cost = cost + excluded.cost,
-                     calls = calls + 1,
-                     updated_at = excluded.updated_at""",
+                     tokens = usage_counters.tokens + EXCLUDED.tokens,
+                     cost = usage_counters.cost + EXCLUDED.cost,
+                     calls = usage_counters.calls + 1,
+                     updated_at = EXCLUDED.updated_at""",
                 (period_type, period_key, tokens, cost, now_iso),
             )
 
@@ -1812,7 +1869,7 @@ class MetadataStore:
         # 解析原始事件
         def parse_row(r):
             try:
-                tu = json.loads(r["token_usage"]) if r["token_usage"] else None
+                tu = self._parse_json(r["token_usage"]) if r["token_usage"] else None
             except json.JSONDecodeError:
                 tu = None
             return {
@@ -2018,12 +2075,12 @@ class MetadataStore:
         dim_json = json.dumps(dimensions, ensure_ascii=False) if dimensions else None
         cur = self._exec(
             """INSERT INTO eval_scores (trace_id, question, answer, score, dimensions, comment, run_id, judged_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?) RETURNING id""",
             (trace_id, question[:500], answer[:1000], score, dim_json, comment,
              run_id, datetime.now().isoformat()),
         )
         self._conn.commit()
-        return cur.lastrowid
+        return cur.fetchone()["id"]
 
     @_synchronized
     def get_eval_scores(self, limit: int = 50) -> list[dict]:
@@ -2039,7 +2096,7 @@ class MetadataStore:
         result = []
         for r in rows:
             try:
-                dims = json.loads(r["dimensions"]) if r["dimensions"] else None
+                dims = self._parse_json(r["dimensions"]) if r["dimensions"] else None
             except json.JSONDecodeError:
                 dims = None
             result.append({
@@ -2098,12 +2155,12 @@ class MetadataStore:
         cur = self._exec(
             """INSERT INTO eval_runs
                (run_type, total, passed, pass_rate, avg_score, duration_ms, details, created_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?) RETURNING id""",
             (run_type, total, passed, pass_rate, avg_score, duration_ms, details_json,
              datetime.now().isoformat()),
         )
         self._conn.commit()
-        return cur.lastrowid
+        return cur.fetchone()["id"]
 
     @_synchronized
     def get_eval_runs(self, limit: int = 20, run_type: str | None = None) -> list[dict]:
@@ -2122,7 +2179,7 @@ class MetadataStore:
         result = []
         for r in rows:
             try:
-                det = json.loads(r["details"]) if r["details"] else None
+                det = self._parse_json(r["details"]) if r["details"] else None
             except json.JSONDecodeError:
                 det = None
             result.append({
@@ -2211,11 +2268,11 @@ class MetadataStore:
         result = []
         for r in rows:
             try:
-                kw = json.loads(r["expected_keywords"]) if r["expected_keywords"] else []
+                kw = self._parse_json(r["expected_keywords"]) if r["expected_keywords"] else []
             except json.JSONDecodeError:
                 kw = []
             try:
-                src = json.loads(r["expected_sources"]) if r["expected_sources"] else []
+                src = self._parse_json(r["expected_sources"]) if r["expected_sources"] else []
             except json.JSONDecodeError:
                 src = []
             result.append({
@@ -2284,12 +2341,12 @@ class MetadataStore:
         extra_json = json.dumps(extra, ensure_ascii=False) if extra else None
         cur = self._exec(
             """INSERT INTO bad_cases (trace_id, question, answer, reason, extra, collected_at)
-               VALUES (?, ?, ?, ?, ?, ?)""",
+               VALUES (?, ?, ?, ?, ?, ?) RETURNING id""",
             (trace_id, question[:500], answer[:1000] if answer else "",
              reason, extra_json, datetime.now().isoformat()),
         )
         self._conn.commit()
-        return cur.lastrowid
+        return cur.fetchone()["id"]
 
     @_synchronized
     def get_bad_cases(self, limit: int = 100) -> list[dict]:
@@ -2303,7 +2360,7 @@ class MetadataStore:
         result = []
         for r in rows:
             try:
-                extra = json.loads(r["extra"]) if r["extra"] else None
+                extra = self._parse_json(r["extra"]) if r["extra"] else None
             except json.JSONDecodeError:
                 extra = None
             result.append({

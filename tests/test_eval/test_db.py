@@ -1,6 +1,5 @@
 """Golden Cases 数据库 CRUD 测试（Phase 5D FR53）。"""
 
-import pytest
 
 from brain.eval.runner import seed_golden_dataset
 
@@ -133,6 +132,7 @@ class TestEvalRunsHistory:
             run_type="offline", total=5, passed=3,
             details={"failed_cases": [{"id": "e1", "score": 0.5}]},
         )
+        assert run_id  # add_eval_run 返回新 id
         runs = metadata_store.get_eval_runs()
         assert runs[0]["details"]["failed_cases"][0]["id"] == "e1"
 

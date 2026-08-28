@@ -71,13 +71,13 @@
 | FR2 | CLI 快速添加 | `brain add <content>` 直接将文本摄入 | ✅ |
 | FR3 | 语义搜索 | `brain search <query>` 基于向量相似度检索 | ✅ |
 | FR4 | 基础问答 | `brain ask <question>` RAG 检索增强生成，引用来源 | ✅ |
-| FR5 | 数据持久化 | 向量存储（ChromaDB）+ 元数据（SQLite）本地持久化 | ✅ |
+| FR5 | 数据持久化 | PostgreSQL + pgvector 本地持久化（向量+元数据统一存储） | ✅ |
 
 ### Phase 2 — 智能处理 ✅（已完成）
 
 | FR# | 功能 | 描述 | 状态 |
 |-----|------|------|------|
-| FR6 | 自动分类 | 摄入时 DeepAgents 自动生成多维标签（主题/类型），写入 SQLite | ✅ |
+| FR6 | 自动分类 | 摄入时 DeepAgents 自动生成多维标签（主题/类型），写入 PostgreSQL | ✅ |
 | FR7 | 关联发现 | DeepAgents 发现新笔记与旧笔记的隐性关联，记录关联类型和描述 | ✅ |
 | FR8 | LangGraph 流水线扩展 | 在 embed 节点后增加 classify → connect 两个节点 | ✅ |
 | FR9 | 重复检测 | 摄入时按 file_hash 检测重复，提示用户 | ✅ |
@@ -95,7 +95,7 @@
 | FR14 | 知识问答增强 | 问答结果中展示相关标签和关联，丰富上下文 | ✅ |
 | FR15 | Web UI | FastAPI + Vue3 前后端分离界面，问答为主页 | ✅ |
 | FR16 | 流式问答 | SSE 流式输出：思考片段 + 工具调用轨迹 + 答案逐字输出 | ✅ |
-| FR17 | 会话管理 | 多会话支持：会话列表、历史消息持久化（SQLite）、可切换/删除 | ✅ |
+| FR17 | 会话管理 | 多会话支持：会话列表、历史消息持久化（PostgreSQL）、可切换/删除 | ✅ |
 | FR18 | 多层记忆 | 工作记忆（最近10轮）+ 检索记忆（历史消息向量化按需取回） | ✅ |
 | FR19 | 知识沉淀（HIL） | 子智能体提取知识片段 → 用户确认后保存；不静默污染笔记库 | ✅ |
 | FR20 | 知识片段闭环 | 前端片段浏览页（查看/删除）；问答搜索同时检索片段 | ✅ |
@@ -104,7 +104,7 @@
 | FR23 | 测试补齐 | 存储/API/HIL 链路测试，防回归 | ✅ |
 | FR24 | 定时任务调度 | RSS 自动拉取（每60分钟）、每日摘要（08:00）、每周趋势（周一）自动生成并持久化 | ✅ |
 | FR25 | 知识图谱可视化 | 笔记-关联交互式图谱：节点大小=关联数，点击高亮邻居，边色=关联类型 | ✅ |
-| FR26 | 知识片段向量化 | 片段写入 ChromaDB 独立 collection，search_fragments 改语义检索 | ✅ |
+| FR26 | 知识片段向量化 | 片段写入 pgvector `vec_fragment_memory`，search_fragments 改语义检索 | ✅ |
 | FR27 | 同会话记忆加权 | 检索记忆时同会话旧消息权重提升，保住超窗口对话连续性 | ✅ |
 | FR28 | SM-2 间隔重复 | 复习卡片 + 四档评分（忘记/困难/良好/简单）+ SM-2 算法调度 | ✅ |
 | FR29 | 工程化 | GitHub Actions CI、loguru 日志文件持久化、性能回归测试、README 重写 | ✅ |
@@ -154,7 +154,7 @@
 | FR41 | 测试补齐 | 书签源/编辑链路/导出导入的集成测试 | P1 |
 
 **Phase 4 设计约束：**
-- 不引入新框架，全部基于现有 LangGraph + DeepAgents + ChromaDB + SQLite 扩展
+- 不引入新框架，全部基于现有 LangGraph + DeepAgents + PostgreSQL + pgvector 扩展
 - 书签源遵循 `SourceProtocol`，与 RSS 源结构对齐
 - 数据导出格式以 Markdown 为主，附带 metadata.json 保留标签/关联，便于跨实例迁移
 
@@ -173,7 +173,7 @@
 | FR42 | 全链路 Trace ID | 每次问答生成 trace_id，贯穿 LLM/工具调用/日志，写入 messages 表 | P0 ✅ |
 | FR43 | 结构化 JSON 日志 | loguru 增加 JSON sink，带 trace_id/agent/tool 字段，便于过滤检索 | P0 ✅ |
 | FR44 | 核心指标采集 | 问答延迟/工具调用次数/Token 消耗/摄入耗时写入 metrics 表；CLI `brain metrics` | P0 ✅ |
-| FR45 | 健康检查 | `/api/health` 探测 LLM/Embedding/SQLite/ChromaDB 连通性 | P0 ✅ |
+| FR45 | 健康检查 | `/api/health` 探测 LLM/Embedding/PostgreSQL/pgvector 连通性 | P0 ✅ |
 | FR46 | 可观测性页面 | 前端 Observability 页：健康状态灯 + 指标看板 + 最近调用链 | P0 ✅ |
 
 #### Phase 5B — 成本治理 ✅（已完成）
@@ -191,7 +191,7 @@
 
 | FR# | 功能 | 描述 | 优先级 |
 |-----|------|------|--------|
-| FR50 | 数据备份/恢复 | `brain backup` 导出 SQLite+ChromaDB+checkpoints 到 ZIP；`brain restore` 恢复 | P1 | ⏸ |
+| FR50 | 数据备份/恢复 | `brain backup` 用 pg_dump 导出 PostgreSQL 全库到压缩包；`brain restore` 恢复 | P1 | ⏸ |
 | FR51 | LLM 调用容灾 | 使用 ChatOpenAI/ChatAnthropic 原生 `max_retries` 重试策略（透传给底层 SDK，自动处理 429/5xx/超时 + 指数退避抖动）；`brain/llm.py` 初始化时传入；base.py 保留外层重试仅处理 JSON 解析失败 | P2 | ✅ |
 | FR52 | 记忆/片段清理 | 知识片段和会话历史 TTL 清理（调度器加任务） | P2 | ⏸ |
 
@@ -238,27 +238,27 @@
 > 升级为「BM25 + 向量 + RRF 融合 + Rerank 精排 + 查询改写」的工业级 RAG。
 > 优化效果可直接在 Observability 看板和 `brain eval` 评估集上量化对比。
 > **设计约束（基于代码实测）：**
-> - Chunk 全文只存 ChromaDB，SQLite 仅有 `content_preview`(200 字)。BM25 索引笔记标题+预览，
+> - Chunk 全文只存 pgvector，PostgreSQL 仅有 `content_preview`(200 字)。BM25 索引笔记标题+预览，
 >   不双写 chunk 全文（BM25 价值在精确关键词命中，标题/预览已覆盖主要关键词）
-> - 双后端兼容：SQLite 用 FTS5，MySQL 用 FULLTEXT + MATCH...AGAINST，复用 `_exec` 语法翻译机制
+> - PostgreSQL 用 pg_trgm GIN 索引 + ILIKE + similarity() 排序，中文友好
 > - Rerank 走 SiliconFlow `/v1/rerank` API（`BAAI/bge-reranker-v2-m3`），复用现有 API Key，
 >   不引入本地 GB 级 cross-encoder 模型（与轻量原则一致）
 > - 查询改写复用主 LLM（DeepSeek），不引入新模型
 
 | FR# | 功能 | 描述 | 优先级 | 状态 |
 |-----|------|------|--------|------|
-| FR58 | 混合检索 | BM25（SQLite FTS5 / MySQL FULLTEXT 索引笔记标题+预览）+ 向量召回 + RRF 融合；`brain/retrieval/hybrid_search.py` 统一入口；`search_notes` 工具与 `/api/search` 切换调用 | P1 | ✅ |
+| FR58 | 混合检索 | BM25（pg_trgm GIN 索引笔记标题+预览）+ 向量召回 + RRF 融合；`brain/retrieval/hybrid_search.py` 统一入口；`search_notes` 工具与 `/api/search` 切换调用 | P1 | ✅ |
 | FR59 | Rerank 精排 | SiliconFlow `/v1/rerank`（bge-reranker-v2-m3）对融合后 Top-N 精排；`brain/retrieval/reranker.py`；config 开关 + top_n 可配 | P2 | ✅ |
 | FR60 | 查询改写 | Multi-Query：LLM 生成 3 个改写版本，多路召回去重后融合，提升语义召回；`brain/retrieval/query_rewriter.py` | P2 | ✅ |
 
 **Phase 5F 设计约束：**
-- 本地优先：BM25 索引存 SQLite/MySQL，Rerank 走已有 SiliconFlow API，不引入新基础设施
+- 本地优先：BM25 索引用 PostgreSQL pg_trgm，Rerank 走已有 SiliconFlow API，不引入新基础设施
 - 向后兼容：混合检索失败时降级为纯向量召回（现有 `VectorStore.search`），不阻塞主流程
 - 可量化：5A 的 trace_events 已记录每次检索的 tool_call，5F 上线后跑 `brain eval` 对比通过率变化
 - 双调用方统一：`server.search_notes`(API) 和 `researcher.search_notes`(工具) 都切到 `HybridSearcher`
 
 **Phase 5 设计约束：**
-- 本地优先：指标存 SQLite、日志存本地文件、Trace 存 messages 表，不引入外部时序库
+- 本地优先：指标存 PostgreSQL、日志存本地文件、Trace 存 messages 表，不引入外部时序库
 - 轻量：健康检查用最小调用（dry-run 或 1 token）避免消耗配额
 - 可观测性是基础：5A 优先做，后续 5B 成本数据天然依赖 trace_id 和指标采集
 

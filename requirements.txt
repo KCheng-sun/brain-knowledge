@@ -16,10 +16,11 @@ langchain-openai>=0.3.0
 # LLM — Anthropic (备选)
 # langchain-anthropic>=0.3.0
 
-# 向量存储
-chromadb>=0.5.0
+# 向量存储 + 数据库（PostgreSQL + pgvector，统一存储业务数据/向量/Checkpoint）
+psycopg[binary]>=3.2.0
+langgraph-checkpoint-postgres>=3.0.0
 
-# 本地 Embedding
+# 本地 Embedding（仅 local provider 用，默认 siliconflow API）
 sentence-transformers>=3.0.0
 
 # CLI
@@ -31,16 +32,12 @@ pydantic-settings>=2.0.0
 pyyaml>=6.0
 python-dotenv>=1.0.0
 
-# 异步 SQLite
-aiosqlite>=0.20.0
-# MySQL（Phase 5D）
-pymysql>=1.1.0
-
 # 文件监听
 watchdog>=4.0.0
 
 # RSS 订阅
 feedparser>=6.0.0
+trafilatura>=1.12.0
 
 # Markdown 解析
 markdown>=3.5.0

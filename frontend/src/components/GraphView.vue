@@ -14,7 +14,7 @@ const empty = ref(false);
 
 const RELATION_COLORS = {
   related: "#94a3b8",
-  extends: "var(--ant-color-primary)",
+  extends: "#1677ff",
   contradicts: "#f56565",
   references: "#36b37e",
 };
@@ -57,7 +57,7 @@ function renderGraph(data) {
   });
 
   const CATEGORY_COLORS = [
-    "var(--ant-color-primary)", "var(--ant-color-primary)", "#36b37e", "#ff9f43",
+    "#1677ff", "#4096ff", "#36b37e", "#ff9f43",
     "#f56565", "#ec4899", "#06b6d4", "#64748b",
   ];
 
@@ -211,5 +211,20 @@ onBeforeUnmount(() => {
   bottom: 24px;
   width: 300px;
   z-index: 20;
+}
+
+/* 图例 */
+.legend-item {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 13px;
+  color: rgba(0, 0, 0, 0.65);
+}
+.legend-line {
+  display: inline-block;
+  width: 20px;
+  height: 3px;
+  border-radius: 2px;
 }
 </style>

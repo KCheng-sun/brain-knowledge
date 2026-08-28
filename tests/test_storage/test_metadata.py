@@ -1,10 +1,9 @@
 """MetadataStore 单元测试（同步）。
 
-MetadataStore 自 Phase 3 起改为 sqlite3 同步实现（带线程锁），
+MetadataStore 基于 PostgreSQL 同步实现（带线程锁），
 全部测试为普通 sync 函数。
 """
 
-import pytest
 
 from brain.models import (
     Connection,
@@ -12,7 +11,6 @@ from brain.models import (
     NoteStatus,
     RelationType,
     SourceType,
-    Tag,
     TagCategory,
 )
 

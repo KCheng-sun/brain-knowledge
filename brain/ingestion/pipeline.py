@@ -357,7 +357,7 @@ class IngestionPipeline:
     # ================================================================
 
     def _index_node(self, state: IngestionState) -> IngestionState:
-        """节点6: 写入元数据（SQLite）——含标签和关联。"""
+        """节点6: 写入元数据（PostgreSQL）——含标签和关联。"""
         if state["status"] == "failed":
             return state
 

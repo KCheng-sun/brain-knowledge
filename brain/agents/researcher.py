@@ -246,24 +246,29 @@ class ResearcherAgent:
                 if tool_calls:
                     for tc in tool_calls:
                         tc_index = tc.get("index", 0)
-                        entry = pending_tool_calls.setdefault(
-                            tc_index,
-                            {"name": "", "args": {}},
-                        )
+                        entry = pending_tool_calls.get(tc_index)
+                        # 上一回合同 index 的工具已发送 → 新回合的工具调用，重置 entry
+                        if entry and entry.get("_sent"):
+                            entry = {"name": "", "args": {}, "id": ""}
+                        if not entry:
+                            entry = {"name": "", "args": {}, "id": ""}
+                        pending_tool_calls[tc_index] = entry
                         if tc.get("name"):
                             entry["name"] = tc["name"]
-                        if tc.get("args"):
-                            entry["args"].update(tc["args"])
+                        if tc.get("id"):
+                            entry["id"] = tc["id"]
+                        # args 到达就更新（流式下 name 和 args 可能分片到达）
+                        if tc.get("args") is not None:
+                            entry["args"] = {**entry["args"], **tc["args"]}
 
-                        # 名称已完整且 args 非空 → 视为完整调用，发出事件
-                        if entry["name"]:
+                        # name 到达就发出事件（带上当前 args，可能后续才补全）
+                        if entry["name"] and not entry.get("_sent"):
                             yield {
                                 "type": "tool_start",
                                 "name": entry["name"],
                                 "args": entry["args"],
                             }
-                            # 清除，避免重复发送
-                            pending_tool_calls[tc_index] = {"name": "", "args": {}}
+                            entry["_sent"] = True  # 标记已发送，避免同回合重复
 
             elif mode == "updates":
                 # HIL 中断检测：__interrupt__ 键出现表示等待用户决策
@@ -283,10 +288,29 @@ class ResearcherAgent:
                         continue
                     if node == "tools" or "messages" in update:
                         for m in update.get("messages", []):
-                            if getattr(m, "tool_call_id", None):
-                                tool_name = getattr(m, "name", "unknown")
-                                if tool_name:
-                                    yield {"type": "tool_end", "name": tool_name}
+                            tool_call_id = getattr(m, "tool_call_id", None)
+                            if not tool_call_id:
+                                continue
+                            tool_name = getattr(m, "name", "") or ""
+                            final_args = {}
+                            # name 为空时用 tool_call_id 从 pending 反查
+                            if not tool_name:
+                                for entry in pending_tool_calls.values():
+                                    if entry.get("id") == tool_call_id:
+                                        tool_name = entry.get("name", "")
+                                        final_args = entry.get("args", {})
+                                        break
+                            else:
+                                for entry in pending_tool_calls.values():
+                                    if entry.get("name") == tool_name and entry.get("_sent"):
+                                        final_args = entry.get("args", {})
+                                        break
+                            if tool_name:
+                                yield {
+                                    "type": "tool_end",
+                                    "name": tool_name,
+                                    "args": final_args,
+                                }
 
         yield {"type": "status", "message": "✅ 研究完成"}
         yield {"type": "done", "content": ""}
@@ -349,20 +373,25 @@ class ResearcherAgent:
                 if tool_calls:
                     for tc in tool_calls:
                         tc_index = tc.get("index", 0)
-                        entry = pending_tool_calls.setdefault(
-                            tc_index, {"name": "", "args": {}}
-                        )
+                        entry = pending_tool_calls.get(tc_index)
+                        if entry and entry.get("_sent"):
+                            entry = {"name": "", "args": {}, "id": ""}
+                        if not entry:
+                            entry = {"name": "", "args": {}, "id": ""}
+                        pending_tool_calls[tc_index] = entry
                         if tc.get("name"):
                             entry["name"] = tc["name"]
-                        if tc.get("args"):
-                            entry["args"].update(tc["args"])
-                        if entry["name"]:
+                        if tc.get("id"):
+                            entry["id"] = tc["id"]
+                        if tc.get("args") is not None:
+                            entry["args"] = {**entry["args"], **tc["args"]}
+                        if entry["name"] and not entry.get("_sent"):
                             yield {
                                 "type": "tool_start",
                                 "name": entry["name"],
                                 "args": entry["args"],
                             }
-                            pending_tool_calls[tc_index] = {"name": "", "args": {}}
+                            entry["_sent"] = True
 
             elif mode == "updates":
                 if "__interrupt__" in chunk:
@@ -378,10 +407,28 @@ class ResearcherAgent:
                         continue
                     if node == "tools" or "messages" in update:
                         for m in update.get("messages", []):
-                            if getattr(m, "tool_call_id", None):
-                                tool_name = getattr(m, "name", "unknown")
-                                if tool_name:
-                                    yield {"type": "tool_end", "name": tool_name}
+                            tool_call_id = getattr(m, "tool_call_id", None)
+                            if not tool_call_id:
+                                continue
+                            tool_name = getattr(m, "name", "") or ""
+                            final_args = {}
+                            if not tool_name:
+                                for entry in pending_tool_calls.values():
+                                    if entry.get("id") == tool_call_id:
+                                        tool_name = entry.get("name", "")
+                                        final_args = entry.get("args", {})
+                                        break
+                            else:
+                                for entry in pending_tool_calls.values():
+                                    if entry.get("name") == tool_name and entry.get("_sent"):
+                                        final_args = entry.get("args", {})
+                                        break
+                            if tool_name:
+                                yield {
+                                    "type": "tool_end",
+                                    "name": tool_name,
+                                    "args": final_args,
+                                }
 
         yield {"type": "status", "message": "✅ 研究完成"}
         yield {"type": "done", "content": ""}
