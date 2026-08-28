@@ -634,7 +634,7 @@ logging:
 ## 7. 目录结构
 
 ```
-deep_agents/                        # 项目根目录
+brain-knowledge/                     # 项目根目录
 ├── docs/
 │   ├── requirements.md             # 需求文档（每次迭代前更新）
 │   └── design.md                   # 项目设计文档（本文件，每次迭代前更新）

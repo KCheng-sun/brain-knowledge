@@ -9,7 +9,7 @@
 **Brain（个人知识管家）** 是一个本地优先、AI 驱动的个人知识管理系统。
 核心目标：把碎片信息变成可检索、可关联、可生长的知识网络。
 
-- **项目根目录**: `D:\projects\deep_agents`
+- **项目根目录**: `D:\projects\brain-knowledge`
 - **主包名**: `brain`
 - **Python 版本**: 3.13+
 - **平台**: Windows 11 (PowerShell 5.1)

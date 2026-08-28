@@ -130,7 +130,7 @@ ruff check brain/         # Lint
 ## 📁 目录结构
 
 ```
-deep_agents/
+brain-knowledge/
 ├── brain/                  # Python 主包
 │   ├── api/                # FastAPI 后端
 │   ├── agents/             # DeepAgents（主 Agent + 子智能体 + 中间件）
