@@ -26,6 +26,10 @@ dependencies = [
     "markdown>=3.5.0",
     "loguru>=0.7.0",
     "tiktoken>=0.7.0",
+    "fastapi>=0.115.0",
+    "uvicorn>=0.32.0",
+    "python-multipart>=0.0.12",
+    "langfuse>=3.0.0",  # Phase 5G：LLM 可观测性追踪（LangChain CallbackHandler）
 ]
 
 [project.scripts]

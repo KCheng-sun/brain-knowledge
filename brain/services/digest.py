@@ -140,6 +140,10 @@ class DigestService:
         # 4. LLM 生成
         llm = get_chat_model()
 
+        # Phase 5G：Langfuse 追踪摘要生成（直接 LLM 调用，用上下文管理器建 trace）
+        from brain.langfuse_tracing import langfuse_trace
+        trace_name = "daily-digest" if days_range == 1 else "weekly-trend"
+
         if days_range == 1:
             prompt = get_prompt_template(
                 prompt_key,
@@ -148,7 +152,8 @@ class DigestService:
                 connections_section=conns_section,
                 date_str=title_date,
             )
-            response = llm.invoke(prompt)
+            with langfuse_trace(trace_name, tags=["digest"]) as lf:
+                response = llm.invoke(prompt, config=lf.langchain_config())
             return response.content
         else:
             prompt = get_prompt_template(
@@ -159,5 +164,6 @@ class DigestService:
                 start_date=start_date.isoformat(),
                 end_date=end_date.isoformat(),
             )
-            response = llm.invoke(prompt)
+            with langfuse_trace(trace_name, tags=["digest"]) as lf:
+                response = llm.invoke(prompt, config=lf.langchain_config())
             return response.content

@@ -43,7 +43,12 @@ class QueryRewriter:
 
             # 提示词从 prompts 表读取（is_template=1，含 {query}/{count} 占位符）
             prompt = get_prompt_template("query_rewriter", query=query, count=self._count)
-            response = self._llm.invoke([HumanMessage(content=prompt)])
+            # Phase 5G：Langfuse 追踪查询改写（直接 LLM 调用，用上下文管理器建 trace）
+            from brain.langfuse_tracing import langfuse_trace
+            with langfuse_trace("query-rewrite", tags=["rag", "retrieval"]) as lf:
+                response = self._llm.invoke(
+                    [HumanMessage(content=prompt)], config=lf.langchain_config()
+                )
             lines = [
                 line.strip()
                 for line in response.content.split("\n")

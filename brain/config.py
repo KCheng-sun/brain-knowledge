@@ -134,6 +134,20 @@ class RetrievalSettings(BaseSettings):
     query_rewrite_count: int = 3         # Multi-Query 改写版本数
 
 
+class LangfuseSettings(BaseSettings):
+    """Langfuse 可观测性配置（Phase 5G：Langfuse 追踪）。
+
+    凭证从标准 Langfuse 环境变量读取（LANGFUSE_PUBLIC_KEY / LANGFUSE_SECRET_KEY /
+    LANGFUSE_BASE_URL），与 Langfuse SDK 约定一致。详见 .env 与 Langfuse 文档。
+    tracing_enabled=False 时，全程不初始化 Langfuse 客户端（零开销 + 零导入副作用）。
+    """
+
+    model_config = SettingsConfigDict(env_prefix="BRAIN_LANGFUSE_")
+
+    tracing_enabled: bool = True        # 总开关（False=完全不追踪，含无凭证时）
+    environment: str = "development"     # development/staging/production（Langfuse 看板隔离）
+
+
 # ============================================================
 # 顶层配置
 # ============================================================
@@ -157,6 +171,7 @@ class AppConfig(BaseSettings):
     agents: AgentSettings = Field(default_factory=AgentSettings)
     cost: CostSettings = Field(default_factory=CostSettings)
     retrieval: RetrievalSettings = Field(default_factory=RetrievalSettings)
+    langfuse: LangfuseSettings = Field(default_factory=LangfuseSettings)
 
     # 应用级配置
     dry_run: bool = False  # mock LLM 调用

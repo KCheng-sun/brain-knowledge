@@ -1,4 +1,4 @@
-﻿"""深度研究 Agent — 基于 DeepAgents 框架 + 官方 AgentMiddleware。"""
+"""深度研究 Agent — 基于 DeepAgents 框架 + 官方 AgentMiddleware。"""
 
 from langchain_core.tools import tool
 from loguru import logger
@@ -218,6 +218,17 @@ class ResearcherAgent:
             from brain.observability import TraceEventLogger
             token_cb = TraceEventLogger(self._metadata_store, self._trace_id)
             stream_config.setdefault("callbacks", []).append(token_cb)
+        # Phase 5G：Langfuse 追踪——与本地 TraceEventLogger 并存，互不干扰
+        # agent.stream 是 chain 路径，触发 on_chain_start，CallbackHandler 从 metadata
+        # 的 langfuse_* 前缀自动解析 trace 属性（trace_name/session_id/tags）
+        from brain.langfuse_tracing import attach_langfuse
+        stream_config = attach_langfuse(
+            stream_config,
+            session_id=session_id,
+            trace_id=self._trace_id,
+            trace_name="ask",
+            tags=["deepagents", "rag"],
+        )
 
         for mode, chunk in agent.stream(
             {"messages": messages},
@@ -343,6 +354,15 @@ class ResearcherAgent:
             config.setdefault("callbacks", []).append(
                 TraceEventLogger(self._metadata_store, self._trace_id)
             )
+        # Phase 5G：Langfuse 追踪 HIL 恢复——归入同一 session，trace_name 标记 resume
+        from brain.langfuse_tracing import attach_langfuse
+        config = attach_langfuse(
+            config,
+            session_id=session_id,
+            trace_id=self._trace_id,
+            trace_name="ask-resume",
+            tags=["deepagents", "rag", "hil-resume"],
+        )
 
         logger.info(f"[researcher] 恢复执行 (session={session_id})")
 
@@ -461,6 +481,15 @@ class ResearcherAgent:
             invoke_config["callbacks"] = [
                 TraceEventLogger(self._metadata_store, self._trace_id)
             ]
+        # Phase 5G：Langfuse 追踪（非流式问答，chain 路径用 metadata 模式）
+        from brain.langfuse_tracing import attach_langfuse
+        invoke_config = attach_langfuse(
+            invoke_config,
+            session_id=session_id,
+            trace_id=self._trace_id,
+            trace_name="ask",
+            tags=["deepagents", "rag"],
+        )
         result = agent.invoke({"messages": messages}, config=invoke_config or None)
 
         result_messages = result.get("messages", [])

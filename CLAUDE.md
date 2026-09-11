@@ -100,6 +100,7 @@ markdown
 feedparser
 networkx
 tiktoken
+langfuse              # Phase 5G：LLM 可观测性追踪（LangChain CallbackHandler）
 ```
 
 ### 开发工具
@@ -238,7 +239,8 @@ ruff check brain/
 - 5D：评估闭环（离线测试集 + Bad Case 回流 + LLM-as-Judge）
 - 5E：提示词外部化（prompts/*.yaml + 配置集中化）
 - 5F：RAG 增强（BM25+Rerank+查询改写）
-- 约束：本地优先，不引入 K8s/Redis/Kafka，指标存 PostgreSQL、日志存本地文件
+- 5G：Langfuse 追踪（本地自托管 v4 + LangChain CallbackHandler + 全链路 trace）
+- 约束：本地优先，不引入 K8s/Redis/Kafka，指标存 PostgreSQL、日志存本地文件、Langfuse 自托管
 - 经验（5A）：
   - contextvars 透传 trace_id 比 threading.local 更适合异步生成器场景
   - FastAPI StreamingResponse 的生成器在独立上下文执行，trace_id 需在生成器内部 set
@@ -342,6 +344,24 @@ ruff check brain/
   - **迁移加列要 SQLite + MySQL 双后端同步**：messages 表加 status 列、sessions 表加 pending_msg_id 列，SQLite 的 CREATE TABLE 和 _migrate 的 ALTER TABLE、mysql_schema.py 的 CREATE TABLE 三处都要改。`ADD COLUMN ... NOT NULL DEFAULT 'complete'` 会自动回填旧数据行
   - **历史消息顺序错乱根因：后端 timeline 只存 tool 不存 thought**：流式打印时前端 tool_start 会把已流出文本归档为 thought 进 timeline，顺序是「文本-工具-文本-工具」。但后端 tool_start 只 append tool 项、不归档 thought，导致持久化的 timeline 是纯工具列表，content 是全部文本拼一起。历史查看时渲染成「工具-工具-文本」。修复：后端 tool_start 也要把当前 answer_parts 归档为 thought 进 timeline 并清空 answer_parts（与前端逻辑一致），done 时 content 只存最后一段文本
   - **memory 向量用全文而非最后一段**：thought 拆分后 content 只剩最后一段文本，若直接写记忆向量会丢失前面片段的语义。done 时从 timeline 提取所有 thought 拼接 + 最后 content 作为 full_text 写 memory，保证语义检索能命中中间片段
+- 经验（5G Langfuse 追踪）：
+  - **Langfuse skill 的「文档优先」原则不可跳过**：v4 SDK 与 v2/v3 不兼容（`from langfuse.langchain import CallbackHandler`、`get_client()` 单例），凭记忆写必错。必须先 fetch 集成文档 + best-practices 页 + 查已安装包的源码签名，再动手
+  - **直接 LLM 调用与 chain 路径的 CallbackHandler 行为不同**：`llm.invoke(messages)` 只触发 `on_chat_model_start`，不触发 `on_chain_start`，而 `_parse_langfuse_trace_attributes`（解析 `langfuse_*` metadata）只在 `on_chain_start` 调用。结果：直接调用时 config.metadata 的 `langfuse_trace_name`/`langfuse_session_id`/`langfuse_tags` 全被忽略，trace_name 退化为模型名。解法：直接调用用 `start_as_current_observation` + `propagate_attributes` 上下文管理器建 trace root，CallbackHandler 在上下文内创建自动继承 trace context
+  - **trace_context 与 metadata 属性互斥**：传 `trace_context`（分布式追踪「连接已存在 trace」路径）时，`_take_root_trace_context` 直接 return，跳过 metadata 解析。不能同时用 trace_context 设自定义 trace_id 和 metadata 设 trace_name/session_id
+  - **Langfuse trace_id 必须 32 位小写十六进制**：应用侧 trace_id 是 12 位短格式，直接传 `trace_context={"trace_id": app_trace_id}` 会报 `invalid literal for int() with base 16`。正确关联方式是用 `Langfuse.create_trace_id(seed=app_trace_id)` 派生，或直接把应用 trace_id 存入 metadata.brain_trace_id 供互查（不强求两者 ID 相等）
+  - **流式 agent 的 with 块包裹要谨慎**：把 `agent.stream()` 的 for 循环包进 `with langfuse_trace()` 需整体缩进循环体（100+ 行），脚本批量缩进易越界误伤后续方法。权衡：agent/chain 路径用 `attach_langfuse`（metadata 模式，不改缩进，trace_name/session_id/tags 正确，仅 metadata 嵌套为字符串）；直接 LLM 调用用 `langfuse_trace` 上下文管理器（metadata 干净展开）
+  - **降级链路必须全链路容错**：`is_enabled()`（无凭证/禁用）→ import 失败（SDK 未装）→ `start_as_current_observation`/`propagate_attributes` 异常，每层都 catch 降级为 Noop，返回的 trace 对象 `langchain_config()` 原样返回 config。可观测性绝不能影响主流程（与 5A 的 record_metric 一致）
+  - **短进程必须 flush**：CLI 命令退出前调 `shutdown()`，否则后台批量发送的 trace 随 `os._exit(0)` 丢失。FastAPI 长驻服务在 lifespan shutdown 调。长运行无需手动 flush——SDK 后台批量发送
+  - **import 时序：环境变量必须先于 Langfuse 客户端初始化**：`get_client()` 在首次调用时读 `LANGFUSE_*` 环境变量，若 `load_dotenv()` 未先执行则客户端 disabled。`brain.langfuse_tracing` 的所有入口都先调 `get_config()`（确保 .env 已加载）再 `get_client()`
+  - **DeepAgents 集成自动识别**：Langfuse CallbackHandler 检测到 deepagents 框架会在 metadata 加 `ls_integration: deepagents`，trace 树自动按 agent/subagent/tool 嵌套，无需额外配置
+- 经验（5G 提示词接入 Langfuse）：
+  - **{var} → {{var}} 转换要处理字面花括号**：Langfuse 只认双花括号 `{{var}}`，而本项目 str.format 用单花括号 `{var}`。但 judge 提示词的 JSON 示例里有 `{{ }}`（str.format 的字面花括号转义），直接转会把 JSON 的 `{` 变成变量。正确做法：先把 `{{`/`}}` 临时替换成占位符，再用正则把 `{identifier}` 转成 `{{identifier}}`，最后还原字面花括号。迁移脚本 `_to_langfuse_syntax` 实现此逻辑
+  - **prompt name 用 hyphen 不用 snake_case**：Langfuse prompt name 规范是 lowercase-hyphenated（`query-rewriter`），本项目 key 是 snake_case（`query_rewriter`）。在 `brain.prompts._langfuse_name` 统一转换，调用方无感。迁移脚本和读取层都走同一转换函数
+  - **三级回退保主流程**：`get_prompt` 优先 Langfuse（`get_prompt(label=production)`）→ 本地 prompts 表 → prompt_defaults。`get_prompt_template` Langfuse 源用 `prompt.compile(**kwargs)`，本地回退用 `str.format(**kwargs)`——两套渲染语法各自匹配自己的模板语法，不能交叉（Langfuse 的 `{{var}}` 走 str.format 会报错，本地的 `{var}` 走 compile 不渲染）
+  - **不用 SDK fallback 参数，手动三级回退**：`get_prompt` 有 `fallback` 参数，但只支持单层字符串回退。我们要保留「本地数据库可编辑」能力（5E 的 prompts 表 CRUD 页面），需手动做 Langfuse→DB→default 三级回退，让本地编辑仍有意义（Langfuse 宕机时本地编辑生效）
+  - **Langfuse 客户端自带缓存，不在应用层缓存 Langfuse 源**：`get_prompt` 有 `cache_ttl_seconds`（默认 5s），首次 fetch 后零延迟，Langfuse 宕机仍用缓存。因此 `brain.prompts._cache` 只缓存数据库/默认值回退结果，不缓存 Langfuse 源——避免本地编辑 Langfuse 后缓存不刷新
+  - **迁移脚本要幂等 + 验证**：`create_prompt` 同名会新增版本（不覆盖），重复运行安全。迁移后立即 `get_prompt(label=production)` 取回验证，确认变量语法正确、production 标签到位。迁移脚本 `brain.scripts.migrate_prompts_to_langfuse` 内置验证步骤
+  - **纯文本 prompt 的 compile 无参返回原文**：`prompt.compile()` 对无变量的纯文本 prompt（classifier/connector 等）原样返回，不报错。`get_prompt` 对纯文本直接返回 `lf_prompt.prompt`，`get_prompt_template` 对模板才调 compile
 
 ---
 
@@ -360,6 +380,13 @@ ruff check brain/
 3. 在 `brain/agents/__init__.py` 中注册
 4. 在流水线或服务中调用
 5. 更新 `design.md` 的 Agent 层描述
+
+### 如何管理/迭代提示词？
+提示词三级读取（优先级高→低）：**Langfuse Prompt Management** → 本地 prompts 表 → `brain/storage/prompt_defaults.py`。
+- **首选 Langfuse**：访问 http://localhost:3000 → Prompts 页面，在线编辑、版本管理、A/B 实验。`brain.prompts.get_prompt` 优先从 Langfuse 读（label=production），客户端自带缓存（5s 刷新）
+- **本地回退**：Langfuse 不可达时回退到 PostgreSQL prompts 表（API `/api/prompts` 页面可 CRUD）和 `prompt_defaults.py` 默认值
+- **新增提示词**：在 `prompt_defaults.py` 的 `DEFAULT_PROMPTS` 加条目，然后跑 `python -m brain.scripts.migrate_prompts_to_langfuse` 同步到 Langfuse（幂等，同名新增版本）
+- **变量语法**：Langfuse 用 `{{var}}`（双花括号），本地用 `{var}`（单花括号）。迁移脚本自动转换；直接在 Langfuse 编辑时记得用双花括号
 
 ### 如何在开发中避免消耗 API 额度？
 - 设置环境变量 `BRAIN_DRY_RUN=true` 使用 mock LLM 响应

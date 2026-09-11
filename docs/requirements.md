@@ -262,6 +262,25 @@
 - 轻量：健康检查用最小调用（dry-run 或 1 token）避免消耗配额
 - 可观测性是基础：5A 优先做，后续 5B 成本数据天然依赖 trace_id 和指标采集
 
+### Phase 5G — Langfuse 追踪集成
+
+> 将 LLM 调用链接入 Langfuse（本地自托管 v4），获得富 trace 树、会话视图、看板与评分能力，补充 5A 的本地 metrics/trace_events。
+
+| 编号 | 功能 | 说明 | 优先级 | 状态 |
+|------|------|------|--------|------|
+| FR61 | Langfuse SDK 集成 | 安装 `langfuse` v4 SDK；`brain/langfuse_tracing.py` 统一入口；`.env` 配置 `LANGFUSE_*` 凭证 + `BRAIN_LANGFUSE__*` 开关；无凭证/禁用时降级为空操作，主流程零影响 | P1 | ✅ |
+| FR62 | 全链路追踪 | 所有 LLM 调用点接入：ResearcherAgent（stream/resume/invoke）、BaseAgent（classifier/connector）、digest、query_rewriter、judge；trace_name/session_id/tags 遵循最佳实践 | P1 | ✅ |
+| FR63 | 双模式适配 | agent/chain 路径用 metadata 模式（`attach_langfuse`），直接 LLM 调用用上下文管理器模式（`langfuse_trace`）；后者用 start_as_current_observation + propagate_attributes 建 trace root | P1 | ✅ |
+| FR64 | trace_id 关联 | 应用侧 trace_id 存入 Langfuse metadata.brain_trace_id，与本地 metrics/trace_events 双向互查 | P2 | ✅ |
+| FR65 | 生命周期管理 | CLI 入口和 FastAPI lifespan 在退出时 flush/shutdown Langfuse 客户端，确保短进程的 trace 不丢失 | P1 | ✅ |
+| FR66 | 提示词接入 Langfuse | 10 个提示词迁移到 Langfuse Prompt Management（label=production）；`brain.prompts` 优先从 Langfuse 读（`get_prompt`/`get_prompt_template` 用 `compile` 渲染 `{{var}}`），回退本地 prompts 表 + prompt_defaults；迁移脚本 `brain.scripts.migrate_prompts_to_langfuse` | P1 | ✅ |
+
+**Phase 5G 设计约束：**
+- 本地优先：Langfuse 用本地自托管 v4（docker-compose），不依赖云服务
+- 与 5A 并存：Langfuse 提供富 trace 树（generation/tool/span 嵌套），本地 TraceEventLogger 写 metrics 表，两者互补不替代
+- 降级安全：无凭证/禁用/SDK 未安装/上下文创建失败，均静默降级，不影响主流程（与 record_metric 一致）
+- 遵循最佳实践：trace_name 动词式、session_id 分组多轮对话、environment 隔离 dev/prod 看板、avoid 模型名作 trace_name
+
 ---
 
 ## 5. 非功能需求

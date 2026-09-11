@@ -77,7 +77,13 @@ class LLMJudge:
             else:
                 # 兼容旧格式（无分隔符）
                 messages = [HumanMessage(content=prompt)]
-            response = llm.invoke(messages)
+            # Phase 5G：Langfuse 追踪 Judge 评分（直接 LLM 调用，用上下文管理器建 trace）
+            # trace_id 存入 metadata，与被评问答的本地 trace 关联（供互查）
+            from brain.langfuse_tracing import langfuse_trace
+            with langfuse_trace(
+                "llm-judge", trace_id=trace_id, tags=["eval", "judge"]
+            ) as lf:
+                response = llm.invoke(messages, config=lf.langchain_config())
             text = response.content if hasattr(response, "content") else str(response)
 
             # 解析 JSON（LLM 可能输出多余文本，提取第一个 JSON 块）

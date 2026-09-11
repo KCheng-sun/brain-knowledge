@@ -20,6 +20,13 @@ async def lifespan(app: FastAPI):
     _init()
     yield
     # shutdown：调度器停止等清理可放这里（当前由进程退出回收）
+    # Phase 5G：关闭 Langfuse 客户端，刷新待发送 trace
+    try:
+        from brain.langfuse_tracing import shutdown
+
+        shutdown()
+    except Exception:
+        pass
 
 
 app = FastAPI(title="Brain API", version="0.1.0", lifespan=lifespan)

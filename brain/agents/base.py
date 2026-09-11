@@ -75,15 +75,22 @@ class BaseAgent:
             HumanMessage(content=user_prompt),
         ]
 
+        # Phase 5G：Langfuse 追踪单次 Agent 调用（直接 LLM 调用，用上下文管理器建 trace）。
+        # trace_name 用动词式（classifier / connector），便于看板过滤。
+        # 这些 Agent 无 session_id（摄入流水线触发），不归属会话。
+        from brain.langfuse_tracing import langfuse_trace
+
         if self.output_model is not None:
             # 结构化模式：function calling 在生成时强制 schema，invoke 直接返回 Pydantic 实例
             structured_llm = llm.with_structured_output(
                 self.output_model, method=self._structured_method
             )
-            result = structured_llm.invoke(messages)
+            with langfuse_trace(self.name, tags=["ingestion", self.name]) as lf:
+                result = structured_llm.invoke(messages, config=lf.langchain_config())
         else:
             # 纯文本模式：普通 invoke，返回 AIMessage
-            result = llm.invoke(messages)
+            with langfuse_trace(self.name, tags=["ingestion", self.name]) as lf:
+                result = llm.invoke(messages, config=lf.langchain_config())
 
         logger.info(f"[{self.name}] ✓ 执行成功")
         return result

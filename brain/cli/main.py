@@ -1078,6 +1078,14 @@ def main():
     try:
         cli()
     finally:
+        # Phase 5G：CLI 命令退出前刷新 Langfuse 事件队列，确保 trace 已发送。
+        # 短生命周期进程必须 flush，否则后台批量发送的 trace 会随 os._exit 丢失。
+        try:
+            from brain.langfuse_tracing import shutdown
+
+            shutdown()
+        except Exception:
+            pass
         # sentence-transformers 的非 daemon 线程会阻止进程退出，
         # 用 os._exit 强制退出（CLI 命令执行完后不涉及数据丢失风险）
         os._exit(0)

@@ -53,6 +53,10 @@ fastapi>=0.115.0
 uvicorn>=0.32.0
 python-multipart>=0.0.12
 
+# 可观测性 — Langfuse 追踪（Phase 5G）
+# Langfuse v4 SDK：LangChain CallbackHandler + get_client；兼容本地自托管 v4 服务
+langfuse>=3.0.0
+
 # ============================================================
 # 开发依赖
 # ============================================================
