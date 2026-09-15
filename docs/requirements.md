@@ -274,6 +274,7 @@
 | FR64 | trace_id 关联 | 应用侧 trace_id 存入 Langfuse metadata.brain_trace_id，与本地 metrics/trace_events 双向互查 | P2 | ✅ |
 | FR65 | 生命周期管理 | CLI 入口和 FastAPI lifespan 在退出时 flush/shutdown Langfuse 客户端，确保短进程的 trace 不丢失 | P1 | ✅ |
 | FR66 | 提示词接入 Langfuse | 10 个提示词迁移到 Langfuse Prompt Management（label=production）；`brain.prompts` 优先从 Langfuse 读（`get_prompt`/`get_prompt_template` 用 `compile` 渲染 `{{var}}`），回退本地 prompts 表 + prompt_defaults；迁移脚本 `brain.scripts.migrate_prompts_to_langfuse` | P1 | ✅ |
+| FR67 | RAG 在线评测 | ask trace 的 root observation 汇总 input(问题)/output(答案)/metadata.context(检索上下文)；Langfuse LLM-as-a-Judge faithfulness evaluator 自动打忠实度分（reference-free，对照上下文判断）；rule 匹配 name=ask 的 observation | P1 | ✅ |
 
 **Phase 5G 设计约束：**
 - 本地优先：Langfuse 用本地自托管 v4（docker-compose），不依赖云服务

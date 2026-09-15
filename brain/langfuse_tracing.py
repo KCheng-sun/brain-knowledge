@@ -134,8 +134,86 @@ def attach_langfuse(
     return new_config
 
 
-@contextmanager
-def langfuse_trace(
+class _NoopTrace:
+    """未启用 Langfuse 时的空 trace，所有方法无操作。"""
+
+    def langchain_config(self, config: dict | None = None) -> dict | None:
+        return config
+
+    def update_output(self, output: Any) -> None:
+        pass
+
+    def update_metadata(self, metadata: dict[str, Any]) -> None:
+        pass
+
+    def end(self) -> None:
+        pass
+
+
+class _LangfuseTrace:
+    """活跃的 Langfuse trace，持有 root observation。
+
+    由 start_trace() 创建。能力：
+      - langchain_config(config) 注入 CallbackHandler，LLM/tool observation 嵌套在 root 下
+      - update_output(output) 设 trace 级输出（最终答案，evaluator 读这个）
+      - update_metadata({...}) 追加 metadata（检索上下文，evaluator 读这个）
+      - end() 结束 trace（退出 propagate 上下文 + 结束 root span）
+    """
+
+    def __init__(self, root, name: str):
+        self._root = root
+        self._name = name
+        self._active = False
+        self._prop_cm = None
+        self._root_cm = None
+
+    def langchain_config(self, config: dict | None = None) -> dict:
+        from langfuse.langchain import CallbackHandler
+
+        handler = CallbackHandler()
+        new_config = dict(config or {})
+        cbs = list(new_config.get("callbacks") or [])
+        cbs.append(handler)
+        new_config["callbacks"] = cbs
+        return new_config
+
+    def update_output(self, output: Any) -> None:
+        """设 trace 级输出（最终答案）。evaluator 从 observation.output 读取。"""
+        if self._root is not None:
+            try:
+                self._root.update(output=output)
+            except Exception as e:
+                logger.debug(f"Langfuse update_output 失败（忽略）: {e}")
+
+    def update_metadata(self, metadata: dict[str, Any]) -> None:
+        """追加 metadata（检索上下文等）。evaluator 从 observation.metadata 读取。"""
+        if self._root is not None:
+            try:
+                self._root.update(metadata=metadata)
+            except Exception as e:
+                logger.debug(f"Langfuse update_metadata 失败（忽略）: {e}")
+
+    def end(self) -> None:
+        """结束 trace：退出 propagate 上下文，结束 root span。
+
+        流式生成器在 finally 中调用，确保 trace 属性和 span 正确收尾。
+        重复调用安全（_active 标记）。
+        """
+        if not self._active:
+            return
+        self._active = False
+        try:
+            if self._prop_cm is not None:
+                self._prop_cm.__exit__(None, None, None)
+            # 退出 root span 的 context manager（结束 span，trace 立即可见）
+            root_cm = getattr(self, "_root_cm", None)
+            if root_cm is not None:
+                root_cm.__exit__(None, None, None)
+        except Exception as e:
+            logger.debug(f"Langfuse trace end 失败（忽略）: {e}")
+
+
+def start_trace(
     name: str,
     *,
     session_id: str | None = None,
@@ -144,55 +222,37 @@ def langfuse_trace(
     tags: list[str] | None = None,
     metadata: dict[str, Any] | None = None,
     input: Any = None,
-) -> Iterator[Any]:
-    """创建 Langfuse trace 上下文（直接 LLM 调用用）。
+) -> _LangfuseTrace | _NoopTrace:
+    """开始一个 Langfuse trace，返回可手动管理生命周期的 trace 对象。
 
-    适用：digest/query_rewriter/judge 等直接 llm.invoke(messages) 的场景。
-    用 start_as_current_observation 建 trace root + propagate_attributes 设 trace 级
-    属性，with 块内创建的 CallbackHandler 自动继承当前 trace context，其 LLM observation
-    嵌套在 root 下。未启用时为 Noop 上下文。
+    适用于流式生成器（ask 路由的 event_stream）——trace 跨越多个 yield，
+    无法用单个 with 块覆盖，需在生成器开始时 start、结束/异常时 end。
+
+    关键能力（faithfulness 评测依赖）：root observation 汇总 input/output/metadata，
+    observation-level evaluator（如 LLM-as-a-Judge faithfulness）只看单个 observation
+    的数据，所以 question/answer/context 三者都汇总到 root。
 
     用法::
 
-        with langfuse_trace("daily-digest", tags=["digest"]) as lf:
-            cfg = lf.langchain_config()
-            llm.invoke(messages, config=cfg)
-
-    Args:
-        name: trace 名称（动词式，看板过滤用）
-        session_id/user_id/tags/metadata/trace_id: trace 属性，同 attach_langfuse
-        input: trace 级输入（看板可见）
-
-    Yields:
-        trace 对象（启用）或 None（未启用），用 .langchain_config() 取带 handler 的 config
+        lf = start_trace("ask", session_id=sid, trace_id=tid, tags=["rag"],
+                         input={"question": q})
+        try:
+            cfg = lf.langchain_config(base_config)
+            for chunk in agent.stream(..., config=cfg):
+                yield ...
+            lf.update_output(final_answer)
+            lf.update_metadata({"context": retrieved_context})
+        finally:
+            lf.end()
     """
-
-    class _Trace:
-        """活跃 trace，langchain_config 返回带 CallbackHandler 的 config。"""
-
-        def __init__(self):
-            self._enabled = False
-
-        def langchain_config(self, config: dict | None = None) -> dict:
-            from langfuse.langchain import CallbackHandler
-
-            handler = CallbackHandler()
-            new_config = dict(config or {})
-            cbs = list(new_config.get("callbacks") or [])
-            cbs.append(handler)
-            new_config["callbacks"] = cbs
-            return new_config
-
     if not is_enabled():
-        yield _Trace()
-        return
+        return _NoopTrace()
 
     try:
         from langfuse import get_client, propagate_attributes
     except ImportError:
         logger.debug("langfuse 未安装，跳过追踪")
-        yield _Trace()
-        return
+        return _NoopTrace()
 
     from brain.config import get_config
 
@@ -206,27 +266,66 @@ def langfuse_trace(
         if trace_id:
             biz_meta["brain_trace_id"] = trace_id
 
-        # start_as_current_observation 建 trace root（定 name/input/output），
+        # start_as_current_observation 建 trace root（定 name/input/output/metadata），
         # propagate_attributes 设 trace 级归属维度（session/user/tags）。
-        with lf.start_as_current_observation(name=name, as_type="span") as root:
-            if input is not None:
-                root.update(input=input)
-            prop_kwargs: dict[str, Any] = {"metadata": biz_meta}
-            if session_id:
-                prop_kwargs["session_id"] = session_id
-            if user_id:
-                prop_kwargs["user_id"] = user_id
-            if tags:
-                prop_kwargs["tags"] = tags
-            with propagate_attributes(**prop_kwargs):
-                trace = _Trace()
-                trace._enabled = True
-                trace._root = root
-                yield trace
+        # 返回的是 context manager，需 __enter__() 拿到真正的 LangfuseSpan；
+        # span 可 update（output/metadata），供 LLM-as-a-Judge evaluator 读取
+        # （observation-level evaluator 只看单个 observation 的 input/output/metadata，
+        # 所以 question/answer/context 三者都汇总到 root）。
+        root_cm = lf.start_as_current_observation(name=name, as_type="span")
+        root = root_cm.__enter__()
+        if input is not None:
+            root.update(input=input)
+        prop_kwargs: dict[str, Any] = {"metadata": biz_meta}
+        if session_id:
+            prop_kwargs["session_id"] = session_id
+        if user_id:
+            prop_kwargs["user_id"] = user_id
+        if tags:
+            prop_kwargs["tags"] = tags
+        prop_cm = propagate_attributes(**prop_kwargs)
+        prop_cm.__enter__()  # 进入 propagate 上下文（trace 属性生效）
+
+        trace = _LangfuseTrace(root=root, name=name)
+        trace._root_cm = root_cm  # type: ignore[attr-defined]
+        trace._prop_cm = prop_cm  # type: ignore[attr-defined]
+        trace._active = True
+        return trace
     except Exception as e:
-        # 追踪上下文创建失败不能影响主流程——降级为 Noop
         logger.debug(f"Langfuse trace 创建失败，降级为 Noop: {e}")
-        yield _Trace()
+        return _NoopTrace()
+
+
+@contextmanager
+def langfuse_trace(
+    name: str,
+    *,
+    session_id: str | None = None,
+    trace_id: str | None = None,
+    user_id: str | None = None,
+    tags: list[str] | None = None,
+    metadata: dict[str, Any] | None = None,
+    input: Any = None,
+) -> Iterator[_LangfuseTrace | _NoopTrace]:
+    """创建一个 Langfuse trace 上下文（with 块用法，直接 LLM 调用用）。
+
+    适用于同步、调用可在 with 块内完成的场景（digest/query_rewriter/judge）。
+    流式生成器场景（ask 路由 event_stream，trace 跨多个 yield）用 start_trace()。
+
+    用法::
+
+        with langfuse_trace("daily-digest", tags=["digest"]) as lf:
+            cfg = lf.langchain_config()
+            llm.invoke(messages, config=cfg)
+    """
+    trace = start_trace(
+        name, session_id=session_id, trace_id=trace_id, user_id=user_id,
+        tags=tags, metadata=metadata, input=input,
+    )
+    try:
+        yield trace
+    finally:
+        trace.end()
 
 
 def flush() -> None:

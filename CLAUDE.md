@@ -362,6 +362,14 @@ ruff check brain/
   - **Langfuse 客户端自带缓存，不在应用层缓存 Langfuse 源**：`get_prompt` 有 `cache_ttl_seconds`（默认 5s），首次 fetch 后零延迟，Langfuse 宕机仍用缓存。因此 `brain.prompts._cache` 只缓存数据库/默认值回退结果，不缓存 Langfuse 源——避免本地编辑 Langfuse 后缓存不刷新
   - **迁移脚本要幂等 + 验证**：`create_prompt` 同名会新增版本（不覆盖），重复运行安全。迁移后立即 `get_prompt(label=production)` 取回验证，确认变量语法正确、production 标签到位。迁移脚本 `brain.scripts.migrate_prompts_to_langfuse` 内置验证步骤
   - **纯文本 prompt 的 compile 无参返回原文**：`prompt.compile()` 对无变量的纯文本 prompt（classifier/connector 等）原样返回，不报错。`get_prompt` 对纯文本直接返回 `lf_prompt.prompt`，`get_prompt_template` 对模板才调 compile
+- 经验（5G RAG 在线评测）：
+  - **observation-level evaluator 只看单个 observation 的数据**：Langfuse 文档明确「They do not load sibling or child observations from the same trace」。faithfulness 评测需要同时拿「问题+答案+检索上下文」，但这三者在默认 trace 里分散在不同 observation（问题在 root input、上下文在 search_notes TOOL output、答案在最后一个 GENERATION output）。必须在 root observation 上汇总三者，evaluator 才能工作
+  - **start_as_current_observation 返回 context manager，不是 span**：不用 `with` 块时，`lf.start_as_current_observation()` 返回 `_AgnosticContextManager`，需 `__enter__()` 才拿到真正的 `LangfuseSpan`。直接对返回值调 `update()` 会报 `'... object has no attribute 'update'`。手动生命周期管理要存两个 cm：root_cm（span）和 prop_cm（propagate_attributes），end 时都 `__exit__`
+  - **trace 生命周期由路由统一管理**：原 researcher 内部用 attach_langfuse 自建 trace，但 researcher 看不到最终答案（流式 token 还在 yield）。改为 ask 路由的 event_stream 用 `start_trace` 创建 trace、传 `lf_trace` 给 researcher、在 done/interrupt/error 时 `update_output(答案)` + `update_metadata({context})`、finally `lf.end()`。researcher 收到 lf_trace 时用其 `langchain_config()` 注入 handler，未传时回退 attach_langfuse（兼容 CLI）
+  - **检索上下文从 timeline 提取**：event_stream 已收集 timeline（tool_start 事件含 name+args），从 search_notes/search_fragments 的 args.query 提取检索查询作为 context 摘要。完整检索结果文本在 TraceEventLogger 的 trace_events 表，evaluator 不直接读——context 摘要足以让 judge 判断查询是否相关
+  - **faithfulness 是 reference-free 的核心价值**：不需要 ground truth 标准答案，对照「检索到的上下文」判断回答是否编造。可对任意生产流量自动打分（采样 5-10% 即可看趋势）。claim-based 方法：拆解论断→逐条对照上下文→支持占比=score
+  - **evaluator prompt 变量用双花括号**：Langfuse `{{var}}`，与本地 str.format 的 `{var}` 不同。建 evaluator 时 prompt 里的 JSON 示例用单花括号 `{`（字面字符），只有变量用双花括号 `{{var}}`。`variables` 字段是只读的（从 prompt 自动推断），POST 时不能传
+  - **rule filter 的 column 只能是固定枚举**：`trace.name` 不是合法 column，要用 observation 级的 `name`（匹配 root observation 的 name=ask）。合法值：type/name/environment/level 等。环境过滤要排除 `langfuse-llm-as-a-judge` 等 eval 环境，否则 evaluator 会递归评估自己的执行 trace
 
 ---
 

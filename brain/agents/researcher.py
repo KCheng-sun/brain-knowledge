@@ -145,6 +145,7 @@ class ResearcherAgent:
         memory_hits: list | None = None,
         checkpointer=None,
         trace_id: str | None = None,
+        lf_trace=None,
     ):
         """流式执行研究，逐事件 yield。
 
@@ -154,6 +155,12 @@ class ResearcherAgent:
             history: 历史消息列表 [{"role": "user"/"assistant", "content": ...}]
                      不含当前问题，按时间正序
             memory_hits: 跨会话检索到的相关历史消息（SearchResult 列表）
+            trace_id: 可观测性 trace_id（Phase 5A）
+            lf_trace: Langfuse trace 对象（Phase 5G，由 ask 路由 start_trace 创建）。
+                      传入时用其 langchain_config 注入 handler，trace 归路由统一管理
+                      （路由在 done 后设 output=答案 + metadata.context=检索上下文，
+                      供 LLM-as-a-Judge faithfulness evaluator 读取）。
+                      为 None 时回退到 attach_langfuse 自建 trace。
 
         Yield 事件类型:
           - {"type": "status", "message": str}         状态提示（Agent 启动/完成）
@@ -219,16 +226,19 @@ class ResearcherAgent:
             token_cb = TraceEventLogger(self._metadata_store, self._trace_id)
             stream_config.setdefault("callbacks", []).append(token_cb)
         # Phase 5G：Langfuse 追踪——与本地 TraceEventLogger 并存，互不干扰
-        # agent.stream 是 chain 路径，触发 on_chain_start，CallbackHandler 从 metadata
-        # 的 langfuse_* 前缀自动解析 trace 属性（trace_name/session_id/tags）
+        # 优先用路由传入的 lf_trace（路由统一管理，done 后设 output/context 供 evaluator 读）；
+        # 未传时回退 attach_langfuse 自建 trace（向后兼容 CLI 等非路由调用点）
         from brain.langfuse_tracing import attach_langfuse
-        stream_config = attach_langfuse(
-            stream_config,
-            session_id=session_id,
-            trace_id=self._trace_id,
-            trace_name="ask",
-            tags=["deepagents", "rag"],
-        )
+        if lf_trace is not None:
+            stream_config = lf_trace.langchain_config(stream_config)
+        else:
+            stream_config = attach_langfuse(
+                stream_config,
+                session_id=session_id,
+                trace_id=self._trace_id,
+                trace_name="ask",
+                tags=["deepagents", "rag"],
+            )
 
         for mode, chunk in agent.stream(
             {"messages": messages},

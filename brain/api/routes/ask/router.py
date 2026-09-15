@@ -129,12 +129,57 @@ def ask_question_stream(req: AskRequest):
         timeline: list[dict] = []
         _t0 = _time.perf_counter()
 
+        # Phase 5G：Langfuse trace 由路由统一创建（start_trace），
+        # researcher 用 lf_trace.langchain_config 注入 handler，trace 归此管理。
+        # done/interrupt/error 后设 output=答案 + metadata.context=检索上下文，
+        # 供 LLM-as-a-Judge faithfulness evaluator 读取（observation-level
+        # evaluator 只看单个 observation 的 input/output/metadata，三者都汇总到 root）
+        from brain.langfuse_tracing import start_trace
+        lf = start_trace(
+            "ask",
+            session_id=session_id,
+            trace_id=trace_id,
+            tags=["deepagents", "rag"],
+            input={"question": req.question},
+        )
+
+        def _collect_context() -> list[str]:
+            """从 timeline 提取检索上下文（search_notes/search_fragments 的 args+结果）。
+
+            faithfulness evaluator 需要对照「检索到的上下文」判断回答是否忠实。
+            timeline 里 tool 项的 args 含查询，但工具返回值不在 timeline（只有 name/done），
+            故这里收集检索类工具的调用参数作为上下文摘要（至少能判断查询是否相关）。
+            完整的检索结果文本在 TraceEventLogger 的 trace_events 表里，evaluator 不直接读。
+            """
+            contexts: list[str] = []
+            for item in timeline:
+                if item.get("kind") != "tool":
+                    continue
+                name = item.get("name", "")
+                if name in ("search_notes", "search_fragments"):
+                    args = item.get("args", {})
+                    query = args.get("query") or args.get("keyword", "")
+                    if query:
+                        contexts.append(f"[{name}] query={query}")
+            return contexts
+
+        def _finalize_langfuse(answer: str, status: str) -> None:
+            """流结束/中断/出错时把答案和上下文写到 Langfuse root observation。"""
+            try:
+                lf.update_output(answer)
+                lf.update_metadata({
+                    "context": _collect_context(),
+                    "status": status,
+                })
+            except Exception:
+                pass
+
         yield f"data: {json.dumps({'type': 'session', 'session_id': session_id, 'trace_id': trace_id}, ensure_ascii=False)}\n\n"
 
         try:
             for event in agent.research_stream(
                 req.question, session_id, history, memory_hits,
-                checkpointer=get_checkpointer(), trace_id=trace_id,
+                checkpointer=get_checkpointer(), trace_id=trace_id, lf_trace=lf,
             ):
                 if event["type"] == "token":
                     answer_parts.append(event["content"])
@@ -157,6 +202,8 @@ def ask_question_stream(req: AskRequest):
                         )
                         ms.set_pending_msg_id(session_id, msg_id)
                         ms.touch_session(session_id)
+                    # Phase 5G：中断时把已流出的部分答案+上下文写到 Langfuse root
+                    _finalize_langfuse(answer, "interrupted")
                     # 提取全部提议的知识片段（LangGraph 可能一次提议多个，需逐一审批）
                     request = event.get("request") or {}
                     action_requests = request.get("action_requests", [])
@@ -217,6 +264,8 @@ def ask_question_stream(req: AskRequest):
                     record_metric(ms, "ask", "count", 1,
                                   {"question": req.question[:50]},
                                   trace_id=trace_id)
+                    # Phase 5G：done 时把完整答案+检索上下文写到 Langfuse root
+                    _finalize_langfuse(answer, "done")
 
                 yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
         except Exception as e:
@@ -233,6 +282,7 @@ def ask_question_stream(req: AskRequest):
             partial = "".join(answer_parts)
             if partial.strip():
                 timeline.append({"kind": "text", "content": partial})
+            error_answer = ""
             if any(t.get("kind") == "text" for t in timeline) or timeline:
                 content = "\n\n".join(
                     t["content"] for t in timeline if t.get("kind") == "text"
@@ -241,16 +291,23 @@ def ask_question_stream(req: AskRequest):
                     content += f"\n\n[中断: {reason}]"
                 else:
                     content = f"[中断: {reason}]"
+                error_answer = content
                 msg_id = ms.add_message(
                     session_id, "assistant", content, timeline=timeline
                 )
                 if content:
                     vs.add_memory(msg_id, session_id, "assistant", content)
                 ms.touch_session(session_id)
+            # Phase 5G：出错时把部分答案+上下文写到 Langfuse root
+            _finalize_langfuse(error_answer, "error")
             yield f"data: {json.dumps({'type': 'error', 'message': f'问答失败: {e}'}, ensure_ascii=False)}\n\n"
+        finally:
+            # Phase 5G：无论正常/中断/出错，都结束 Langfuse trace（释放 propagate 上下文 + 结束 span）
+            lf.end()
 
         # 流正常结束时清理 trace_id 上下文
         # （trace_id 为闭包变量，随生成器回收自动消失，无需 reset）
+        # Langfuse trace 在 finally 中 lf.end() 已结束
 
     return StreamingResponse(
         event_stream(),
